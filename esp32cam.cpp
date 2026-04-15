@@ -2897,8 +2897,14 @@ static void startSetupAPMode() {
 }
 
 static void startCameraAPMode() {
-  WiFi.setHostname(cfgDeviceName.c_str());
-  Serial.printf("[WIFI] Hostname set to: %s\n", cfgDeviceName.c_str());
+  if (!cfgDeviceName.isEmpty()) {
+    if (!WiFi.softAPsetHostname(cfgDeviceName.c_str())) {
+      Serial.println("[WIFI] Failed to set AP hostname");
+    } else {
+      Serial.printf("[WIFI] AP hostname set to: %s\n", cfgDeviceName.c_str());
+    }
+  }
+
   WiFi.mode(WIFI_AP);
   bool ok = WiFi.softAP(AP_FALLBACK_SSID, cfgAccessPass.c_str(), AP_CHANNEL, AP_HIDDEN, AP_MAX_CONNECTIONS);
   if (!ok) {
@@ -2929,8 +2935,14 @@ static void startSTAMode() {
     WiFi.disconnect(true, true);
     delay(250);
     WiFi.mode(WIFI_STA);
-    WiFi.setHostname(cfgDeviceName.c_str());
-    Serial.printf("[WIFI] Hostname set to: %s\n", cfgDeviceName.c_str());
+
+    if (!cfgDeviceName.isEmpty()) {
+      if (!WiFi.setHostname(cfgDeviceName.c_str())) {
+        Serial.println("[WIFI] Failed to set STA hostname");
+      } else {
+        Serial.printf("[WIFI] STA hostname set to: %s\n", cfgDeviceName.c_str());
+      }
+    }
 
     if (wifi.wifiPass.isEmpty()) {
       WiFi.begin(wifi.ssid.c_str());
