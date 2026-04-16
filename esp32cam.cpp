@@ -24,12 +24,16 @@
 
 #include <Arduino.h>
 #include "esp_camera.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <FS.h>
 #include <SD_MMC.h>
 #include <esp_system.h>
 #include <mbedtls/aes.h>
+#include <time.h>
+#include <sys/time.h>
 #include <vector>
 #include <algorithm>
 #include <cstring>
@@ -45,9 +49,12 @@ static constexpr int PIR_GPIO    = 13;
 static constexpr int AP_CHANNEL = 1;
 static constexpr bool AP_HIDDEN = false;
 static constexpr int AP_MAX_CONNECTIONS = 4;
+static constexpr const char *NTP_SERVER = "pool.ntp.org";
+static constexpr const char *TIME_ZONE = "BRT3";
 
 // ─── SD configuration storage ──────────────────────────────────────────────────
 #define CONFIG_FILE_PATH "/config.enc"
+#define CAPTURE_COUNTER_FILE_PATH "/capture_counter.txt"
 
 // ─── Globals ──────────────────────────────────────────────────────────────────
 static WebServer   server(80);
@@ -58,8 +65,10 @@ static String cfgDeviceName;
 static bool   isConfigured = false;
 static bool   streamTaskStarted = false;
 static bool   recordingActive = false;
+static volatile bool streamClientConnected = false;
 static bool   flashEnabled = false;
 static unsigned long recordingStartTime = 0;
+static uint32_t recordingDurationMs = 0;
 static unsigned long recordingLastFrameAt = 0;
 static uint32_t recordingFrameCount = 0;
 static uint32_t recordingMaxFrameSize = 0;
@@ -71,6 +80,11 @@ static String recordingPath;
 static File   sdUploadFile;
 static bool   sdUploadFailed = false;
 static String sdUploadPath;
+static uint32_t captureSequence = 0;
+static bool captureSequenceLoaded = false;
+static SemaphoreHandle_t cameraMutex = nullptr;
+static SemaphoreHandle_t recordingMutex = nullptr;
+static constexpr unsigned long STREAM_FRAME_INTERVAL_MS = 100;
 static constexpr unsigned long RECORDING_FRAME_INTERVAL_MS = 100;
 static constexpr uint32_t AVI_HAS_INDEX_FLAG = 0x00000010UL;
 static constexpr uint32_t AVI_KEYFRAME_FLAG = 0x00000010UL;
@@ -113,6 +127,13 @@ struct StoredConfig {
 };
 
 static StoredConfig runtimeConfig;
+static bool syncClockWithNtp();
+static camera_fb_t *lockAndCaptureFrame(TickType_t timeoutTicks = pdMS_TO_TICKS(1000));
+static void unlockCameraFrame(camera_fb_t *fb);
+static bool isRecordingFrameDue(unsigned long now);
+static bool recordFrameIfDue(camera_fb_t *fb, unsigned long now);
+static bool appendRecordingFrame(camera_fb_t *fb);
+static void stopRecordingSession(bool keepFile);
 
 static bool initSDCard() {
   static bool sdInitialized = false;
@@ -134,6 +155,212 @@ static bool initSDCard() {
   sdInitialized = true;
   Serial.println("[SD] Mounted in 1-bit mode");
   return true;
+}
+
+static camera_fb_t *lockAndCaptureFrame(TickType_t timeoutTicks) {
+  if (!cameraMutex) {
+    return nullptr;
+  }
+
+  if (xSemaphoreTake(cameraMutex, timeoutTicks) != pdTRUE) {
+    return nullptr;
+  }
+
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    xSemaphoreGive(cameraMutex);
+    return nullptr;
+  }
+
+  return fb;
+}
+
+static void unlockCameraFrame(camera_fb_t *fb) {
+  if (!fb) {
+    return;
+  }
+
+  esp_camera_fb_return(fb);
+  if (cameraMutex) {
+    xSemaphoreGive(cameraMutex);
+  }
+}
+
+static bool isRecordingFrameDue(unsigned long now) {
+  if (!recordingMutex) {
+    return false;
+  }
+
+  bool due = false;
+  if (xSemaphoreTake(recordingMutex, portMAX_DELAY) == pdTRUE) {
+    due = recordingActive
+       && (recordingLastFrameAt == 0
+        || (now - recordingLastFrameAt) >= RECORDING_FRAME_INTERVAL_MS);
+    xSemaphoreGive(recordingMutex);
+  }
+
+  return due;
+}
+
+static bool saveCaptureSequence(uint32_t value) {
+  SD_MMC.remove(CAPTURE_COUNTER_FILE_PATH);
+  File file = SD_MMC.open(CAPTURE_COUNTER_FILE_PATH, FILE_WRITE);
+  if (!file) {
+    Serial.println("[SEQ] Failed to open capture counter file for write");
+    return false;
+  }
+
+  if (file.print(value) == 0) {
+    file.close();
+    Serial.println("[SEQ] Failed to write capture counter value");
+    return false;
+  }
+
+  file.close();
+  return true;
+}
+
+static bool loadCaptureSequence() {
+  if (captureSequenceLoaded) {
+    return true;
+  }
+
+  if (!initSDCard()) {
+    return false;
+  }
+
+  captureSequence = 0;
+
+  if (SD_MMC.exists(CAPTURE_COUNTER_FILE_PATH)) {
+    File file = SD_MMC.open(CAPTURE_COUNTER_FILE_PATH, FILE_READ);
+    if (!file) {
+      Serial.println("[SEQ] Failed to open capture counter file for read");
+      return false;
+    }
+
+    String raw = file.readString();
+    file.close();
+    raw.trim();
+
+    if (!raw.isEmpty()) {
+      uint64_t parsed = 0;
+      bool valid = true;
+      for (size_t i = 0; i < raw.length(); ++i) {
+        char c = raw[i];
+        if (c < '0' || c > '9') {
+          valid = false;
+          break;
+        }
+        parsed = (parsed * 10ULL) + (uint64_t)(c - '0');
+        if (parsed > 0xFFFFFFFFULL) {
+          valid = false;
+          break;
+        }
+      }
+
+      if (valid) {
+        captureSequence = (uint32_t)parsed;
+      } else {
+        Serial.println("[SEQ] Invalid capture counter content, resetting to 0");
+      }
+    }
+  }
+
+  captureSequenceLoaded = true;
+  Serial.printf("[SEQ] Current capture sequence: %lu\n", (unsigned long)captureSequence);
+  return true;
+}
+
+static bool nextCaptureSequence(uint32_t &nextValue) {
+  if (!loadCaptureSequence()) {
+    return false;
+  }
+
+  uint32_t candidate = captureSequence + 1;
+  if (!saveCaptureSequence(candidate)) {
+    return false;
+  }
+
+  captureSequence = candidate;
+  nextValue = candidate;
+  return true;
+}
+
+static bool isClockSane() {
+  time_t now = time(nullptr);
+  if (now < 1704067200) {  // 2024-01-01 00:00:00 UTC
+    return false;
+  }
+
+  struct tm timeinfo;
+  if (!localtime_r(&now, &timeinfo)) {
+    return false;
+  }
+
+  return (timeinfo.tm_year + 1900) >= 2024;
+}
+
+static void applyLocalTimeZone() {
+  setenv("TZ", TIME_ZONE, 1);
+  tzset();
+}
+
+static void ensureClockBeforeTimestamp() {
+  if (isClockSane()) {
+    return;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    syncClockWithNtp();
+  } else {
+    Serial.println("[NTP] Clock not synced and WiFi is not connected");
+  }
+}
+
+static String formatLocalTimeString() {
+  time_t now = time(nullptr);
+  struct tm timeinfo;
+  char buf[32] = "1970-01-01 00:00:00";
+  if (localtime_r(&now, &timeinfo)) {
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+  }
+  return String(buf);
+}
+
+static String buildCapturePath(uint32_t sequence, const char *extension) {
+  ensureClockBeforeTimestamp();
+
+  time_t now = time(nullptr);
+  struct tm timeinfo;
+  char stamp[24] = "19700101_000000";
+  if (localtime_r(&now, &timeinfo)) {
+    if (strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &timeinfo) == 0) {
+      strncpy(stamp, "19700101_000000", sizeof(stamp));
+      stamp[sizeof(stamp) - 1] = '\0';
+    }
+  }
+
+  char path[80];
+  snprintf(path, sizeof(path), "/capture/%lu-%s.%s",
+           (unsigned long)sequence,
+           stamp,
+           extension);
+  return String(path);
+}
+
+static void serviceNtpSync() {
+  static unsigned long lastAttemptAt = 0;
+  unsigned long nowMs = millis();
+  if ((nowMs - lastAttemptAt) < 60000UL) {
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED || isClockSane()) {
+    return;
+  }
+
+  lastAttemptAt = nowMs;
+  syncClockWithNtp();
 }
 
 static void deriveKey(uint8_t key[16]) {
@@ -180,6 +407,40 @@ static bool writeU32LE(File &file, uint32_t value) {
     (uint8_t)((value >> 24) & 0xFF)
   };
   return file.write(bytes, sizeof(bytes)) == sizeof(bytes);
+}
+
+static bool writeMjpegFramePayload(File &file, const uint8_t *data, size_t len) {
+  if (!data || len == 0U) {
+    return false;
+  }
+
+  // Some players are more reliable when MJPEG-in-AVI frames advertise AVI1
+  // in the APP0 marker instead of the camera's default JFIF signature.
+  bool patchApp0 = len >= 10U
+    && data[0] == 0xFF && data[1] == 0xD8
+    && data[2] == 0xFF && data[3] == 0xE0
+    && data[6] == 'J' && data[7] == 'F' && data[8] == 'I' && data[9] == 'F';
+  if (!patchApp0) {
+    return file.write(data, len) == len;
+  }
+
+  static const uint8_t avi1[4] = {'A', 'V', 'I', '1'};
+  if (file.write(data, 6) != 6) {
+    return false;
+  }
+  if (file.write(avi1, sizeof(avi1)) != sizeof(avi1)) {
+    return false;
+  }
+  return file.write(data + 10, len - 10U) == (len - 10U);
+}
+
+static uint32_t gcdU32(uint32_t a, uint32_t b) {
+  while (b != 0U) {
+    uint32_t rem = a % b;
+    a = b;
+    b = rem;
+  }
+  return a == 0U ? 1U : a;
 }
 
 static bool hexToBytes(const String &hex, std::vector<uint8_t> &out) {
@@ -1119,15 +1380,17 @@ id('flash_btn').addEventListener('click',function(){
 });
 var h=window.location.hostname;
 id('stream').dataset.src='http://'+h+':81/stream';
-setStreamVisibility(true);
 id('ip_label').innerText=h;
+setStreamVisibility(false);
 fetch('/status').then(function(r){return r.json();}).then(function(s){
   ['framesize','brightness','contrast','saturation','quality','special_effect','wb_mode'].forEach(function(k){
     if(s[k]!==undefined){var e=id(k);if(e)e.value=s[k];var v=id(k+'_v');if(v)v.innerText=s[k];}
   });
   ['awb','aec','hmirror','vflip','lenc'].forEach(function(k){if(s[k]!==undefined){var e=id(k);if(e)e.checked=!!s[k];}});
-  if(s.stream_visible!==undefined){setStreamVisibility(!!s.stream_visible);}
+  setStreamVisibility(s.stream_visible!==undefined?!!s.stream_visible:true);
   if(s.recording_active!==undefined){setRecordingState(!!s.recording_active,s.recording_active?'Recording...':'');}
+}).catch(function(){
+  setStreamVisibility(true);
 });
 </script>
 </body>
@@ -1226,13 +1489,54 @@ header h1{color:#e94560;font-size:1.3em}
     </form>
     <div id="name_status" class="status"></div>
   </div>
+  <div class="panel">
+    <h3>Time</h3>
+    <div class="status" id="time_now"></div>
+    <form class="form" id="time_form">
+      <div>
+        <label>Manual Local Time</label>
+        <input id="manual_time" type="datetime-local" step="1" required>
+      </div>
+      <button type="submit">Set Time</button>
+      <button type="button" id="ntp_sync_btn">Sync NTP</button>
+    </form>
+    <div id="time_status" class="status"></div>
+  </div>
 </div>
 <script>
 function id(n){return document.getElementById(n);}
 function setWiFiStatus(msg,err){var e=id('wifi_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setAdminStatus(msg,err){var e=id('admin_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setNameStatus(msg,err){var e=id('name_status');e.textContent=msg;e.className=err?'status error':'status';}
+function setTimeStatus(msg,err){var e=id('time_status');e.textContent=msg;e.className=err?'status error':'status';}
 function formData(obj){return Object.keys(obj).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(obj[k]);}).join('&');}
+function toDateTimeLocalValue(epoch){
+  var d=new Date((Number(epoch)||0)*1000);
+  if(isNaN(d.getTime())) return '';
+  var pad=function(n){return n<10?'0'+n:String(n);};
+  return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'T'+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());
+}
+function refreshTimeStatus(){
+  fetch('/admin/time').then(function(r){
+    if(!r.ok){throw new Error('Failed to load time status');}
+    return r.json();
+  }).then(function(d){
+    id('time_now').textContent='Current: '+(d.local||'unknown')+' • '+(d.sane?'Clock synced':'Clock not synced')+' • '+(d.wifiConnected?'WiFi connected':'WiFi offline');
+    if(d.epoch){id('manual_time').value=toDateTimeLocalValue(d.epoch);}
+  }).catch(function(e){
+    id('time_now').textContent='Current: unavailable';
+    setTimeStatus(e.message,true);
+  });
+}
+function syncNtpTime(){
+  setTimeStatus('Syncing NTP...',false);
+  fetch('/admin/time/sync',{method:'POST'}).then(function(r){
+    return r.text().then(function(msg){
+      setTimeStatus(msg||'NTP sync request finished',!r.ok);
+      refreshTimeStatus();
+    });
+  }).catch(function(e){setTimeStatus(e.message,true);});
+}
 function refreshDeviceName(){
   var input=id('device_name');
   fetch('/admin/name').then(function(r){
@@ -1267,9 +1571,25 @@ function refreshWiFiList(){fetch('/wifi/list').then(function(r){return r.json();
 id('wifi_form').addEventListener('submit',function(e){e.preventDefault();fetch('/wifi/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({ssid:id('wifi_ssid').value,wpass:id('wifi_wpass').value})}).then(function(r){r.text().then(function(msg){setWiFiStatus(msg,!r.ok);if(r.ok){id('wifi_form').reset();refreshWiFiList();id('wifi_scan_list').value='';}});});});
 id('admin_form').addEventListener('submit',function(e){e.preventDefault();fetch('/admin/password',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({current:id('admin_current').value,next:id('admin_new').value,confirm:id('admin_confirm').value})}).then(function(r){r.text().then(function(msg){setAdminStatus(msg,!r.ok);if(r.ok)id('admin_form').reset();});});});
 id('name_form').addEventListener('submit',function(e){e.preventDefault();fetch('/admin/rename',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({name:id('device_name').value})}).then(function(r){r.text().then(function(msg){setNameStatus(msg,!r.ok);if(r.ok)refreshDeviceName();});});});
+id('time_form').addEventListener('submit',function(e){
+  e.preventDefault();
+  var raw=id('manual_time').value;
+  if(!raw){setTimeStatus('Choose a date and time first',true);return;}
+  var dt=new Date(raw);
+  if(isNaN(dt.getTime())){setTimeStatus('Invalid date/time value',true);return;}
+  var epoch=Math.floor(dt.getTime()/1000);
+  fetch('/admin/time/set',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({epoch:epoch})}).then(function(r){
+    return r.text().then(function(msg){
+      setTimeStatus(msg||'Time updated',!r.ok);
+      refreshTimeStatus();
+    });
+  }).catch(function(err){setTimeStatus(err.message,true);});
+});
+id('ntp_sync_btn').addEventListener('click',syncNtpTime);
 id('wifi_scan_list').addEventListener('change',function(){if(this.value)id('wifi_ssid').value=this.value;});
 refreshWiFiList();
 refreshDeviceName();
+refreshTimeStatus();
 </script>
 </body>
 </html>)html";
@@ -1410,6 +1730,22 @@ function renderCrumbs(){
 function sortItems(items){
   var by=document.getElementById('sort_by').value;
   var dir=document.getElementById('sort_dir').value==='desc'?-1:1;
+  function splitNumericPrefix(name){
+    var text=String(name||'');
+    var m=text.match(/^(\d+)(.*)$/);
+    if(!m) return {hasPrefix:false,num:0,rest:text};
+    return {hasPrefix:true,num:parseInt(m[1],10)||0,rest:m[2]};
+  }
+  function compareSmartName(aName,bName){
+    var aParts=splitNumericPrefix(aName);
+    var bParts=splitNumericPrefix(bName);
+    if(aParts.hasPrefix&&bParts.hasPrefix){
+      if(aParts.num!==bParts.num) return aParts.num-bParts.num;
+      return aParts.rest.localeCompare(bParts.rest);
+    }
+    if(aParts.hasPrefix!==bParts.hasPrefix) return aParts.hasPrefix?-1:1;
+    return String(aName||'').localeCompare(String(bName||''));
+  }
   return items.slice().sort(function(a,b){
     if(a.isDir!==b.isDir) return a.isDir?-1:1;
     var ba=String(a.name||'');
@@ -1419,8 +1755,8 @@ function sortItems(items){
 
     var cmp=0;
     if(by==='size') cmp=(Number(a.size)||0)-(Number(b.size)||0);
-    else if(by==='type') cmp=ta.localeCompare(tb)||ba.localeCompare(bb);
-    else cmp=ba.localeCompare(bb);
+    else if(by==='type') cmp=ta.localeCompare(tb)||compareSmartName(ba,bb);
+    else cmp=compareSmartName(ba,bb);
 
     return cmp*dir;
   });
@@ -1549,8 +1885,6 @@ static bool initCamera() {
     if (psramFound()) {
         config.fb_location  = CAMERA_FB_IN_PSRAM;
         config.jpeg_quality = 10;
-        config.fb_count     = 2;
-        config.grab_mode    = CAMERA_GRAB_LATEST;
     } else {
         config.frame_size = FRAMESIZE_CIF;
     }
@@ -1592,6 +1926,8 @@ static void streamTask(void *pvParameters) {
         }
 
         Serial.println("[STREAM] Client connected");
+        streamClientConnected = true;
+        unsigned long lastFrameAt = 0;
 
         // Consume request headers (wait for blank line)
         {
@@ -1615,17 +1951,29 @@ static void streamTask(void *pvParameters) {
 
         // Stream JPEG frames until client disconnects
         while (client.connected()) {
-            camera_fb_t *fb = esp_camera_fb_get();
+            unsigned long now = millis();
+            if (lastFrameAt != 0) {
+                unsigned long elapsed = now - lastFrameAt;
+                if (elapsed < STREAM_FRAME_INTERVAL_MS) {
+                    vTaskDelay(pdMS_TO_TICKS(STREAM_FRAME_INTERVAL_MS - elapsed));
+                    continue;
+                }
+            }
+
+            camera_fb_t *fb = lockAndCaptureFrame(pdMS_TO_TICKS(1000));
             if (!fb) {
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
             }
 
             if (fb->format != PIXFORMAT_JPEG) {
-                esp_camera_fb_return(fb);
+                unlockCameraFrame(fb);
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
             }
+
+            now = millis();
+            recordFrameIfDue(fb, now);
 
             char partHeader[128];
             int hlen = snprintf(partHeader, sizeof(partHeader),
@@ -1639,11 +1987,13 @@ static void streamTask(void *pvParameters) {
             if (ok) ok = (client.write(fb->buf, fb->len) == fb->len);
             if (ok) ok = (client.print("\r\n") > 0);
 
-            esp_camera_fb_return(fb);
+            unlockCameraFrame(fb);
+            lastFrameAt = now;
 
             if (!ok) break;
         }
 
+        streamClientConnected = false;
         client.stop();
         Serial.println("[STREAM] Client disconnected");
     }
@@ -1964,7 +2314,7 @@ static void handleAdminPasswordChange() {
 static void handleCapture() {
     if (!checkAuth()) return;
 
-    camera_fb_t *fb = esp_camera_fb_get();
+    camera_fb_t *fb = lockAndCaptureFrame(pdMS_TO_TICKS(1000));
     if (!fb) {
         server.send(503, "text/plain", "Camera capture failed");
         return;
@@ -1983,7 +2333,7 @@ static void handleCapture() {
     );
     client.write(fb->buf, fb->len);
 
-    esp_camera_fb_return(fb);
+    unlockCameraFrame(fb);
 }
 
 static void handleControl() {
@@ -2234,6 +2584,89 @@ static void handleDeviceNameGet() {
   String json = "{\"deviceName\":\"" + jsonEscape(currentName) + "\"}";
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(200, "application/json", json);
+}
+
+static void handleAdminTimeStatus() {
+  if (!checkAuth()) return;
+
+  time_t now = time(nullptr);
+  String json = "{";
+  json += "\"epoch\":" + String((unsigned long)now) + ",";
+  json += "\"sane\":" + String(isClockSane() ? "true" : "false") + ",";
+  json += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
+  json += "\"local\":\"" + jsonEscape(formatLocalTimeString()) + "\"";
+  json += "}";
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+}
+
+static bool parseEpochArg(const String &raw, time_t &epochOut) {
+  if (raw.isEmpty()) {
+    return false;
+  }
+
+  uint64_t parsed = 0;
+  for (size_t i = 0; i < raw.length(); ++i) {
+    char c = raw[i];
+    if (c < '0' || c > '9') {
+      return false;
+    }
+    parsed = (parsed * 10ULL) + (uint64_t)(c - '0');
+    if (parsed > 0x7FFFFFFFULL) {
+      return false;
+    }
+  }
+
+  if (parsed < 946684800ULL) {  // 2000-01-01
+    return false;
+  }
+
+  epochOut = (time_t)parsed;
+  return true;
+}
+
+static void handleAdminTimeSet() {
+  if (!checkAuth()) return;
+  if (!server.hasArg("epoch")) {
+    server.send(400, "text/plain", "epoch is required");
+    return;
+  }
+
+  time_t epoch = 0;
+  if (!parseEpochArg(server.arg("epoch"), epoch)) {
+    server.send(400, "text/plain", "Invalid epoch value");
+    return;
+  }
+
+  applyLocalTimeZone();
+
+  struct timeval tv;
+  tv.tv_sec = epoch;
+  tv.tv_usec = 0;
+  if (settimeofday(&tv, nullptr) != 0) {
+    server.send(500, "text/plain", "Failed to set system time");
+    return;
+  }
+
+  server.send(200, "text/plain", "Time set to: " + formatLocalTimeString());
+}
+
+static void handleAdminTimeSync() {
+  if (!checkAuth()) return;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    server.send(503, "text/plain", "WiFi is not connected");
+    return;
+  }
+
+  bool ok = syncClockWithNtp();
+  if (!ok) {
+    server.send(500, "text/plain", "NTP sync failed");
+    return;
+  }
+
+  server.send(200, "text/plain", "NTP synced: " + formatLocalTimeString());
 }
 
 static void handleAdminPage() {
@@ -2525,45 +2958,75 @@ static void handleSDUpload() {
 }
 
 static void handleCaptureSD() {
-    if (!checkAuth()) return;
+  if (!checkAuth()) return;
 
-    if (!initSDCard()) {
-        server.send(500, "text/plain", "SD card not available");
+  if (!initSDCard()) {
+    server.send(500, "text/plain", "SD card not available");
     return;
   }
 
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) {
-        server.send(503, "text/plain", "Camera capture failed");
-        return;
-    }
+  if (!SD_MMC.exists("/capture")) {
+    SD_MMC.mkdir("/capture");
+  }
 
-    if (!SD_MMC.exists("/capture")) {
-        SD_MMC.mkdir("/capture");
-    }
+  uint32_t sequence = 0;
+  if (!nextCaptureSequence(sequence)) {
+    server.send(500, "text/plain", "Failed to update capture sequence");
+    return;
+  }
 
-    time_t now = time(nullptr);
-    struct tm timeinfo;
-    localtime_r(&now, &timeinfo);
-    char filename[64];
-    strftime(filename, sizeof(filename), "/capture/IMG_%Y%m%d_%H%M%S.jpg", &timeinfo);
+  String photoPath = buildCapturePath(sequence, "jpg");
 
-    File file = SD_MMC.open(filename, FILE_WRITE);
-    if (file) {
-        file.write(fb->buf, fb->len);
-        file.close();
-        server.send(200, "text/plain", String("Saved: ") + filename);
-    } else {
-        server.send(500, "text/plain", "Failed to save image to SD");
-    }
+  camera_fb_t *fb = lockAndCaptureFrame(pdMS_TO_TICKS(1000));
+  if (!fb) {
+    server.send(503, "text/plain", "Camera capture failed");
+    return;
+  }
 
-    esp_camera_fb_return(fb);
+  File file = SD_MMC.open(photoPath, FILE_WRITE);
+  if (file) {
+    file.write(fb->buf, fb->len);
+    file.close();
+    server.send(200, "text/plain", String("Saved: ") + photoPath);
+  } else {
+    server.send(500, "text/plain", "Failed to save image to SD");
+  }
+
+  unlockCameraFrame(fb);
 }
 
-static bool writeAviHeader(File &file, uint32_t riffSize, uint32_t fps, uint32_t frameCount, uint32_t maxFrameSize, uint16_t width, uint16_t height, uint32_t moviListSize) {
-  uint32_t microsecondsPerFrame = fps == 0 ? 0 : (1000000UL / fps);
-  uint32_t bytesPerSecond = fps * maxFrameSize;
-  uint32_t imageSize = (uint32_t)width * (uint32_t)height * 3UL;
+static bool writeAviHeader(File &file, uint32_t riffSize, uint32_t durationMs, uint32_t frameCount, uint32_t maxFrameSize, uint16_t width, uint16_t height, uint32_t moviListSize) {
+  if (durationMs == 0U) {
+    durationMs = frameCount == 0U ? 1U : (frameCount * RECORDING_FRAME_INTERVAL_MS);
+  }
+
+  uint64_t totalMicroseconds = (uint64_t)durationMs * 1000ULL;
+  uint32_t microsecondsPerFrame = frameCount == 0U
+    ? 0U
+    : (uint32_t)((totalMicroseconds + (frameCount / 2ULL)) / (uint64_t)frameCount);
+  if (frameCount != 0U && microsecondsPerFrame == 0U) {
+    microsecondsPerFrame = 1U;
+  }
+
+  uint32_t moviPayloadSize = moviListSize >= 4U ? (moviListSize - 4U) : 0U;
+  uint32_t bytesPerSecond = durationMs == 0U
+    ? 0U
+    : (uint32_t)((((uint64_t)moviPayloadSize * 1000ULL) + (durationMs / 2ULL)) / (uint64_t)durationMs);
+  uint32_t imageSize = maxFrameSize == 0U
+    ? (uint32_t)width * (uint32_t)height * 3UL
+    : maxFrameSize;
+  uint32_t scale = durationMs;
+  uint64_t rawRate = (uint64_t)frameCount * 1000ULL;
+  uint32_t rate = rawRate > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : (uint32_t)rawRate;
+
+  if (scale == 0U || rate == 0U) {
+    scale = 1U;
+    rate = 1U;
+  } else {
+    uint32_t divisor = gcdU32(scale, rate);
+    scale /= divisor;
+    rate /= divisor;
+  }
 
   if (!file.seek(0)) {
     return false;
@@ -2603,8 +3066,8 @@ static bool writeAviHeader(File &file, uint32_t riffSize, uint32_t fps, uint32_t
     writeU16LE(file, 0) &&
     writeU16LE(file, 0) &&
     writeU32LE(file, 0) &&
-    writeU32LE(file, 1) &&
-    writeU32LE(file, fps) &&
+    writeU32LE(file, scale) &&
+    writeU32LE(file, rate) &&
     writeU32LE(file, 0) &&
     writeU32LE(file, frameCount) &&
     writeU32LE(file, maxFrameSize) &&
@@ -2637,6 +3100,12 @@ static bool finalizeRecordingFile() {
     return false;
   }
 
+  uint32_t durationMs = recordingDurationMs;
+  if (durationMs == 0U) {
+    unsigned long elapsedMs = millis() - recordingStartTime;
+    durationMs = elapsedMs == 0UL ? 1U : (uint32_t)elapsedMs;
+  }
+
   uint32_t indexSize = (uint32_t)recordingIndex.size() * 16UL;
   if (!recordingFile.seek(recordingFile.size())) {
     return false;
@@ -2657,9 +3126,8 @@ static bool finalizeRecordingFile() {
 
   recordingFile.flush();
 
-  uint32_t fps = 1000UL / RECORDING_FRAME_INTERVAL_MS;
   uint32_t riffSize = (uint32_t)recordingFile.size() - 8UL;
-  if (!writeAviHeader(recordingFile, riffSize, fps, recordingFrameCount, recordingMaxFrameSize, recordingWidth, recordingHeight, recordingMoviListSize)) {
+  if (!writeAviHeader(recordingFile, riffSize, durationMs, recordingFrameCount, recordingMaxFrameSize, recordingWidth, recordingHeight, recordingMoviListSize)) {
     return false;
   }
 
@@ -2682,11 +3150,15 @@ static void stopRecordingSession(bool keepFile) {
   }
 
   recordingActive = false;
+  recordingStartTime = 0;
+  recordingDurationMs = 0;
   recordingLastFrameAt = 0;
+  recordingFrameCount = 0;
   recordingMaxFrameSize = 0;
   recordingWidth = 0;
   recordingHeight = 0;
   recordingMoviListSize = 4;
+  recordingPath = "";
   recordingIndex.clear();
 }
 
@@ -2702,13 +3174,15 @@ static bool appendRecordingFrame(camera_fb_t *fb) {
   recordingMaxFrameSize = std::max(recordingMaxFrameSize, (uint32_t)fb->len);
 
   AviIndexEntry entry;
+  // idx1 offsets are relative to the start of the movi list payload, whose
+  // first four bytes are the literal "movi" tag.
   entry.offset = recordingMoviListSize;
   entry.size = (uint32_t)fb->len;
 
   if (!writeFourCC(recordingFile, "00dc") || !writeU32LE(recordingFile, entry.size)) {
     return false;
   }
-  if (recordingFile.write(fb->buf, fb->len) != fb->len) {
+  if (!writeMjpegFramePayload(recordingFile, fb->buf, fb->len)) {
     return false;
   }
 
@@ -2726,104 +3200,136 @@ static bool appendRecordingFrame(camera_fb_t *fb) {
   return true;
 }
 
+static bool recordFrameIfDue(camera_fb_t *fb, unsigned long now) {
+  if (!fb || !recordingMutex) {
+    return false;
+  }
+
+  bool ok = true;
+  if (xSemaphoreTake(recordingMutex, portMAX_DELAY) == pdTRUE) {
+    if (recordingActive &&
+        (recordingLastFrameAt == 0 || (now - recordingLastFrameAt) >= RECORDING_FRAME_INTERVAL_MS)) {
+      ok = appendRecordingFrame(fb);
+      if (ok) {
+        recordingLastFrameAt = now;
+        ++recordingFrameCount;
+        if ((recordingFrameCount % 10U) == 0U) {
+          recordingFile.flush();
+        }
+      } else {
+        Serial.println("[REC] Failed to write frame; aborting recording");
+        stopRecordingSession(false);
+      }
+    }
+    xSemaphoreGive(recordingMutex);
+  }
+
+  return ok;
+}
+
 static void serviceRecording() {
-  if (!recordingActive) {
+  if (!recordingActive || streamClientConnected) {
     return;
   }
 
   unsigned long now = millis();
-  if (recordingLastFrameAt != 0 && (now - recordingLastFrameAt) < RECORDING_FRAME_INTERVAL_MS) {
+  if (!isRecordingFrameDue(now)) {
     return;
   }
 
-  camera_fb_t *fb = esp_camera_fb_get();
+  camera_fb_t *fb = lockAndCaptureFrame(pdMS_TO_TICKS(1000));
   if (!fb) {
     return;
   }
 
-  bool writeOk = appendRecordingFrame(fb);
-  esp_camera_fb_return(fb);
-
-  if (!writeOk) {
-    Serial.println("[REC] Failed to write frame; aborting recording");
-    stopRecordingSession(false);
-    recordingFrameCount = 0;
-    recordingPath = "";
-    return;
-  }
-
-  recordingLastFrameAt = now;
-  ++recordingFrameCount;
-  if ((recordingFrameCount % 10U) == 0U) {
-    recordingFile.flush();
-  }
+  recordFrameIfDue(fb, now);
+  unlockCameraFrame(fb);
 }
 
 static void handleRecordStart() {
-    if (!checkAuth()) return;
+  if (!checkAuth()) return;
 
-    if (!initSDCard()) {
-        server.send(500, "text/plain", "SD card not available");
+  if (!initSDCard()) {
+    server.send(500, "text/plain", "SD card not available");
     return;
   }
 
-    if (recordingActive) {
-        server.send(400, "text/plain", "Recording already in progress");
-        return;
-    }
+  int statusCode = 200;
+  String message;
 
+  if (!recordingMutex || xSemaphoreTake(recordingMutex, portMAX_DELAY) != pdTRUE) {
+    server.send(500, "text/plain", "Recording lock unavailable");
+    return;
+  }
+
+  if (recordingActive) {
+    statusCode = 400;
+    message = "Recording already in progress";
+  } else {
     if (!SD_MMC.exists("/capture")) {
-        SD_MMC.mkdir("/capture");
+      SD_MMC.mkdir("/capture");
     }
 
-    time_t now = time(nullptr);
-    struct tm timeinfo;
-    localtime_r(&now, &timeinfo);
-    char filename[64];
-    strftime(filename, sizeof(filename), "/capture/VID_%Y%m%d_%H%M%S.avi", &timeinfo);
-
-    recordingPath = String(filename);
-    if (recordingFile) {
-      recordingFile.close();
+    uint32_t sequence = 0;
+    if (!nextCaptureSequence(sequence)) {
+      statusCode = 500;
+      message = "Failed to update capture sequence";
+    } else {
+      recordingPath = buildCapturePath(sequence, "avi");
+      if (recordingFile) {
+        recordingFile.close();
+      }
+      recordingFile = SD_MMC.open(recordingPath, FILE_WRITE);
+      if (!recordingFile) {
+        recordingPath = "";
+        statusCode = 500;
+        message = "Failed to open recording file";
+      } else {
+        uint8_t aviHeader[AVI_HEADER_SIZE] = {0};
+        if (recordingFile.write(aviHeader, sizeof(aviHeader)) != sizeof(aviHeader)) {
+          recordingFile.close();
+          SD_MMC.remove(recordingPath);
+          recordingPath = "";
+          statusCode = 500;
+          message = "Failed to initialize AVI file";
+        } else {
+          recordingActive = true;
+          recordingStartTime = millis();
+          recordingDurationMs = 0;
+          recordingLastFrameAt = 0;
+          recordingFrameCount = 0;
+          recordingMaxFrameSize = 0;
+          recordingWidth = 0;
+          recordingHeight = 0;
+          recordingMoviListSize = 4;
+          recordingIndex.clear();
+          message = String("Recording started: ") + recordingPath;
+        }
+      }
     }
-    recordingFile = SD_MMC.open(recordingPath, FILE_WRITE);
-    if (!recordingFile) {
-      recordingPath = "";
-      server.send(500, "text/plain", "Failed to open recording file");
-      return;
-    }
+  }
 
-    uint8_t aviHeader[AVI_HEADER_SIZE] = {0};
-    if (recordingFile.write(aviHeader, sizeof(aviHeader)) != sizeof(aviHeader)) {
-      recordingFile.close();
-      SD_MMC.remove(recordingPath);
-      recordingPath = "";
-      server.send(500, "text/plain", "Failed to initialize AVI file");
-      return;
-    }
-
-    recordingActive = true;
-    recordingStartTime = millis();
-    recordingLastFrameAt = 0;
-    recordingFrameCount = 0;
-    recordingMaxFrameSize = 0;
-    recordingWidth = 0;
-    recordingHeight = 0;
-    recordingMoviListSize = 4;
-    recordingIndex.clear();
-
-    server.send(200, "text/plain", String("Recording started: ") + recordingPath);
+  xSemaphoreGive(recordingMutex);
+  server.send(statusCode, "text/plain", message);
 }
 
 static void handleRecordStop() {
-    if (!checkAuth()) return;
+  if (!checkAuth()) return;
 
-    if (!recordingActive) {
-        server.send(400, "text/plain", "No recording in progress");
+  int statusCode = 200;
+  String message;
+
+  if (!recordingMutex || xSemaphoreTake(recordingMutex, portMAX_DELAY) != pdTRUE) {
+    server.send(500, "text/plain", "Recording lock unavailable");
     return;
   }
 
+  if (!recordingActive) {
+    statusCode = 400;
+    message = "No recording in progress";
+  } else {
     unsigned long duration = millis() - recordingStartTime;
+    recordingDurationMs = duration == 0UL ? 1U : (uint32_t)duration;
 
     bool keepFile = recordingFrameCount > 0;
     String savedPath = recordingPath;
@@ -2832,16 +3338,17 @@ static void handleRecordStop() {
     if (!keepFile) {
       savedPath = "";
     }
-    recordingPath = "";
 
-    String message = "Recording stopped. Duration: " + String(duration / 1000) + "s, Frames: " + String(savedFrameCount);
+    message = "Recording stopped. Duration: " + String(duration / 1000) + "s, Frames: " + String(savedFrameCount);
     if (keepFile) {
       message += ", Saved: " + savedPath;
     } else {
       message += ". No frames captured.";
     }
+  }
 
-    server.send(200, "text/plain", message);
+  xSemaphoreGive(recordingMutex);
+  server.send(statusCode, "text/plain", message);
 }
 
 // ─── WiFi mode starters ───────────────────────────────────────────────────────
@@ -2856,6 +3363,9 @@ static void registerCameraRoutes() {
   server.on("/admin/password",HTTP_POST, handleAdminPasswordChange);
   server.on("/admin/rename",  HTTP_POST, handleDeviceNameRename);
   server.on("/admin/name",    HTTP_GET,  handleDeviceNameGet);
+  server.on("/admin/time",    HTTP_GET,  handleAdminTimeStatus);
+  server.on("/admin/time/set",HTTP_POST, handleAdminTimeSet);
+  server.on("/admin/time/sync",HTTP_POST, handleAdminTimeSync);
   server.on("/wifi/list",     HTTP_GET,  handleWifiList);
   server.on("/wifi/add",      HTTP_POST, handleWifiAdd);
   server.on("/wifi/delete",   HTTP_POST, handleWifiDelete);
@@ -2921,6 +3431,28 @@ static void startCameraAPMode() {
   ensureStreamTask();
 }
 
+static bool syncClockWithNtp() {
+  Serial.printf("[NTP] Syncing clock using %s (TZ=%s)\n", NTP_SERVER, TIME_ZONE);
+  applyLocalTimeZone();
+  configTzTime(TIME_ZONE, NTP_SERVER);
+
+  struct tm timeinfo;
+  for (int attempt = 0; attempt < 20; ++attempt) {
+    if (getLocalTime(&timeinfo, 500)) {
+      char ts[32];
+      strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &timeinfo);
+      Serial.printf("[NTP] Time synced: %s\n", ts);
+      return true;
+    }
+    delay(500);
+    Serial.print('.');
+  }
+
+  Serial.println();
+  Serial.println("[NTP] Time sync failed; clock may be incorrect");
+  return false;
+}
+
 static void startSTAMode() {
   if (runtimeConfig.wifiList.empty()) {
     Serial.println("[WIFI] No saved STA networks — switching to fallback AP");
@@ -2964,6 +3496,7 @@ static void startSTAMode() {
 
     if (WiFi.status() == WL_CONNECTED) {
       Serial.printf("[WIFI] Connected to %s — IP: %s\n", wifi.ssid.c_str(), WiFi.localIP().toString().c_str());
+      syncClockWithNtp();
       registerCameraRoutes();
       server.begin();
       Serial.println("[HTTP] Camera server ready on port 80");
@@ -2982,6 +3515,15 @@ static void startSTAMode() {
 void setup() {
     Serial.begin(115200);
     Serial.println("\n[BOOT] ESP32-CAM starting");
+
+  cameraMutex = xSemaphoreCreateMutex();
+  recordingMutex = xSemaphoreCreateMutex();
+  if (!cameraMutex || !recordingMutex) {
+    Serial.println("[BOOT] Failed to create runtime mutexes — halting");
+    for (;;) {
+      delay(1000);
+    }
+  }
 
   pinMode(BUTTON_GPIO, INPUT_PULLUP);
   pinMode(PIR_GPIO, INPUT);
@@ -3022,5 +3564,6 @@ void setup() {
 
 void loop() {
     server.handleClient();
+  serviceNtpSync();
   serviceRecording();
 }

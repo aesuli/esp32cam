@@ -87,6 +87,6 @@ The firmware provides a three-page web interface (all require authentication):
 ## Capture and recording
 
 - **Still captures** are saved to `/capture/IMG_*.jpg` with automatic timestamp-based filenames
-- **Video recordings** are saved to `/capture/VID_*.avi` in Motion JPEG AVI format with automatic timestamp-based filenames
+- **Video recordings** are saved to `/capture/VID_*.avi` in Motion JPEG AVI format with automatic timestamp-based filenames and timing based on the real capture duration
 - Both capture and record operations save to the microSD card
 - File-based storage allows later retrieval and analysis via the SD Browser page
