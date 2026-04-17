@@ -37,6 +37,7 @@
 #include <vector>
 #include <algorithm>
 #include <cstring>
+#include <cstdarg>
 #include "camera_pins.h"
 
 // ─── Pin definitions ──────────────────────────────────────────────────────────
@@ -52,6 +53,19 @@ static constexpr bool AP_HIDDEN = false;
 static constexpr int AP_MAX_CONNECTIONS = 4;
 static constexpr const char *NTP_SERVER = "pool.ntp.org";
 static constexpr const char *TIME_ZONE = "BRT3";
+static constexpr int CONFIG_LOAD_RETRIES = 5;
+static constexpr unsigned long CONFIG_LOAD_RETRY_DELAY_MS = 1000;
+static constexpr int CAMERA_INIT_RETRIES = 8;
+static constexpr unsigned long CAMERA_INIT_RETRY_DELAY_MS = 500;
+static constexpr unsigned long BOOT_RECOVERY_RESTART_DELAY_MS = 5000;
+static constexpr int AP_START_RETRIES = 3;
+static constexpr unsigned long AP_START_RETRY_DELAY_MS = 1000;
+static constexpr uint32_t CAMERA_XCLK_FREQS_HZ[] = {
+  20000000UL,
+  10000000UL,
+  8000000UL,
+  4000000UL
+};
 
 // ─── SD configuration storage ──────────────────────────────────────────────────
 #define CONFIG_FILE_PATH "/config.enc"
@@ -93,6 +107,118 @@ static constexpr unsigned long RECORDING_FRAME_INTERVAL_MS = 100;
 static constexpr uint32_t AVI_HAS_INDEX_FLAG = 0x00000010UL;
 static constexpr uint32_t AVI_KEYFRAME_FLAG = 0x00000010UL;
 static constexpr size_t AVI_HEADER_SIZE = 224;
+static constexpr const char *SERIAL_LOG_FILE_PATH = "/log.txt";
+
+static bool initSDCard();
+
+static bool gLogWriteInProgress = false;
+static bool gLogSdReady = false;
+static bool gLogSdFailureReported = false;
+static bool gLogFileFailureReported = false;
+
+static bool appendSerialLogChunk(const uint8_t *data, size_t len) {
+  if (!data || len == 0 || gLogWriteInProgress) {
+    return false;
+  }
+
+  gLogWriteInProgress = true;
+
+  if (!gLogSdReady) {
+    gLogSdReady = initSDCard();
+    if (!gLogSdReady) {
+      if (!gLogSdFailureReported) {
+        ::Serial.println("[LOG] SD logging disabled: initSDCard failed");
+        gLogSdFailureReported = true;
+      }
+      gLogWriteInProgress = false;
+      return false;
+    }
+  }
+
+  if (!SD_MMC.exists(SERIAL_LOG_FILE_PATH)) {
+    File createFile = SD_MMC.open(SERIAL_LOG_FILE_PATH, FILE_WRITE);
+    if (!createFile) {
+      if (!gLogFileFailureReported) {
+        ::Serial.println("[LOG] Failed to create /log.txt");
+        gLogFileFailureReported = true;
+      }
+      gLogWriteInProgress = false;
+      return false;
+    }
+    createFile.close();
+  }
+
+  File file = SD_MMC.open(SERIAL_LOG_FILE_PATH, FILE_APPEND);
+  if (!file) {
+    if (!gLogFileFailureReported) {
+      ::Serial.println("[LOG] Failed to open /log.txt for append");
+      gLogFileFailureReported = true;
+    }
+    gLogWriteInProgress = false;
+    return false;
+  }
+
+  size_t written = file.write(data, len);
+  file.flush();
+  file.close();
+
+  if (written != len && !gLogFileFailureReported) {
+    ::Serial.println("[LOG] Partial write to /log.txt");
+    gLogFileFailureReported = true;
+  }
+
+  gLogWriteInProgress = false;
+  return written == len;
+}
+
+class SerialMirror : public Print {
+ public:
+  void begin(unsigned long baud) {
+    ::Serial.begin(baud);
+  }
+
+  size_t write(uint8_t b) override {
+    size_t out = ::Serial.write(b);
+    appendSerialLogChunk(&b, 1);
+    return out;
+  }
+
+  size_t write(const uint8_t *buffer, size_t size) override {
+    size_t out = ::Serial.write(buffer, size);
+    appendSerialLogChunk(buffer, size);
+    return out;
+  }
+
+  int printf(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+
+    va_list argsCopy;
+    va_copy(argsCopy, args);
+    int needed = vsnprintf(nullptr, 0, format, argsCopy);
+    va_end(argsCopy);
+
+    if (needed <= 0) {
+      va_end(args);
+      return needed;
+    }
+
+    std::vector<char> buffer((size_t)needed + 1);
+    int written = vsnprintf(buffer.data(), buffer.size(), format, args);
+    va_end(args);
+
+    if (written > 0) {
+      write((const uint8_t *)buffer.data(), (size_t)written);
+    }
+
+    return written;
+  }
+};
+
+static SerialMirror LogSerial;
+
+// Redirect this translation unit's Serial prints to a mirrored logger.
+#define Serial LogSerial
 
 struct AviIndexEntry {
   uint32_t offset;
@@ -139,6 +265,9 @@ static bool isRecordingFrameDue(unsigned long now);
 static bool recordFrameIfDue(camera_fb_t *fb, unsigned long now);
 static bool appendRecordingFrame(camera_fb_t *fb);
 static void stopRecordingSession(bool keepFile);
+static bool loadRuntimeConfigWithRetries(StoredConfig &cfg);
+static bool initCameraWithRetries();
+static bool waitForIO0Released(unsigned long timeoutMs);
 
 // ─── LED Control Functions ────────────────────────────────────────────────────
 static void initLED() {
@@ -209,6 +338,11 @@ static void ledWifiFailureSequence() {
 // Fallback AP activation: Triple blink
 static void ledFallbackAPSequence() {
   ledBlinkCount(3, 100, 100);
+}
+
+// Setup AP activation: four short blinks
+static void ledSetupAPSequence() {
+  ledBlinkCount(6, 100, 100);
 }
 
 static bool initSDCard() {
@@ -1974,15 +2108,12 @@ loadFiles();
 </html>)html";
 
 // ─── Camera initialisation ────────────────────────────────────────────────────
-static bool initCamera() {
-    // Power-cycle the camera via PWDN pin. On cold boot the sensor may be
-    // in an indeterminate state; toggling PWDN ensures a clean startup.
+static bool initCamera(uint32_t xclkFreqHz) {
+  // Keep camera powered up and give the sensor time to stabilize.
     if (PWDN_GPIO_NUM >= 0) {
         pinMode(PWDN_GPIO_NUM, OUTPUT);
-        digitalWrite(PWDN_GPIO_NUM, HIGH);  // power down
-        delay(100);
-        digitalWrite(PWDN_GPIO_NUM, LOW);   // power up
-        delay(100);
+    digitalWrite(PWDN_GPIO_NUM, LOW);
+    delay(300);
     }
 
     camera_config_t config;
@@ -2004,7 +2135,7 @@ static bool initCamera() {
     config.pin_sccb_scl  = SIOC_GPIO_NUM;
     config.pin_pwdn      = PWDN_GPIO_NUM;
     config.pin_reset     = RESET_GPIO_NUM;
-    config.xclk_freq_hz  = 20000000;
+    config.xclk_freq_hz  = xclkFreqHz;
     config.pixel_format  = PIXFORMAT_JPEG;
     config.grab_mode     = CAMERA_GRAB_WHEN_EMPTY;
     config.fb_location   = CAMERA_FB_IN_DRAM;
@@ -2025,12 +2156,9 @@ static bool initCamera() {
         return false;
     }
 
-    // OV3660-specific defaults for better image quality
     sensor_t *s = esp_camera_sensor_get();
     if (s && s->id.PID == OV3660_PID) {
         s->set_vflip(s, 1);
-        s->set_brightness(s, 1);
-        s->set_saturation(s, -2);
     }
 
     applyStoredCameraSettings(runtimeConfig);
@@ -2041,6 +2169,74 @@ static bool initCamera() {
     flashEnabled = false;
 
     return true;
+}
+
+static bool initCameraWithRetries() {
+    const size_t xclkCount = sizeof(CAMERA_XCLK_FREQS_HZ) / sizeof(CAMERA_XCLK_FREQS_HZ[0]);
+
+    for (int attempt = 1; attempt <= CAMERA_INIT_RETRIES; ++attempt) {
+      uint32_t xclkHz = CAMERA_XCLK_FREQS_HZ[(size_t)(attempt - 1) % xclkCount];
+
+        Serial.printf("[CAM] Init attempt %d/%d using XCLK=%lu Hz\n",
+          attempt,
+          CAMERA_INIT_RETRIES,
+          (unsigned long)xclkHz);
+
+        if (initCamera(xclkHz)) {
+            if (attempt > 1) {
+                Serial.printf("[CAM] Init succeeded on attempt %d (XCLK=%lu Hz)\n",
+                  attempt,
+                  (unsigned long)xclkHz);
+            }
+            return true;
+        }
+
+        esp_camera_deinit();
+        Serial.printf("[CAM] Retry %d/%d\n", attempt, CAMERA_INIT_RETRIES);
+        delay(CAMERA_INIT_RETRY_DELAY_MS);
+    }
+
+    return false;
+}
+
+static bool loadRuntimeConfigWithRetries(StoredConfig &cfg) {
+  for (int attempt = 1; attempt <= CONFIG_LOAD_RETRIES; ++attempt) {
+    if (loadConfigFromSD(cfg)) {
+      if (attempt > 1) {
+        Serial.printf("[CFG] Loaded config on attempt %d\n", attempt);
+      }
+      return true;
+    }
+
+    if (attempt < CONFIG_LOAD_RETRIES) {
+      Serial.printf("[CFG] Load attempt %d/%d failed, retrying in %lu ms\n",
+        attempt,
+        CONFIG_LOAD_RETRIES,
+        (unsigned long)CONFIG_LOAD_RETRY_DELAY_MS);
+      delay(CONFIG_LOAD_RETRY_DELAY_MS);
+    }
+  }
+
+  return false;
+}
+
+
+
+static bool startSoftAPWithRetries(const char *ssid, const char *password) {
+  for (int attempt = 1; attempt <= AP_START_RETRIES; ++attempt) {
+    WiFi.mode(WIFI_AP);
+    if (WiFi.softAP(ssid, password, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONNECTIONS)) {
+      if (attempt > 1) {
+        Serial.printf("[WIFI] AP start succeeded on attempt %d\n", attempt);
+      }
+      return true;
+    }
+
+    Serial.printf("[WIFI] AP start attempt %d/%d failed\n", attempt, AP_START_RETRIES);
+    delay(AP_START_RETRY_DELAY_MS);
+  }
+
+  return false;
 }
 
 // ─── MJPEG streaming task (core 0, port 81) ───────────────────────────────────
@@ -3574,12 +3770,12 @@ static void ensureStreamTask() {
 }
 
 static void startSetupAPMode() {
-    WiFi.mode(WIFI_AP);
-  bool ok = WiFi.softAP(AP_SETUP_SSID, nullptr, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONNECTIONS);
+  bool ok = startSoftAPWithRetries(AP_SETUP_SSID, nullptr);
   if (!ok) {
     Serial.println("[WIFI] Setup AP start failed");
     return;
   }
+    ledSetupAPSequence();
     Serial.printf("[WIFI] Open AP started — SSID: %s  IP: %s\n",
     AP_SETUP_SSID, WiFi.softAPIP().toString().c_str());
 
@@ -3600,8 +3796,7 @@ static void startCameraAPMode() {
     }
   }
 
-  WiFi.mode(WIFI_AP);
-  bool ok = WiFi.softAP(AP_FALLBACK_SSID, cfgAccessPass.c_str(), AP_CHANNEL, AP_HIDDEN, AP_MAX_CONNECTIONS);
+  bool ok = startSoftAPWithRetries(AP_FALLBACK_SSID, cfgAccessPass.c_str());
   if (!ok) {
     Serial.println("[WIFI] Fallback AP start failed (check password length >= 8)");
     return;
@@ -3636,7 +3831,6 @@ static bool syncClockWithNtp() {
     Serial.print('.');
   }
 
-  Serial.println();
   Serial.println("[NTP] Time sync failed; clock may be incorrect");
   return false;
 }
@@ -3648,13 +3842,21 @@ static void startSTAMode() {
     return;
   }
 
-  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(false);
 
   for (size_t i = 0; i < runtimeConfig.wifiList.size(); ++i) {
     const WifiCredential &wifi = runtimeConfig.wifiList[i];
+
+    // Hard reset STA state between credential attempts so each SSID starts
+    // from a clean state machine and scan context.
     WiFi.disconnect(true, true);
-    delay(250);
+    delay(200);
+    WiFi.mode(WIFI_OFF);
+    delay(150);
     WiFi.mode(WIFI_STA);
+    delay(150);
 
     if (!cfgDeviceName.isEmpty()) {
       if (!WiFi.setHostname(cfgDeviceName.c_str())) {
@@ -3673,19 +3875,20 @@ static void startSTAMode() {
     // LED feedback: double blink when testing WiFi credentials
     ledWifiTestSequence();
 
-    Serial.printf("[WIFI] Trying network %u/%u: %s",
+    Serial.printf("[WIFI] Trying network %u/%u: %s\n",
       (unsigned int)(i + 1),
       (unsigned int)runtimeConfig.wifiList.size(),
       wifi.ssid.c_str());
 
-    unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 20000UL) {
-      delay(500);
-      Serial.print('.');
-    }
-    Serial.println();
+    int result = (int)WiFi.waitForConnectResult(20000UL);
 
-    if (WiFi.status() == WL_CONNECTED) {
+    // Stop any stale connection attempt before trying the next credential.
+    if (result != (int)WL_CONNECTED || WiFi.status() != WL_CONNECTED) {
+      WiFi.disconnect(true, true);
+      delay(100);
+    }
+
+    if (result == (int)WL_CONNECTED && WiFi.status() == WL_CONNECTED) {
       // LED feedback: short blink on success
       ledWifiSuccessSequence();
       Serial.printf("[WIFI] Connected to %s — IP: %s\n", wifi.ssid.c_str(), WiFi.localIP().toString().c_str());
@@ -3699,7 +3902,7 @@ static void startSTAMode() {
 
     // LED feedback: long blink on failure
     ledWifiFailureSequence();
-    Serial.printf("[WIFI] Failed to connect to %s\n", wifi.ssid.c_str());
+    Serial.printf("[WIFI] Failed to connect to %s (status=%d)\n", wifi.ssid.c_str(), (int)result);
   }
 
   Serial.println("[WIFI] All saved networks failed — switching to fallback AP");
@@ -3708,10 +3911,8 @@ static void startSTAMode() {
 
 // ─── Arduino entry points ─────────────────────────────────────────────────────
 void setup() {
-    Serial.begin(115200);
-    // Allow power rails to stabilize on cold boot / USB-brick power-up.
-    delay(1500);
-    Serial.println("\n[BOOT] ESP32-CAM starting");
+  Serial.begin(115200);
+  Serial.println("\n[BOOT] ESP32-CAM starting");
 
   // Initialize LED and provide boot feedback
   initLED();
@@ -3732,7 +3933,7 @@ void setup() {
 
   // Load stored encrypted configuration from SD card.
   StoredConfig cfg;
-  if (loadConfigFromSD(cfg)) {
+  if (loadRuntimeConfigWithRetries(cfg)) {
     runtimeConfig = cfg;
     cfgAccessPass = cfg.adminPass;
     cfgDeviceName = cfg.deviceName;
@@ -3749,12 +3950,15 @@ void setup() {
     Serial.printf("[CFG] Configured: %s\n", isConfigured ? "yes" : "no");
 
     // Initialise camera
-    if (!initCamera()) {
-        Serial.println("[CAM] Fatal: camera init failed — halting");
-      // Halt here in test build (no LED signaling)
-        for (;;) {
-        delay(1000);
+    if (!initCameraWithRetries()) {
+        Serial.printf("[CAM] Fatal: camera init failed after %d attempts — restarting in %lu ms\n",
+          CAMERA_INIT_RETRIES,
+          (unsigned long)BOOT_RECOVERY_RESTART_DELAY_MS);
+        for (int i = 0; i < 5; ++i) {
+          ledWifiFailureSequence();
         }
+        delay(BOOT_RECOVERY_RESTART_DELAY_MS);
+        ESP.restart();
     }
     Serial.println("[CAM] Camera ready");
 
