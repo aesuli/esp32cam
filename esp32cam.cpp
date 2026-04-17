@@ -42,6 +42,7 @@
 // ─── Pin definitions ──────────────────────────────────────────────────────────
 static constexpr int BUTTON_GPIO = 12;
 static constexpr int PIR_GPIO    = 13;
+static constexpr int LED_GPIO    = 33;  // Internal red LED on ESP32-CAM
 
 // ─── AP setup credentials ─────────────────────────────────────────────────────
 #define AP_SETUP_SSID   "ESP32-CAM-Setup"
@@ -67,6 +68,9 @@ static bool   streamTaskStarted = false;
 static bool   recordingActive = false;
 static volatile bool streamClientConnected = false;
 static bool   flashEnabled = false;
+static bool   ledAccessBlinkEnabled = false;
+static unsigned long lastUrlAccessBlink = 0;
+static constexpr unsigned long LED_ACCESS_BLINK_INTERVAL_MS = 100;  // Minimum interval between access blinks
 static unsigned long recordingStartTime = 0;
 static uint32_t recordingDurationMs = 0;
 static unsigned long recordingLastFrameAt = 0;
@@ -124,6 +128,7 @@ struct StoredConfig {
   String deviceName;
   bool hasCameraSettings = false;
   CameraSettings cameraSettings;
+  bool ledAccessBlink = false;  // LED blink on URL access
 };
 
 static StoredConfig runtimeConfig;
@@ -134,6 +139,77 @@ static bool isRecordingFrameDue(unsigned long now);
 static bool recordFrameIfDue(camera_fb_t *fb, unsigned long now);
 static bool appendRecordingFrame(camera_fb_t *fb);
 static void stopRecordingSession(bool keepFile);
+
+// ─── LED Control Functions ────────────────────────────────────────────────────
+static void initLED() {
+  pinMode(LED_GPIO, OUTPUT);
+  digitalWrite(LED_GPIO, HIGH);  // HIGH = OFF (active low)
+}
+
+static void ledOn() {
+  digitalWrite(LED_GPIO, LOW);   // LOW = ON (active low)
+}
+
+static void ledOff() {
+  digitalWrite(LED_GPIO, HIGH);  // HIGH = OFF (active low)
+}
+
+// Fixed on for specified duration
+static void ledFixedOn(unsigned long durationMs) {
+  ledOn();
+  delay(durationMs);
+  ledOff();
+}
+
+// Single blink with specified on/off times
+static void ledBlink(unsigned long onMs, unsigned long offMs) {
+  ledOn();
+  delay(onMs);
+  ledOff();
+  delay(offMs);
+}
+
+// Multiple blinks
+static void ledBlinkCount(int count, unsigned long onMs, unsigned long offMs) {
+  for (int i = 0; i < count; ++i) {
+    ledBlink(onMs, offMs);
+    if (i < count - 1) {
+      delay(100);  // Gap between blinks
+    }
+  }
+}
+
+// Very short blink for URL access (does not block long)
+static void ledQuickBlink() {
+  ledOn();
+  delayMicroseconds(50000);  // 50ms very short blink
+  ledOff();
+}
+
+// Boot sequence: Fixed on
+static void ledBootSequence() {
+  ledFixedOn(1000);  // 1 second fixed on
+}
+
+// WiFi test sequence: Double blink
+static void ledWifiTestSequence() {
+  ledBlinkCount(2, 100, 100);
+}
+
+// WiFi success: Short blink
+static void ledWifiSuccessSequence() {
+  ledBlink(100, 200);  // 100ms on, 200ms off
+}
+
+// WiFi failure: Long blink
+static void ledWifiFailureSequence() {
+  ledBlink(500, 200);  // 500ms on, 200ms off
+}
+
+// Fallback AP activation: Triple blink
+static void ledFallbackAPSequence() {
+  ledBlinkCount(3, 100, 100);
+}
 
 static bool initSDCard() {
   static bool sdInitialized = false;
@@ -774,6 +850,7 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
   if (cfg.hasCameraSettings) {
     appendCameraSettings(plain, cfg.cameraSettings);
   }
+  appendU8(plain, cfg.ledAccessBlink ? 1 : 0);
 
   return encryptPayload(plain, ivHex, cipherHex);
   }
@@ -919,6 +996,18 @@ static bool decryptConfigV4(const String &ivHex, const String &cipherHex, Stored
   cfg.hasCameraSettings = (hasCameraSettings != 0);
   if (cfg.hasCameraSettings && !readCameraSettings(plain, offset, cfg.cameraSettings)) {
     return false;
+  }
+
+  // Read LED access blink setting (with backward compatibility for old configs)
+  uint8_t ledAccessBlink = 0;
+  if (offset < plain.size()) {
+    if (!readU8(plain, offset, ledAccessBlink)) {
+      cfg.ledAccessBlink = false;
+    } else {
+      cfg.ledAccessBlink = (ledAccessBlink != 0);
+    }
+  } else {
+    cfg.ledAccessBlink = false;
   }
 
   return offset == plain.size() && !cfg.adminPass.isEmpty();
@@ -1507,6 +1596,18 @@ header h1{color:#e94560;font-size:1.3em}
     </form>
     <div id="time_status" class="status"></div>
   </div>
+  <div class="panel">
+    <h3>LED Control</h3>
+    <form class="form" id="led_form">
+      <div style="display:flex;align-items:center;gap:10px">
+        <label for="led_access_blink" style="margin:0">Blink on URL access</label>
+        <input id="led_access_blink" type="checkbox" style="width:auto">
+      </div>
+      <button type="submit">Save</button>
+    </form>
+    <div id="led_status" class="status"></div>
+    <div style="font-size:.85em;color:#bbb;margin-top:10px">When enabled, LED blinks briefly on each URL request. Boot sequences are unaffected.</div>
+  </div>
 </div>
 <script>
 function id(n){return document.getElementById(n);}
@@ -1514,6 +1615,7 @@ function setWiFiStatus(msg,err){var e=id('wifi_status');e.textContent=msg;e.clas
 function setAdminStatus(msg,err){var e=id('admin_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setNameStatus(msg,err){var e=id('name_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setTimeStatus(msg,err){var e=id('time_status');e.textContent=msg;e.className=err?'status error':'status';}
+function setLedStatus(msg,err){var e=id('led_status');e.textContent=msg;e.className=err?'status error':'status';}
 function formData(obj){return Object.keys(obj).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(obj[k]);}).join('&');}
 function toDateTimeLocalValue(epoch){
   var d=new Date((Number(epoch)||0)*1000);
@@ -1592,9 +1694,22 @@ id('time_form').addEventListener('submit',function(e){
 });
 id('ntp_sync_btn').addEventListener('click',syncNtpTime);
 id('wifi_scan_list').addEventListener('change',function(){if(this.value)id('wifi_ssid').value=this.value;});
+function refreshLedStatus(){
+  fetch('/admin/led').then(function(r){
+    if(!r.ok){throw new Error('Failed to load LED settings');}
+    return r.json();
+  }).then(function(d){
+    id('led_access_blink').checked=d.ledAccessBlink||false;
+  }).catch(function(){});
+}
+id('led_form').addEventListener('submit',function(e){
+  e.preventDefault();
+  fetch('/admin/led',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({ledAccessBlink:id('led_access_blink').checked?'1':'0'})}).then(function(r){r.text().then(function(msg){setLedStatus(msg||'Saved',!r.ok);refreshLedStatus();});});
+});
 refreshWiFiList();
 refreshDeviceName();
 refreshTimeStatus();
+refreshLedStatus();
 </script>
 </body>
 </html>)html";
@@ -2016,6 +2131,15 @@ static void streamTask(void *pvParameters) {
 
 // ─── Authentication helper ────────────────────────────────────────────────────
 static bool checkAuth() {
+    // LED feedback for URL access blink (if enabled)
+    if (ledAccessBlinkEnabled) {
+      unsigned long now = millis();
+      if (now - lastUrlAccessBlink > LED_ACCESS_BLINK_INTERVAL_MS) {
+        ledQuickBlink();
+        lastUrlAccessBlink = now;
+      }
+    }
+    
     if (cfgAccessPass.isEmpty()) return true;
     if (!server.authenticate("admin", cfgAccessPass.c_str())) {
         server.requestAuthentication(BASIC_AUTH, "ESP32-CAM");
@@ -2025,11 +2149,25 @@ static bool checkAuth() {
 }
 
 // ─── Route handlers: AP (setup) mode ─────────────────────────────────────────
+static void handleUrlAccess() {
+  // LED feedback for URL access blink (if enabled)
+  if (ledAccessBlinkEnabled) {
+    unsigned long now = millis();
+    if (now - lastUrlAccessBlink > LED_ACCESS_BLINK_INTERVAL_MS) {
+      ledQuickBlink();
+      lastUrlAccessBlink = now;
+    }
+  }
+}
+
 static void handleSetupRoot() {
+    handleUrlAccess();
     server.send_P(200, "text/html", SETUP_HTML);
 }
 
 static void handleSave() {
+    handleUrlAccess();
+    
     if (!server.hasArg("ssid") || !server.hasArg("apass")) {
         server.send(400, "text/plain", "Missing required fields");
         return;
@@ -2682,6 +2820,36 @@ static void handleAdminTimeSync() {
   }
 
   server.send(200, "text/plain", "NTP synced: " + formatLocalTimeString());
+}
+
+static void handleAdminLedGet() {
+  if (!checkAuth()) return;
+
+  String json = "{\"ledAccessBlink\":" + String(ledAccessBlinkEnabled ? "true" : "false") + "}";
+  server.send(200, "application/json", json);
+}
+
+static void handleAdminLedSet() {
+  if (!checkAuth()) return;
+
+  if (!server.hasArg("ledAccessBlink")) {
+    server.send(400, "text/plain", "Missing ledAccessBlink parameter");
+    return;
+  }
+
+  String value = server.arg("ledAccessBlink");
+  bool newValue = (value == "1" || value == "true");
+
+  // Update runtime config and save to SD
+  runtimeConfig.ledAccessBlink = newValue;
+  ledAccessBlinkEnabled = newValue;
+
+  if (!persistRuntimeConfig(runtimeConfig)) {
+    server.send(500, "text/plain", "Failed to save LED configuration");
+    return;
+  }
+
+  server.send(200, "text/plain", "LED configuration saved");
 }
 
 static void handleAdminPage() {
@@ -3381,6 +3549,8 @@ static void registerCameraRoutes() {
   server.on("/admin/time",    HTTP_GET,  handleAdminTimeStatus);
   server.on("/admin/time/set",HTTP_POST, handleAdminTimeSet);
   server.on("/admin/time/sync",HTTP_POST, handleAdminTimeSync);
+  server.on("/admin/led",     HTTP_GET,  handleAdminLedGet);
+  server.on("/admin/led",     HTTP_POST, handleAdminLedSet);
   server.on("/wifi/list",     HTTP_GET,  handleWifiList);
   server.on("/wifi/add",      HTTP_POST, handleWifiAdd);
   server.on("/wifi/delete",   HTTP_POST, handleWifiDelete);
@@ -3436,6 +3606,9 @@ static void startCameraAPMode() {
     Serial.println("[WIFI] Fallback AP start failed (check password length >= 8)");
     return;
   }
+
+  // LED feedback: triple blink when fallback AP activated
+  ledFallbackAPSequence();
 
   Serial.printf("[WIFI] Fallback AP started — SSID: %s  IP: %s\n",
     AP_FALLBACK_SSID, WiFi.softAPIP().toString().c_str());
@@ -3497,6 +3670,9 @@ static void startSTAMode() {
       WiFi.begin(wifi.ssid.c_str(), wifi.wifiPass.c_str());
     }
 
+    // LED feedback: double blink when testing WiFi credentials
+    ledWifiTestSequence();
+
     Serial.printf("[WIFI] Trying network %u/%u: %s",
       (unsigned int)(i + 1),
       (unsigned int)runtimeConfig.wifiList.size(),
@@ -3510,6 +3686,8 @@ static void startSTAMode() {
     Serial.println();
 
     if (WiFi.status() == WL_CONNECTED) {
+      // LED feedback: short blink on success
+      ledWifiSuccessSequence();
       Serial.printf("[WIFI] Connected to %s — IP: %s\n", wifi.ssid.c_str(), WiFi.localIP().toString().c_str());
       syncClockWithNtp();
       registerCameraRoutes();
@@ -3519,6 +3697,8 @@ static void startSTAMode() {
       return;
     }
 
+    // LED feedback: long blink on failure
+    ledWifiFailureSequence();
     Serial.printf("[WIFI] Failed to connect to %s\n", wifi.ssid.c_str());
   }
 
@@ -3532,6 +3712,10 @@ void setup() {
     // Allow power rails to stabilize on cold boot / USB-brick power-up.
     delay(1500);
     Serial.println("\n[BOOT] ESP32-CAM starting");
+
+  // Initialize LED and provide boot feedback
+  initLED();
+  ledBootSequence();
 
   cameraMutex = xSemaphoreCreateMutex();
   recordingMutex = xSemaphoreCreateMutex();
@@ -3552,12 +3736,14 @@ void setup() {
     runtimeConfig = cfg;
     cfgAccessPass = cfg.adminPass;
     cfgDeviceName = cfg.deviceName;
+    ledAccessBlinkEnabled = cfg.ledAccessBlink;
     if (cfgDeviceName.isEmpty()) {
       cfgDeviceName = "ESP32-CAM";
     }
     isConfigured = true;
   } else {
     cfgDeviceName = "ESP32-CAM";
+    ledAccessBlinkEnabled = false;
     isConfigured = false;
   }
     Serial.printf("[CFG] Configured: %s\n", isConfigured ? "yes" : "no");
