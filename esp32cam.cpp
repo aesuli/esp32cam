@@ -142,19 +142,24 @@ static bool initSDCard() {
   }
 
   // 1-bit mode keeps GPIO12 and GPIO13 free for button/PIR.
-  if (!SD_MMC.begin("/sdcard", true)) {
-    Serial.println("[SD] Mount failed");
-    return false;
+  // Retry several times: SD cards can be slow to respond on cold boot.
+  for (int attempt = 1; attempt <= 5; ++attempt) {
+    if (SD_MMC.begin("/sdcard", true)) {
+      if (SD_MMC.cardType() != CARD_NONE) {
+        sdInitialized = true;
+        Serial.printf("[SD] Mounted in 1-bit mode (attempt %d)\n", attempt);
+        return true;
+      }
+      SD_MMC.end();
+      Serial.printf("[SD] No card detected on attempt %d\n", attempt);
+    } else {
+      Serial.printf("[SD] Mount failed on attempt %d\n", attempt);
+    }
+    delay(500);
   }
 
-  if (SD_MMC.cardType() == CARD_NONE) {
-    Serial.println("[SD] No SD card detected");
-    return false;
-  }
-
-  sdInitialized = true;
-  Serial.println("[SD] Mounted in 1-bit mode");
-  return true;
+  Serial.println("[SD] Failed to mount after 5 attempts");
+  return false;
 }
 
 static camera_fb_t *lockAndCaptureFrame(TickType_t timeoutTicks) {
@@ -1855,6 +1860,16 @@ loadFiles();
 
 // ─── Camera initialisation ────────────────────────────────────────────────────
 static bool initCamera() {
+    // Power-cycle the camera via PWDN pin. On cold boot the sensor may be
+    // in an indeterminate state; toggling PWDN ensures a clean startup.
+    if (PWDN_GPIO_NUM >= 0) {
+        pinMode(PWDN_GPIO_NUM, OUTPUT);
+        digitalWrite(PWDN_GPIO_NUM, HIGH);  // power down
+        delay(100);
+        digitalWrite(PWDN_GPIO_NUM, LOW);   // power up
+        delay(100);
+    }
+
     camera_config_t config;
     config.ledc_channel  = LEDC_CHANNEL_0;
     config.ledc_timer    = LEDC_TIMER_0;
@@ -3514,6 +3529,8 @@ static void startSTAMode() {
 // ─── Arduino entry points ─────────────────────────────────────────────────────
 void setup() {
     Serial.begin(115200);
+    // Allow power rails to stabilize on cold boot / USB-brick power-up.
+    delay(1500);
     Serial.println("\n[BOOT] ESP32-CAM starting");
 
   cameraMutex = xSemaphoreCreateMutex();
