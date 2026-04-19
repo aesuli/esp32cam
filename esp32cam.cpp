@@ -8,13 +8,13 @@
  *   - GPIO13 reserved for PIR input
  *
  * First Boot (unconfigured or missing config file):
- *   Broadcasts open WiFi AP "ESP32-CAM-Setup".
+ *   Broadcasts protected WiFi AP "ESP32-CAM-Setup"
+ *   with password "ESP32-CAM".
  *   Visit http://192.168.4.1 to enter WiFi credentials and an
  *   access password. Credentials are encrypted and stored on SD.
  *
  * Normal Operation:
- *   Port 80 — web UI with live MJPEG stream and camera controls.
- *   Port 81 — raw MJPEG stream endpoint (/stream).
+ *   Port 80 — web UI with live MJPEG stream (/stream) and camera controls.
  *   Protected by HTTP Basic Auth (username: admin).
  *
  * WiFi Failure Fallback:
@@ -30,6 +30,7 @@
 #include <WebServer.h>
 #include <FS.h>
 #include <SD_MMC.h>
+#include <Update.h>
 #include <esp_system.h>
 #include <mbedtls/aes.h>
 #include <time.h>
@@ -47,6 +48,7 @@ static constexpr int LED_GPIO    = 33;  // Internal red LED on ESP32-CAM
 
 // ─── AP setup credentials ─────────────────────────────────────────────────────
 #define AP_SETUP_SSID   "ESP32-CAM-Setup"
+#define AP_SETUP_PASS   "ESP32-CAM"
 #define AP_FALLBACK_SSID "ESP32-CAM"
 static constexpr int AP_CHANNEL = 1;
 static constexpr bool AP_HIDDEN = false;
@@ -73,18 +75,19 @@ static constexpr uint32_t CAMERA_XCLK_FREQS_HZ[] = {
 
 // ─── Globals ──────────────────────────────────────────────────────────────────
 static WebServer   server(80);
-static WiFiServer  streamServer(81);
 
 static String cfgAccessPass;
 static String cfgDeviceName;
 static bool   isConfigured = false;
-static bool   streamTaskStarted = false;
 static bool   recordingActive = false;
 static volatile bool streamClientConnected = false;
 static bool   flashEnabled = false;
+static bool   cameraInitialized = false;
 static bool   ledAccessBlinkEnabled = false;
 static unsigned long lastUrlAccessBlink = 0;
+static unsigned long lastCameraActivityAt = 0;
 static constexpr unsigned long LED_ACCESS_BLINK_INTERVAL_MS = 100;  // Minimum interval between access blinks
+static unsigned long cameraIdleTimeoutMs = 10000;
 static unsigned long recordingStartTime = 0;
 static uint32_t recordingDurationMs = 0;
 static unsigned long recordingLastFrameAt = 0;
@@ -98,12 +101,16 @@ static String recordingPath;
 static File   sdUploadFile;
 static bool   sdUploadFailed = false;
 static String sdUploadPath;
+static bool   firmwareUploadFailed = false;
+static bool   firmwareUploadSuccess = false;
+static unsigned long firmwareRestartAt = 0;
 static uint32_t captureSequence = 0;
 static bool captureSequenceLoaded = false;
 static SemaphoreHandle_t cameraMutex = nullptr;
 static SemaphoreHandle_t recordingMutex = nullptr;
 static constexpr unsigned long STREAM_FRAME_INTERVAL_MS = 100;
 static constexpr unsigned long RECORDING_FRAME_INTERVAL_MS = 100;
+static constexpr unsigned long FIRMWARE_RESTART_DELAY_MS = 1500;
 static constexpr uint32_t AVI_HAS_INDEX_FLAG = 0x00000010UL;
 static constexpr uint32_t AVI_KEYFRAME_FLAG = 0x00000010UL;
 static constexpr size_t AVI_HEADER_SIZE = 224;
@@ -261,6 +268,8 @@ static StoredConfig runtimeConfig;
 static bool syncClockWithNtp();
 static camera_fb_t *lockAndCaptureFrame(TickType_t timeoutTicks = pdMS_TO_TICKS(1000));
 static void unlockCameraFrame(camera_fb_t *fb);
+static bool ensureCameraReady(TickType_t timeoutTicks = pdMS_TO_TICKS(5000));
+static void serviceCameraIdleTimeout();
 static bool isRecordingFrameDue(unsigned long now);
 static bool recordFrameIfDue(camera_fb_t *fb, unsigned long now);
 static bool appendRecordingFrame(camera_fb_t *fb);
@@ -268,6 +277,7 @@ static void stopRecordingSession(bool keepFile);
 static bool loadRuntimeConfigWithRetries(StoredConfig &cfg);
 static bool initCameraWithRetries();
 static bool waitForIO0Released(unsigned long timeoutMs);
+static void servicePendingFirmwareRestart();
 
 // ─── LED Control Functions ────────────────────────────────────────────────────
 static void initLED() {
@@ -345,6 +355,16 @@ static void ledSetupAPSequence() {
   ledBlinkCount(6, 100, 100);
 }
 
+static void powerDownCameraHardware() {
+  if (PWDN_GPIO_NUM >= 0) {
+    pinMode(PWDN_GPIO_NUM, OUTPUT);
+    digitalWrite(PWDN_GPIO_NUM, HIGH);
+  }
+
+  digitalWrite(LED_FLASH_GPIO_NUM, LOW);
+  flashEnabled = false;
+}
+
 static bool initSDCard() {
   static bool sdInitialized = false;
   if (sdInitialized) {
@@ -381,6 +401,11 @@ static camera_fb_t *lockAndCaptureFrame(TickType_t timeoutTicks) {
     return nullptr;
   }
 
+  if (!cameraInitialized) {
+    xSemaphoreGive(cameraMutex);
+    return nullptr;
+  }
+
   camera_fb_t *fb = esp_camera_fb_get();
   if (!fb) {
     xSemaphoreGive(cameraMutex);
@@ -399,6 +424,63 @@ static void unlockCameraFrame(camera_fb_t *fb) {
   if (cameraMutex) {
     xSemaphoreGive(cameraMutex);
   }
+}
+
+static bool ensureCameraReady(TickType_t timeoutTicks) {
+  if (!cameraMutex) {
+    return false;
+  }
+
+  if (xSemaphoreTake(cameraMutex, timeoutTicks) != pdTRUE) {
+    return false;
+  }
+
+  bool ok = true;
+  if (!cameraInitialized) {
+    Serial.println("[CAM] Powering up camera on demand");
+    ok = initCameraWithRetries();
+    if (ok) {
+      cameraInitialized = true;
+      Serial.println("[CAM] Camera ready");
+    } else {
+      Serial.println("[CAM] Camera init failed");
+    }
+  }
+
+  if (ok) {
+    lastCameraActivityAt = millis();
+  }
+
+  xSemaphoreGive(cameraMutex);
+  return ok;
+}
+
+static void serviceCameraIdleTimeout() {
+  if (!cameraInitialized || streamClientConnected || recordingActive || cameraIdleTimeoutMs == 0UL) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (lastCameraActivityAt != 0 && (now - lastCameraActivityAt) < cameraIdleTimeoutMs) {
+    return;
+  }
+
+  if (!cameraMutex || xSemaphoreTake(cameraMutex, 0) != pdTRUE) {
+    return;
+  }
+
+  if (cameraInitialized && !streamClientConnected && !recordingActive) {
+    esp_err_t err = esp_camera_deinit();
+    if (err != ESP_OK) {
+      Serial.printf("[CAM] Deinit failed: 0x%x\n", err);
+    } else {
+      cameraInitialized = false;
+      powerDownCameraHardware();
+      Serial.printf("[CAM] Camera powered down after %lu ms idle\n", cameraIdleTimeoutMs);
+    }
+  }
+
+  xSemaphoreGive(cameraMutex);
 }
 
 static bool isRecordingFrameDue(unsigned long now) {
@@ -1533,7 +1615,7 @@ function setStreamVisibility(isVisible){
   placeholder.classList.toggle('visible',!streamVisible);
   toggle.textContent=streamVisible?'🙈 Hide Stream':'👁️ Show Stream';
   if(streamVisible){
-    if(!img.dataset.src){img.dataset.src='http://'+window.location.hostname+':81/stream';}
+    if(!img.dataset.src){img.dataset.src='/stream';}
     if(img.src!==img.dataset.src){img.src=img.dataset.src;}
   }else if(img.src){
     img.dataset.src=img.dataset.src||img.src;
@@ -1607,7 +1689,7 @@ id('flash_btn').addEventListener('click',function(){
   });
 });
 var h=window.location.hostname;
-id('stream').dataset.src='http://'+h+':81/stream';
+id('stream').dataset.src='/stream';
 id('ip_label').innerText=h;
 setStreamVisibility(false);
 fetch('/status').then(function(r){return r.json();}).then(function(s){
@@ -1742,6 +1824,18 @@ header h1{color:#e94560;font-size:1.3em}
     <div id="led_status" class="status"></div>
     <div style="font-size:.85em;color:#bbb;margin-top:10px">When enabled, LED blinks briefly on each URL request. Boot sequences are unaffected.</div>
   </div>
+  <div class="panel">
+    <h3>Firmware Update</h3>
+    <form class="form" id="firmware_form">
+      <div>
+        <label>Firmware Binary (.bin)</label>
+        <input id="firmware_file" type="file" accept=".bin,application/octet-stream" required>
+      </div>
+      <button type="submit">Upload Firmware</button>
+    </form>
+    <div id="firmware_status" class="status"></div>
+    <div style="font-size:.85em;color:#bbb;margin-top:10px">Upload the compiled firmware binary. The device will reboot automatically after a successful update.</div>
+  </div>
 </div>
 <script>
 function id(n){return document.getElementById(n);}
@@ -1750,6 +1844,7 @@ function setAdminStatus(msg,err){var e=id('admin_status');e.textContent=msg;e.cl
 function setNameStatus(msg,err){var e=id('name_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setTimeStatus(msg,err){var e=id('time_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setLedStatus(msg,err){var e=id('led_status');e.textContent=msg;e.className=err?'status error':'status';}
+function setFirmwareStatus(msg,err){var e=id('firmware_status');e.textContent=msg;e.className=err?'status error':'status';}
 function formData(obj){return Object.keys(obj).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(obj[k]);}).join('&');}
 function toDateTimeLocalValue(epoch){
   var d=new Date((Number(epoch)||0)*1000);
@@ -1839,6 +1934,21 @@ function refreshLedStatus(){
 id('led_form').addEventListener('submit',function(e){
   e.preventDefault();
   fetch('/admin/led',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({ledAccessBlink:id('led_access_blink').checked?'1':'0'})}).then(function(r){r.text().then(function(msg){setLedStatus(msg||'Saved',!r.ok);refreshLedStatus();});});
+});
+id('firmware_form').addEventListener('submit',function(e){
+  e.preventDefault();
+  var input=id('firmware_file');
+  if(!input.files.length){setFirmwareStatus('Choose a firmware .bin file first',true);return;}
+  var file=input.files[0];
+  setFirmwareStatus('Uploading '+file.name+'...',false);
+  var fd=new FormData();
+  fd.append('firmware',file);
+  fetch('/admin/update',{method:'POST',body:fd}).then(function(r){
+    return r.text().then(function(msg){
+      setFirmwareStatus(msg||'Firmware upload finished',!r.ok);
+      if(r.ok){input.value='';}
+    });
+  }).catch(function(err){setFirmwareStatus(err.message||'Firmware upload failed',true);});
 });
 refreshWiFiList();
 refreshDeviceName();
@@ -2239,90 +2349,74 @@ static bool startSoftAPWithRetries(const char *ssid, const char *password) {
   return false;
 }
 
-// ─── MJPEG streaming task (core 0, port 81) ───────────────────────────────────
-static void streamTask(void *pvParameters) {
-    streamServer.begin();
-    Serial.println("[STREAM] Ready on port 81");
+static void handleStream() {
+    if (!checkAuth()) return;
 
-    for (;;) {
-        WiFiClient client = streamServer.accept();
-        if (!client) {
-            vTaskDelay(pdMS_TO_TICKS(10));
+    if (!ensureCameraReady()) {
+      server.send(503, "text/plain", "Camera unavailable");
+      return;
+    }
+
+    WiFiClient client = server.client();
+    Serial.println("[STREAM] Client connected");
+    streamClientConnected = true;
+    unsigned long lastFrameAt = 0;
+
+    client.print(
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: multipart/x-mixed-replace; boundary=--jpgbound\r\n"
+        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+        "Pragma: no-cache\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+    );
+
+    while (client.connected()) {
+        unsigned long now = millis();
+        if (lastFrameAt != 0) {
+            unsigned long elapsed = now - lastFrameAt;
+            if (elapsed < STREAM_FRAME_INTERVAL_MS) {
+                delay(STREAM_FRAME_INTERVAL_MS - elapsed);
+                continue;
+            }
+        }
+
+        camera_fb_t *fb = lockAndCaptureFrame(pdMS_TO_TICKS(1000));
+        if (!fb) {
+            delay(10);
             continue;
         }
 
-        Serial.println("[STREAM] Client connected");
-        streamClientConnected = true;
-        unsigned long lastFrameAt = 0;
-
-        // Consume request headers (wait for blank line)
-        {
-            unsigned long t = millis();
-            while (client.connected() && millis() - t < 3000) {
-                if (client.available()) {
-                    String line = client.readStringUntil('\n');
-                    if (line == "\r") break;
-                }
-            }
-        }
-
-        // Send multipart response headers
-        client.print(
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: multipart/x-mixed-replace; boundary=--jpgbound\r\n"
-            "Cache-Control: no-cache, no-store, must-revalidate\r\n"
-            "Pragma: no-cache\r\n"
-            "\r\n"
-        );
-
-        // Stream JPEG frames until client disconnects
-        while (client.connected()) {
-            unsigned long now = millis();
-            if (lastFrameAt != 0) {
-                unsigned long elapsed = now - lastFrameAt;
-                if (elapsed < STREAM_FRAME_INTERVAL_MS) {
-                    vTaskDelay(pdMS_TO_TICKS(STREAM_FRAME_INTERVAL_MS - elapsed));
-                    continue;
-                }
-            }
-
-            camera_fb_t *fb = lockAndCaptureFrame(pdMS_TO_TICKS(1000));
-            if (!fb) {
-                vTaskDelay(pdMS_TO_TICKS(10));
-                continue;
-            }
-
-            if (fb->format != PIXFORMAT_JPEG) {
-                unlockCameraFrame(fb);
-                vTaskDelay(pdMS_TO_TICKS(10));
-                continue;
-            }
-
-            now = millis();
-            recordFrameIfDue(fb, now);
-
-            char partHeader[128];
-            int hlen = snprintf(partHeader, sizeof(partHeader),
-                "--jpgbound\r\n"
-                "Content-Type: image/jpeg\r\n"
-                "Content-Length: %u\r\n"
-                "\r\n",
-                (unsigned int)fb->len);
-
-            bool ok = (client.write((const uint8_t *)partHeader, (size_t)hlen) == (size_t)hlen);
-            if (ok) ok = (client.write(fb->buf, fb->len) == fb->len);
-            if (ok) ok = (client.print("\r\n") > 0);
-
+        if (fb->format != PIXFORMAT_JPEG) {
             unlockCameraFrame(fb);
-            lastFrameAt = now;
-
-            if (!ok) break;
+            delay(10);
+            continue;
         }
 
-        streamClientConnected = false;
-        client.stop();
-        Serial.println("[STREAM] Client disconnected");
+        now = millis();
+        recordFrameIfDue(fb, now);
+
+        char partHeader[128];
+        int hlen = snprintf(partHeader, sizeof(partHeader),
+            "--jpgbound\r\n"
+            "Content-Type: image/jpeg\r\n"
+            "Content-Length: %u\r\n"
+            "\r\n",
+            (unsigned int)fb->len);
+
+        bool ok = (client.write((const uint8_t *)partHeader, (size_t)hlen) == (size_t)hlen);
+        if (ok) ok = (client.write(fb->buf, fb->len) == fb->len);
+        if (ok) ok = (client.print("\r\n") > 0);
+
+        unlockCameraFrame(fb);
+        lastFrameAt = now;
+
+        if (!ok) break;
     }
+
+    streamClientConnected = false;
+    client.stop();
+    Serial.println("[STREAM] Client disconnected");
 }
 
 // ─── Authentication helper ────────────────────────────────────────────────────
@@ -2663,6 +2757,11 @@ static void handleAdminPasswordChange() {
 static void handleCapture() {
     if (!checkAuth()) return;
 
+  if (!ensureCameraReady()) {
+    server.send(503, "text/plain", "Camera unavailable");
+    return;
+  }
+
     camera_fb_t *fb = lockAndCaptureFrame(pdMS_TO_TICKS(1000));
     if (!fb) {
         server.send(503, "text/plain", "Camera capture failed");
@@ -2722,6 +2821,11 @@ static void handleControl() {
         return;
       }
 
+      if (!ensureCameraReady()) {
+        server.send(503, "text/plain", "Camera unavailable");
+        return;
+      }
+
     sensor_t *s = esp_camera_sensor_get();
     if (!s) {
         server.send(503, "text/plain", "Camera sensor not available");
@@ -2772,6 +2876,11 @@ static void handleControl() {
 
 static void handleStatus() {
     if (!checkAuth()) return;
+
+  if (!ensureCameraReady()) {
+    server.send(503, "text/plain", "Camera unavailable");
+    return;
+  }
 
     sensor_t *s = esp_camera_sensor_get();
     if (!s) {
@@ -3336,6 +3445,88 @@ static void handleSDUpload() {
   sdUploadFailed = false;
 }
 
+static void handleFirmwareUploadData() {
+  if (!cfgAccessPass.isEmpty() && !server.authenticate("admin", cfgAccessPass.c_str())) {
+    firmwareUploadFailed = true;
+    return;
+  }
+
+  HTTPUpload &upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    firmwareUploadFailed = false;
+    firmwareUploadSuccess = false;
+    firmwareRestartAt = 0;
+
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
+      Update.printError(Serial);
+      firmwareUploadFailed = true;
+    }
+    return;
+  }
+
+  if (upload.status == UPLOAD_FILE_WRITE) {
+    if (firmwareUploadFailed) {
+      return;
+    }
+
+    size_t written = Update.write(upload.buf, upload.currentSize);
+    if (written != upload.currentSize) {
+      Update.printError(Serial);
+      firmwareUploadFailed = true;
+    }
+    return;
+  }
+
+  if (upload.status == UPLOAD_FILE_END) {
+    if (firmwareUploadFailed) {
+      Update.abort();
+      return;
+    }
+
+    if (!Update.end(true) || !Update.isFinished()) {
+      Update.printError(Serial);
+      firmwareUploadFailed = true;
+      return;
+    }
+
+    firmwareUploadSuccess = true;
+    firmwareRestartAt = millis() + FIRMWARE_RESTART_DELAY_MS;
+    Serial.printf("[OTA] Firmware upload complete (%u bytes). Restart scheduled.\n", (unsigned int)upload.totalSize);
+    return;
+  }
+
+  if (upload.status == UPLOAD_FILE_ABORTED) {
+    Update.abort();
+    firmwareUploadFailed = true;
+    firmwareUploadSuccess = false;
+    firmwareRestartAt = 0;
+    Serial.println("[OTA] Firmware upload aborted");
+  }
+}
+
+static void handleFirmwareUpload() {
+  if (!checkAuth()) {
+    server.send(401, "text/plain", "Unauthorized");
+    return;
+  }
+
+  server.sendHeader("Connection", "close");
+
+  if (firmwareUploadSuccess) {
+    server.send(200, "text/plain", "Firmware uploaded successfully. Device will reboot in a moment.");
+    return;
+  }
+
+  if (firmwareUploadFailed) {
+    server.send(500, "text/plain", "Firmware update failed. Check serial log for details.");
+    firmwareUploadFailed = false;
+    return;
+  }
+
+  server.send(400, "text/plain", "No firmware file provided");
+}
+
 static void handleCaptureSD() {
   if (!checkAuth()) return;
 
@@ -3355,6 +3546,11 @@ static void handleCaptureSD() {
   }
 
   String photoPath = buildCapturePath(sequence, "jpg");
+
+  if (!ensureCameraReady()) {
+    server.send(503, "text/plain", "Camera unavailable");
+    return;
+  }
 
   camera_fb_t *fb = lockAndCaptureFrame(pdMS_TO_TICKS(1000));
   if (!fb) {
@@ -3616,6 +3812,10 @@ static void serviceRecording() {
     return;
   }
 
+  if (!ensureCameraReady(pdMS_TO_TICKS(1000))) {
+    return;
+  }
+
   camera_fb_t *fb = lockAndCaptureFrame(pdMS_TO_TICKS(1000));
   if (!fb) {
     return;
@@ -3630,6 +3830,11 @@ static void handleRecordStart() {
 
   if (!initSDCard()) {
     server.send(500, "text/plain", "SD card not available");
+    return;
+  }
+
+  if (!ensureCameraReady()) {
+    server.send(503, "text/plain", "Camera unavailable");
     return;
   }
 
@@ -3733,6 +3938,7 @@ static void handleRecordStop() {
 // ─── WiFi mode starters ───────────────────────────────────────────────────────
 static void registerCameraRoutes() {
   server.on("/",              HTTP_GET,  handleCameraRoot);
+  server.on("/stream",        HTTP_GET,  handleStream);
   server.on("/admin",         HTTP_GET,  handleAdminPage);
   server.on("/sd",            HTTP_GET,  handleSDPage);
   server.on("/capture",       HTTP_GET,  handleCaptureSD);
@@ -3747,6 +3953,7 @@ static void registerCameraRoutes() {
   server.on("/admin/time/sync",HTTP_POST, handleAdminTimeSync);
   server.on("/admin/led",     HTTP_GET,  handleAdminLedGet);
   server.on("/admin/led",     HTTP_POST, handleAdminLedSet);
+  server.on("/admin/update",  HTTP_POST, handleFirmwareUpload, handleFirmwareUploadData);
   server.on("/wifi/list",     HTTP_GET,  handleWifiList);
   server.on("/wifi/add",      HTTP_POST, handleWifiAdd);
   server.on("/wifi/delete",   HTTP_POST, handleWifiDelete);
@@ -3761,23 +3968,15 @@ static void registerCameraRoutes() {
   server.onNotFound(handleNotFound);
 }
 
-static void ensureStreamTask() {
-  if (streamTaskStarted) {
-    return;
-  }
-  xTaskCreatePinnedToCore(streamTask, "streamTask", 8192, NULL, 2, NULL, 0);
-  streamTaskStarted = true;
-}
-
 static void startSetupAPMode() {
-  bool ok = startSoftAPWithRetries(AP_SETUP_SSID, nullptr);
+  bool ok = startSoftAPWithRetries(AP_SETUP_SSID, AP_SETUP_PASS);
   if (!ok) {
     Serial.println("[WIFI] Setup AP start failed");
     return;
   }
     ledSetupAPSequence();
-    Serial.printf("[WIFI] Open AP started — SSID: %s  IP: %s\n",
-    AP_SETUP_SSID, WiFi.softAPIP().toString().c_str());
+    Serial.printf("[WIFI] Protected setup AP started — SSID: %s  Password: %s  IP: %s\n",
+    AP_SETUP_SSID, AP_SETUP_PASS, WiFi.softAPIP().toString().c_str());
 
     server.on("/",     HTTP_GET,  handleSetupRoot);
     server.on("/wifi/scan", HTTP_GET, handleSetupWifiScan);
@@ -3811,7 +4010,6 @@ static void startCameraAPMode() {
   registerCameraRoutes();
   server.begin();
   Serial.println("[HTTP] Camera server ready on port 80 (AP mode)");
-  ensureStreamTask();
 }
 
 static bool syncClockWithNtp() {
@@ -3896,7 +4094,6 @@ static void startSTAMode() {
       registerCameraRoutes();
       server.begin();
       Serial.println("[HTTP] Camera server ready on port 80");
-      ensureStreamTask();
       return;
     }
 
@@ -3907,6 +4104,21 @@ static void startSTAMode() {
 
   Serial.println("[WIFI] All saved networks failed — switching to fallback AP");
   startCameraAPMode();
+}
+
+static void servicePendingFirmwareRestart() {
+  if (!firmwareUploadSuccess || firmwareRestartAt == 0) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if ((long)(now - firmwareRestartAt) < 0) {
+    return;
+  }
+
+  Serial.println("[OTA] Restarting after successful firmware update");
+  delay(100);
+  ESP.restart();
 }
 
 // ─── Arduino entry points ─────────────────────────────────────────────────────
@@ -3929,6 +4141,9 @@ void setup() {
 
   pinMode(BUTTON_GPIO, INPUT_PULLUP);
   pinMode(PIR_GPIO, INPUT);
+  pinMode(LED_FLASH_GPIO_NUM, OUTPUT);
+  digitalWrite(LED_FLASH_GPIO_NUM, LOW);
+  powerDownCameraHardware();
   Serial.printf("[GPIO] Button on GPIO%d, PIR on GPIO%d\n", BUTTON_GPIO, PIR_GPIO);
 
   // Load stored encrypted configuration from SD card.
@@ -3949,18 +4164,7 @@ void setup() {
   }
     Serial.printf("[CFG] Configured: %s\n", isConfigured ? "yes" : "no");
 
-    // Initialise camera
-    if (!initCameraWithRetries()) {
-        Serial.printf("[CAM] Fatal: camera init failed after %d attempts — restarting in %lu ms\n",
-          CAMERA_INIT_RETRIES,
-          (unsigned long)BOOT_RECOVERY_RESTART_DELAY_MS);
-        for (int i = 0; i < 5; ++i) {
-          ledWifiFailureSequence();
-        }
-        delay(BOOT_RECOVERY_RESTART_DELAY_MS);
-        ESP.restart();
-    }
-    Serial.println("[CAM] Camera ready");
+    Serial.printf("[CAM] Lazy init enabled with idle timeout %lu ms\n", cameraIdleTimeoutMs);
 
     if (isConfigured) {
         startSTAMode();
@@ -3973,4 +4177,6 @@ void loop() {
     server.handleClient();
   serviceNtpSync();
   serviceRecording();
+  serviceCameraIdleTimeout();
+  servicePendingFirmwareRestart();
 }

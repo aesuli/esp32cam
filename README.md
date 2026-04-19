@@ -18,7 +18,8 @@ Firmware for AI-Thinker ESP32-CAM (OV3660) with web streaming, camera controls, 
 
 - Device starts AP:
 	- SSID: ESP32-CAM-Setup
-	- Security: open network (no password)
+	- Security: WPA2-PSK
+	- Password: ESP32-CAM
 - Open http://192.168.4.1 and set:
 	- First WiFi SSID/password
 	- Admin password (minimum 8 characters)
@@ -54,7 +55,8 @@ Firmware for AI-Thinker ESP32-CAM (OV3660) with web streaming, camera controls, 
 - Web UI on port 80 with Basic Auth:
 	- Username: admin
 	- Password: configured admin password
-- MJPEG stream endpoint on port 81 (/stream).
+- MJPEG stream endpoint is served on port 80 at /stream and uses the same Basic Auth as the rest of the web UI.
+- Admin page supports browser-based firmware upload. After a successful upload, the ESP32 reboots into the new image automatically.
 
 ## WiFi connection failure fallback
 
@@ -77,6 +79,10 @@ The firmware provides a three-page web interface (all require authentication):
 ### Admin page
 - Manage WiFi credentials (reorder, add, update, delete, scan)
 - Change admin password
+- Change the device name
+- Set or sync device time
+- Enable or disable LED URL-access blink
+- Upload a new firmware binary for OTA update
 
 ### SD Browser page
 - Browse files on the microSD card
@@ -90,3 +96,11 @@ The firmware provides a three-page web interface (all require authentication):
 - **Video recordings** are saved to `/capture/VID_*.avi` in Motion JPEG AVI format with automatic timestamp-based filenames and timing based on the real capture duration
 - Both capture and record operations save to the microSD card
 - File-based storage allows later retrieval and analysis via the SD Browser page
+
+## Firmware OTA update
+
+- Build the firmware normally with PlatformIO.
+- The compiled image is generated at `.pio/build/esp32cam/firmware.bin`.
+- Open the Admin page, choose that `.bin` file in the Firmware Update panel, and upload it.
+- The firmware is transferred over the existing authenticated web interface and the device reboots automatically after a successful update.
+- The project now uses `partitions_ota.csv` so the flash has two application slots, which is required for reliable self-update on ESP32.
