@@ -74,13 +74,23 @@ static constexpr uint32_t CAMERA_XCLK_FREQS_HZ[] = {
 #define CAPTURE_COUNTER_FILE_PATH "/capture_counter.txt"
 
 // ─── Globals ──────────────────────────────────────────────────────────────────
-static WebServer   server(80);
+static constexpr uint16_t HTTP_MAIN_PORT = 80;
+static constexpr uint16_t HTTP_STREAM_PORT = 81;
+static constexpr uint16_t HTTP_TRANSFER_PORT = 82;
+static constexpr uint32_t HTTP_STREAM_TASK_STACK = 8192;
+static constexpr uint32_t HTTP_TRANSFER_TASK_STACK = 8192;
+
+static WebServer   server(HTTP_MAIN_PORT);
+static WebServer   streamServer(HTTP_STREAM_PORT);
+static WebServer   transferServer(HTTP_TRANSFER_PORT);
 
 static String cfgAccessPass;
 static String cfgDeviceName;
+static String routeAccessToken;
 static bool   isConfigured = false;
 static bool   recordingActive = false;
 static volatile bool streamClientConnected = false;
+static volatile bool streamClientAbortRequested = false;
 static bool   flashEnabled = false;
 static bool   cameraInitialized = false;
 static bool   ledAccessBlinkEnabled = false;
@@ -108,6 +118,8 @@ static uint32_t captureSequence = 0;
 static bool captureSequenceLoaded = false;
 static SemaphoreHandle_t cameraMutex = nullptr;
 static SemaphoreHandle_t recordingMutex = nullptr;
+static TaskHandle_t streamServerTaskHandle = nullptr;
+static TaskHandle_t transferServerTaskHandle = nullptr;
 static constexpr unsigned long STREAM_FRAME_INTERVAL_MS = 100;
 static constexpr unsigned long RECORDING_FRAME_INTERVAL_MS = 100;
 static constexpr unsigned long FIRMWARE_RESTART_DELAY_MS = 1500;
@@ -969,6 +981,35 @@ static String jsonEscape(const String &value) {
   return escaped;
 }
 
+static String urlEncode(const String &value) {
+  static const char hex[] = "0123456789ABCDEF";
+  String escaped;
+  escaped.reserve(value.length() * 3);
+
+  for (unsigned int i = 0; i < value.length(); ++i) {
+    uint8_t c = (uint8_t)value[i];
+    bool safe = (c >= 'A' && c <= 'Z')
+             || (c >= 'a' && c <= 'z')
+             || (c >= '0' && c <= '9')
+             || c == '-' || c == '_' || c == '.' || c == '~';
+    if (safe) {
+      escaped += (char)c;
+    } else {
+      escaped += '%';
+      escaped += hex[(c >> 4) & 0x0F];
+      escaped += hex[c & 0x0F];
+    }
+  }
+
+  return escaped;
+}
+
+static void sendHtmlWithToken(const char *html) {
+  String page(html);
+  page.replace("__ROUTE_TOKEN__", routeAccessToken);
+  server.send(200, "text/html", page);
+}
+
 static bool encryptPayload(const std::vector<uint8_t> &plain, String &ivHex, String &cipherHex) {
   if (plain.empty()) {
     return false;
@@ -1598,6 +1639,7 @@ header span{font-size:.85em;color:#888}
 <script>
 var recordingMode=false;
 var streamVisible=true;
+var streamUrl='http://'+window.location.hostname+':81/stream?t='+encodeURIComponent('__ROUTE_TOKEN__');
 function id(n){return document.getElementById(n);}
 function chk(el){return el.checked?1:0;}
 function ctrl(v,val,persist){
@@ -1605,6 +1647,21 @@ function ctrl(v,val,persist){
   if(persist===false){url+='&persist=0';}
   else{url+='&persist=1';}
   fetch(url);
+}
+function closeStreamConnection(){
+  if(!navigator.sendBeacon){
+    fetch('/stream/close',{method:'POST',keepalive:true}).catch(function(){});
+    return;
+  }
+  navigator.sendBeacon('/stream/close',new Blob(['close'],{type:'text/plain'}));
+}
+function releaseStream(notifyServer){
+  var img=id('stream');
+  if(img.src){
+    img.dataset.src=img.dataset.src||img.src;
+    img.removeAttribute('src');
+  }
+  if(notifyServer){closeStreamConnection();}
 }
 function setStreamVisibility(isVisible){
   var img=id('stream');
@@ -1615,11 +1672,10 @@ function setStreamVisibility(isVisible){
   placeholder.classList.toggle('visible',!streamVisible);
   toggle.textContent=streamVisible?'🙈 Hide Stream':'👁️ Show Stream';
   if(streamVisible){
-    if(!img.dataset.src){img.dataset.src='/stream';}
+    if(!img.dataset.src){img.dataset.src=streamUrl;}
     if(img.src!==img.dataset.src){img.src=img.dataset.src;}
-  }else if(img.src){
-    img.dataset.src=img.dataset.src||img.src;
-    img.removeAttribute('src');
+  }else{
+    releaseStream(true);
   }
 }
 function setRecordingState(isRecording,statusText){
@@ -1689,8 +1745,10 @@ id('flash_btn').addEventListener('click',function(){
   });
 });
 var h=window.location.hostname;
-id('stream').dataset.src='/stream';
+id('stream').dataset.src=streamUrl;
 id('ip_label').innerText=h;
+window.addEventListener('pagehide',function(){releaseStream(true);});
+window.addEventListener('beforeunload',function(){releaseStream(true);});
 setStreamVisibility(false);
 fetch('/status').then(function(r){return r.json();}).then(function(s){
   ['framesize','brightness','contrast','saturation','quality','special_effect','wb_mode'].forEach(function(k){
@@ -1839,6 +1897,8 @@ header h1{color:#e94560;font-size:1.3em}
 </div>
 <script>
 function id(n){return document.getElementById(n);}
+var transferBase='http://'+window.location.hostname+':82';
+var transferToken=encodeURIComponent('__ROUTE_TOKEN__');
 function setWiFiStatus(msg,err){var e=id('wifi_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setAdminStatus(msg,err){var e=id('admin_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setNameStatus(msg,err){var e=id('name_status');e.textContent=msg;e.className=err?'status error':'status';}
@@ -1943,7 +2003,7 @@ id('firmware_form').addEventListener('submit',function(e){
   setFirmwareStatus('Uploading '+file.name+'...',false);
   var fd=new FormData();
   fd.append('firmware',file);
-  fetch('/admin/update',{method:'POST',body:fd}).then(function(r){
+  fetch(transferBase+'/admin/update?t='+transferToken,{method:'POST',body:fd}).then(function(r){
     return r.text().then(function(msg){
       setFirmwareStatus(msg||'Firmware upload finished',!r.ok);
       if(r.ok){input.value='';}
@@ -2043,6 +2103,8 @@ header h1{color:#e94560;font-size:1.3em}
 <script>
 var allItems=[];
 var currentDir='/';
+var transferBase='http://'+window.location.hostname+':82';
+var transferToken=encodeURIComponent('__ROUTE_TOKEN__');
 function esc(s){return String(s).replace(/[&<>\"']/g,function(ch){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[ch];});}
 function setStatus(msg,isError){
   var el=document.getElementById('status');
@@ -2145,11 +2207,11 @@ function renderItems(items){
     }
 
     var preview=isImage(item.path)
-      ?'<img class="thumb" loading="lazy" src="/sd/view?file='+encodeURIComponent(item.path)+'" alt="preview">'
+      ?'<img class="thumb" loading="lazy" src="'+transferBase+'/sd/view?file='+encodeURIComponent(item.path)+'&t='+transferToken+'" alt="preview">'
       :'<div class="thumb"></div>';
     return '<div class="file-item">'
       +'<div class="file-left">'+preview+'<div class="meta"><strong>'+esc(item.name)+'</strong><span>'+formatSize(item.size)+' • '+esc(item.path)+'</span></div></div>'
-      +'<div class="file-actions"><a href="/sd/download?file='+encodeURIComponent(item.path)+'">Download</a><a href="/sd/view?file='+encodeURIComponent(item.path)+'" target="_blank" rel="noopener">Open</a><button onclick="deleteFile(\''+item.path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\')">Delete</button></div>'
+      +'<div class="file-actions"><a href="'+transferBase+'/sd/download?file='+encodeURIComponent(item.path)+'&t='+transferToken+'">Download</a><a href="'+transferBase+'/sd/view?file='+encodeURIComponent(item.path)+'&t='+transferToken+'" target="_blank" rel="noopener">Open</a><button onclick="deleteFile(\''+item.path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\')">Delete</button></div>'
       +'</div>';
   }).join('');
 
@@ -2203,7 +2265,7 @@ function uploadFile(input){
   if(!input.files.length)return;
   setStatus('Uploading '+input.files[0].name+'...',false);
   var fd=new FormData();fd.append('file',input.files[0]);
-  fetch('/sd/upload',{method:'POST',body:fd}).then(function(r){
+  fetch(transferBase+'/sd/upload?t='+transferToken,{method:'POST',body:fd}).then(function(r){
     return r.text().then(function(t){
       if(!r.ok){throw new Error(t||'Upload failed');}
       setStatus(t||'Upload complete',false);
@@ -2351,17 +2413,94 @@ static bool startSoftAPWithRetries(const char *ssid, const char *password) {
 
 // Forward declaration
 static bool checkAuth();
+static bool checkAuth(WebServer &srv, bool allowSharedToken = false);
+static bool hasSharedAccessToken(WebServer &srv);
+static String buildLocalUrl(uint16_t port, const String &path, bool withToken = false);
+static void handleStreamMain();
+static void handleStreamClose();
+static void handleStreamWorker();
+static void handleSDDownloadMain();
+static void handleSDDownloadWorker();
+static void handleSDViewMain();
+static void handleSDViewWorker();
+static void handleSDUploadMain();
+static void handleSDUploadWorker();
+static void handleSDUploadDataWorker();
+static void handleFirmwareUploadMain();
+static void handleFirmwareUploadWorker();
+static void handleFirmwareUploadDataWorker();
+static void streamServerTask(void *arg);
+static void transferServerTask(void *arg);
+static void startAuxHttpServers();
 
-static void handleStream() {
-    if (!checkAuth()) return;
+static bool hasSharedAccessToken(WebServer &srv) {
+  if (routeAccessToken.isEmpty() || !srv.hasArg("t")) {
+    return false;
+  }
+
+  return srv.arg("t") == routeAccessToken;
+}
+
+static bool checkAuth(WebServer &srv, bool allowSharedToken) {
+  // LED feedback for URL access blink (if enabled)
+  if (ledAccessBlinkEnabled) {
+    unsigned long now = millis();
+    if (now - lastUrlAccessBlink > LED_ACCESS_BLINK_INTERVAL_MS) {
+      ledQuickBlink();
+      lastUrlAccessBlink = now;
+    }
+  }
+
+  if (cfgAccessPass.isEmpty()) {
+    return true;
+  }
+
+  if (allowSharedToken && hasSharedAccessToken(srv)) {
+    return true;
+  }
+
+  if (!srv.authenticate("admin", cfgAccessPass.c_str())) {
+    srv.requestAuthentication(BASIC_AUTH, "ESP32-CAM");
+    return false;
+  }
+
+  return true;
+}
+
+static String buildLocalUrl(uint16_t port, const String &path, bool withToken) {
+  String url = "http://";
+
+  if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
+    url += WiFi.softAPIP().toString();
+  } else if (WiFi.status() == WL_CONNECTED) {
+    url += WiFi.localIP().toString();
+  } else {
+    url += "127.0.0.1";
+  }
+
+  url += ":";
+  url += String(port);
+  url += path;
+
+  if (withToken && !routeAccessToken.isEmpty()) {
+    url += (path.indexOf('?') >= 0) ? "&t=" : "?t=";
+    url += routeAccessToken;
+  }
+
+  return url;
+}
+
+static void handleStreamWorker() {
+    if (!checkAuth(streamServer, true)) return;
 
     if (!ensureCameraReady()) {
-      server.send(503, "text/plain", "Camera unavailable");
+      streamServer.send(503, "text/plain", "Camera unavailable");
       return;
     }
 
-    WiFiClient client = server.client();
+    WiFiClient client = streamServer.client();
     Serial.println("[STREAM] Client connected");
+    streamClientAbortRequested = false;
     streamClientConnected = true;
     unsigned long lastFrameAt = 0;
 
@@ -2375,6 +2514,10 @@ static void handleStream() {
     );
 
     while (client.connected()) {
+        if (streamClientAbortRequested) {
+            break;
+        }
+
         unsigned long now = millis();
         if (lastFrameAt != 0) {
             unsigned long elapsed = now - lastFrameAt;
@@ -2417,28 +2560,39 @@ static void handleStream() {
         if (!ok) break;
     }
 
+    streamClientAbortRequested = false;
     streamClientConnected = false;
     client.stop();
     Serial.println("[STREAM] Client disconnected");
 }
 
+static void handleStreamMain() {
+  if (!checkAuth(server)) {
+    return;
+  }
+
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  server.sendHeader("Pragma", "no-cache");
+  server.sendHeader("Location", buildLocalUrl(HTTP_STREAM_PORT, "/stream", true));
+  server.send(302, "text/plain", "Redirecting to stream server");
+}
+
+static void handleStreamClose() {
+  if (!checkAuth(server)) {
+    return;
+  }
+
+  if (streamClientConnected) {
+    streamClientAbortRequested = true;
+    Serial.println("[STREAM] Close requested by UI");
+  }
+
+  server.send(204, "text/plain", "");
+}
+
 // ─── Authentication helper ────────────────────────────────────────────────────
 static bool checkAuth() {
-    // LED feedback for URL access blink (if enabled)
-    if (ledAccessBlinkEnabled) {
-      unsigned long now = millis();
-      if (now - lastUrlAccessBlink > LED_ACCESS_BLINK_INTERVAL_MS) {
-        ledQuickBlink();
-        lastUrlAccessBlink = now;
-      }
-    }
-    
-    if (cfgAccessPass.isEmpty()) return true;
-    if (!server.authenticate("admin", cfgAccessPass.c_str())) {
-        server.requestAuthentication(BASIC_AUTH, "ESP32-CAM");
-        return false;
-    }
-    return true;
+    return checkAuth(server);
 }
 
 // ─── Route handlers: AP (setup) mode ─────────────────────────────────────────
@@ -2508,7 +2662,7 @@ static void handleSave() {
 // ─── Route handlers: STA (camera) mode ───────────────────────────────────────
 static void handleCameraRoot() {
     if (!checkAuth()) return;
-    server.send_P(200, "text/html", MAIN_HTML);
+    sendHtmlWithToken(MAIN_HTML);
 }
 
 static String wifiEncryptionLabel(wifi_auth_mode_t authMode) {
@@ -3162,12 +3316,12 @@ static void handleAdminLedSet() {
 
 static void handleAdminPage() {
   if (!checkAuth()) return;
-  server.send_P(200, "text/html", ADMIN_HTML);
+  sendHtmlWithToken(ADMIN_HTML);
 }
 
 static void handleSDPage() {
   if (!checkAuth()) return;
-  server.send_P(200, "text/html", SD_HTML);
+  sendHtmlWithToken(SD_HTML);
 }
 
 static void handleSDList() {
@@ -3237,31 +3391,36 @@ static void handleSDList() {
   server.send(200, "application/json", json);
 }
 
-static void handleSDDownload() {
-  if (!checkAuth()) {
-    server.send(401, "text/plain", "Unauthorized");
+static void handleSDDownloadWorker() {
+  if (!checkAuth(transferServer, true)) {
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(401, "text/plain", "Unauthorized");
     return;
   }
 
-  if (!server.hasArg("file")) {
-    server.send(400, "text/plain", "file parameter required");
+  if (!transferServer.hasArg("file")) {
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(400, "text/plain", "file parameter required");
     return;
   }
 
   if (!initSDCard()) {
-    server.send(500, "text/plain", "SD card not available");
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(500, "text/plain", "SD card not available");
     return;
   }
 
   String filePath;
-  if (!normalizeAndValidateSDPath(server.arg("file"), filePath)) {
-    server.send(400, "text/plain", "Invalid file path");
+  if (!normalizeAndValidateSDPath(transferServer.arg("file"), filePath)) {
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(400, "text/plain", "Invalid file path");
     return;
   }
 
   File file = SD_MMC.open(filePath, FILE_READ);
   if (!file || file.isDirectory()) {
-    server.send(404, "text/plain", "File not found");
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(404, "text/plain", "File not found");
     return;
   }
 
@@ -3271,9 +3430,24 @@ static void handleSDDownload() {
     downloadName = downloadName.substring(slash + 1);
   }
 
-  server.sendHeader("Content-Disposition", "attachment; filename=\"" + downloadName + "\"");
-  server.streamFile(file, "application/octet-stream");
+  transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+  transferServer.sendHeader("Content-Disposition", "attachment; filename=\"" + downloadName + "\"");
+  transferServer.streamFile(file, "application/octet-stream");
   file.close();
+}
+
+static void handleSDDownloadMain() {
+  if (!checkAuth(server)) {
+    return;
+  }
+
+  if (!server.hasArg("file")) {
+    server.send(400, "text/plain", "file parameter required");
+    return;
+  }
+
+  server.sendHeader("Location", buildLocalUrl(HTTP_TRANSFER_PORT, String("/sd/download?file=") + urlEncode(server.arg("file")), true));
+  server.send(302, "text/plain", "Redirecting to transfer server");
 }
 
 static String sdMimeTypeForPath(const String &filePath) {
@@ -3293,9 +3467,46 @@ static String sdMimeTypeForPath(const String &filePath) {
   return "application/octet-stream";
 }
 
-static void handleSDView() {
-  if (!checkAuth()) {
-    server.send(401, "text/plain", "Unauthorized");
+static void handleSDViewWorker() {
+  if (!checkAuth(transferServer, true)) {
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(401, "text/plain", "Unauthorized");
+    return;
+  }
+
+  if (!transferServer.hasArg("file")) {
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(400, "text/plain", "file parameter required");
+    return;
+  }
+
+  if (!initSDCard()) {
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(500, "text/plain", "SD card not available");
+    return;
+  }
+
+  String filePath;
+  if (!normalizeAndValidateSDPath(transferServer.arg("file"), filePath)) {
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(400, "text/plain", "Invalid file path");
+    return;
+  }
+
+  File file = SD_MMC.open(filePath, FILE_READ);
+  if (!file || file.isDirectory()) {
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(404, "text/plain", "File not found");
+    return;
+  }
+
+  transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+  transferServer.streamFile(file, sdMimeTypeForPath(filePath));
+  file.close();
+}
+
+static void handleSDViewMain() {
+  if (!checkAuth(server)) {
     return;
   }
 
@@ -3304,25 +3515,8 @@ static void handleSDView() {
     return;
   }
 
-  if (!initSDCard()) {
-    server.send(500, "text/plain", "SD card not available");
-    return;
-  }
-
-  String filePath;
-  if (!normalizeAndValidateSDPath(server.arg("file"), filePath)) {
-    server.send(400, "text/plain", "Invalid file path");
-    return;
-  }
-
-  File file = SD_MMC.open(filePath, FILE_READ);
-  if (!file || file.isDirectory()) {
-    server.send(404, "text/plain", "File not found");
-    return;
-  }
-
-  server.streamFile(file, sdMimeTypeForPath(filePath));
-  file.close();
+  server.sendHeader("Location", buildLocalUrl(HTTP_TRANSFER_PORT, String("/sd/view?file=") + urlEncode(server.arg("file")), true));
+  server.send(302, "text/plain", "Redirecting to transfer server");
 }
 
 static void handleSDDelete() {
@@ -3426,9 +3620,83 @@ static void handleSDUploadData() {
   }
 }
 
-static void handleSDUpload() {
-  if (!checkAuth()) {
-    server.send(401, "text/plain", "Unauthorized");
+static void handleSDUploadDataWorker() {
+  if (!initSDCard()) {
+    sdUploadFailed = true;
+    return;
+  }
+
+  if (!cfgAccessPass.isEmpty() && !hasSharedAccessToken(transferServer)
+      && !transferServer.authenticate("admin", cfgAccessPass.c_str())) {
+    sdUploadFailed = true;
+    return;
+  }
+
+  HTTPUpload &upload = transferServer.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    sdUploadFailed = false;
+    sdUploadPath = "";
+
+    String filename = upload.filename;
+    filename.replace('\\', '/');
+    int slash = filename.lastIndexOf('/');
+    if (slash >= 0) {
+      filename = filename.substring(slash + 1);
+    }
+
+    if (filename.isEmpty() || filename.indexOf("..") != -1 || filename.indexOf('/') != -1) {
+      sdUploadFailed = true;
+      return;
+    }
+
+    sdUploadPath = "/" + filename;
+    SD_MMC.remove(sdUploadPath);
+    sdUploadFile = SD_MMC.open(sdUploadPath, FILE_WRITE);
+    if (!sdUploadFile) {
+      sdUploadFailed = true;
+      return;
+    }
+    return;
+  }
+
+  if (upload.status == UPLOAD_FILE_WRITE) {
+    if (sdUploadFailed || !sdUploadFile) {
+      sdUploadFailed = true;
+      return;
+    }
+    size_t written = sdUploadFile.write(upload.buf, upload.currentSize);
+    if (written != upload.currentSize) {
+      sdUploadFailed = true;
+    }
+    return;
+  }
+
+  if (upload.status == UPLOAD_FILE_END) {
+    if (sdUploadFile) {
+      sdUploadFile.close();
+    }
+    if (sdUploadFailed && !sdUploadPath.isEmpty()) {
+      SD_MMC.remove(sdUploadPath);
+    }
+    return;
+  }
+
+  if (upload.status == UPLOAD_FILE_ABORTED) {
+    if (sdUploadFile) {
+      sdUploadFile.close();
+    }
+    if (!sdUploadPath.isEmpty()) {
+      SD_MMC.remove(sdUploadPath);
+    }
+    sdUploadFailed = true;
+  }
+}
+
+static void handleSDUploadWorker() {
+  if (!checkAuth(transferServer, true)) {
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(401, "text/plain", "Unauthorized");
     return;
   }
 
@@ -3436,25 +3704,40 @@ static void handleSDUpload() {
     sdUploadFile.close();
   }
 
+  transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+
   if (sdUploadFailed) {
-    server.send(500, "text/plain", "Upload failed");
+    transferServer.send(500, "text/plain", "Upload failed");
   } else if (sdUploadPath.isEmpty()) {
-    server.send(400, "text/plain", "No file provided");
+    transferServer.send(400, "text/plain", "No file provided");
   } else {
-    server.send(200, "text/plain", "Uploaded: " + sdUploadPath);
+    transferServer.send(200, "text/plain", "Uploaded: " + sdUploadPath);
   }
 
   sdUploadPath = "";
   sdUploadFailed = false;
 }
 
-static void handleFirmwareUploadData() {
-  if (!cfgAccessPass.isEmpty() && !server.authenticate("admin", cfgAccessPass.c_str())) {
+static void handleSDUploadMain() {
+  if (!checkAuth(server)) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(401, "text/plain", "Unauthorized");
+    return;
+  }
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Location", buildLocalUrl(HTTP_TRANSFER_PORT, "/sd/upload", true));
+  server.send(307, "text/plain", "Redirecting to transfer server");
+}
+
+static void handleFirmwareUploadDataWorker() {
+  if (!cfgAccessPass.isEmpty() && !hasSharedAccessToken(transferServer)
+      && !transferServer.authenticate("admin", cfgAccessPass.c_str())) {
     firmwareUploadFailed = true;
     return;
   }
 
-  HTTPUpload &upload = server.upload();
+  HTTPUpload &upload = transferServer.upload();
 
   if (upload.status == UPLOAD_FILE_START) {
     firmwareUploadFailed = false;
@@ -3508,26 +3791,40 @@ static void handleFirmwareUploadData() {
   }
 }
 
-static void handleFirmwareUpload() {
-  if (!checkAuth()) {
-    server.send(401, "text/plain", "Unauthorized");
+static void handleFirmwareUploadWorker() {
+  if (!checkAuth(transferServer, true)) {
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(401, "text/plain", "Unauthorized");
     return;
   }
 
-  server.sendHeader("Connection", "close");
+  transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+  transferServer.sendHeader("Connection", "close");
 
   if (firmwareUploadSuccess) {
-    server.send(200, "text/plain", "Firmware uploaded successfully. Device will reboot in a moment.");
+    transferServer.send(200, "text/plain", "Firmware uploaded successfully. Device will reboot in a moment.");
     return;
   }
 
   if (firmwareUploadFailed) {
-    server.send(500, "text/plain", "Firmware update failed. Check serial log for details.");
+    transferServer.send(500, "text/plain", "Firmware update failed. Check serial log for details.");
     firmwareUploadFailed = false;
     return;
   }
 
-  server.send(400, "text/plain", "No firmware file provided");
+  transferServer.send(400, "text/plain", "No firmware file provided");
+}
+
+static void handleFirmwareUploadMain() {
+  if (!checkAuth(server)) {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(401, "text/plain", "Unauthorized");
+    return;
+  }
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Location", buildLocalUrl(HTTP_TRANSFER_PORT, "/admin/update", true));
+  server.send(307, "text/plain", "Redirecting to transfer server");
 }
 
 static void handleCaptureSD() {
@@ -3938,10 +4235,68 @@ static void handleRecordStop() {
   server.send(statusCode, "text/plain", message);
 }
 
+static void streamServerTask(void *arg) {
+  WebServer *srv = static_cast<WebServer *>(arg);
+  for (;;) {
+    srv->handleClient();
+    vTaskDelay(1);
+  }
+}
+
+static void transferServerTask(void *arg) {
+  WebServer *srv = static_cast<WebServer *>(arg);
+  for (;;) {
+    srv->handleClient();
+    vTaskDelay(1);
+  }
+}
+
+static void startAuxHttpServers() {
+  if (!streamServerTaskHandle) {
+    streamServer.on("/stream", HTTP_GET, handleStreamWorker);
+    streamServer.onNotFound([]() {
+      streamServer.send(404, "text/plain", "Not found");
+    });
+    streamServer.begin();
+    xTaskCreatePinnedToCore(
+      streamServerTask,
+      "http-stream",
+      HTTP_STREAM_TASK_STACK,
+      &streamServer,
+      1,
+      &streamServerTaskHandle,
+      ARDUINO_RUNNING_CORE
+    );
+    Serial.printf("[HTTP] Stream server ready on port %u\n", (unsigned int)HTTP_STREAM_PORT);
+  }
+
+  if (!transferServerTaskHandle) {
+    transferServer.on("/sd/download", HTTP_GET, handleSDDownloadWorker);
+    transferServer.on("/sd/view", HTTP_GET, handleSDViewWorker);
+    transferServer.on("/sd/upload", HTTP_POST, handleSDUploadWorker, handleSDUploadDataWorker);
+    transferServer.on("/admin/update", HTTP_POST, handleFirmwareUploadWorker, handleFirmwareUploadDataWorker);
+    transferServer.onNotFound([]() {
+      transferServer.send(404, "text/plain", "Not found");
+    });
+    transferServer.begin();
+    xTaskCreatePinnedToCore(
+      transferServerTask,
+      "http-transfer",
+      HTTP_TRANSFER_TASK_STACK,
+      &transferServer,
+      1,
+      &transferServerTaskHandle,
+      ARDUINO_RUNNING_CORE
+    );
+    Serial.printf("[HTTP] Transfer server ready on port %u\n", (unsigned int)HTTP_TRANSFER_PORT);
+  }
+}
+
 // ─── WiFi mode starters ───────────────────────────────────────────────────────
 static void registerCameraRoutes() {
   server.on("/",              HTTP_GET,  handleCameraRoot);
-  server.on("/stream",        HTTP_GET,  handleStream);
+  server.on("/stream",        HTTP_GET,  handleStreamMain);
+  server.on("/stream/close",  HTTP_POST, handleStreamClose);
   server.on("/admin",         HTTP_GET,  handleAdminPage);
   server.on("/sd",            HTTP_GET,  handleSDPage);
   server.on("/capture",       HTTP_GET,  handleCaptureSD);
@@ -3956,16 +4311,16 @@ static void registerCameraRoutes() {
   server.on("/admin/time/sync",HTTP_POST, handleAdminTimeSync);
   server.on("/admin/led",     HTTP_GET,  handleAdminLedGet);
   server.on("/admin/led",     HTTP_POST, handleAdminLedSet);
-  server.on("/admin/update",  HTTP_POST, handleFirmwareUpload, handleFirmwareUploadData);
+  server.on("/admin/update",  HTTP_POST, handleFirmwareUploadMain);
   server.on("/wifi/list",     HTTP_GET,  handleWifiList);
   server.on("/wifi/add",      HTTP_POST, handleWifiAdd);
   server.on("/wifi/delete",   HTTP_POST, handleWifiDelete);
   server.on("/wifi/move",     HTTP_POST, handleWifiMove);
   server.on("/sd/list",       HTTP_GET,  handleSDList);
-  server.on("/sd/download",   HTTP_GET,  handleSDDownload);
-  server.on("/sd/view",       HTTP_GET,  handleSDView);
+  server.on("/sd/download",   HTTP_GET,  handleSDDownloadMain);
+  server.on("/sd/view",       HTTP_GET,  handleSDViewMain);
   server.on("/sd/delete",     HTTP_POST, handleSDDelete);
-  server.on("/sd/upload",     HTTP_POST, handleSDUpload, handleSDUploadData);
+  server.on("/sd/upload",     HTTP_POST, handleSDUploadMain);
   server.on("/record/start",  HTTP_POST, handleRecordStart);
   server.on("/record/stop",   HTTP_POST, handleRecordStop);
   server.onNotFound(handleNotFound);
@@ -4012,6 +4367,7 @@ static void startCameraAPMode() {
 
   registerCameraRoutes();
   server.begin();
+  startAuxHttpServers();
   Serial.println("[HTTP] Camera server ready on port 80 (AP mode)");
 }
 
@@ -4096,6 +4452,7 @@ static void startSTAMode() {
       syncClockWithNtp();
       registerCameraRoutes();
       server.begin();
+      startAuxHttpServers();
       Serial.println("[HTTP] Camera server ready on port 80");
       return;
     }
@@ -4165,6 +4522,8 @@ void setup() {
     ledAccessBlinkEnabled = false;
     isConfigured = false;
   }
+    routeAccessToken = String((uint32_t)esp_random(), HEX) + String((uint32_t)esp_random(), HEX);
+    Serial.printf("[HTTP] Shared route token initialized (%u chars)\n", (unsigned int)routeAccessToken.length());
     Serial.printf("[CFG] Configured: %s\n", isConfigured ? "yes" : "no");
 
     Serial.printf("[CAM] Lazy init enabled with idle timeout %lu ms\n", cameraIdleTimeoutMs);
