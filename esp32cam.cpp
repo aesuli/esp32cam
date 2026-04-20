@@ -94,10 +94,11 @@ static volatile bool streamClientAbortRequested = false;
 static bool   flashEnabled = false;
 static bool   cameraInitialized = false;
 static bool   ledAccessBlinkEnabled = false;
+static bool   wifiModemSleepEnabled = false;
 static unsigned long lastUrlAccessBlink = 0;
 static unsigned long lastCameraActivityAt = 0;
 static constexpr unsigned long LED_ACCESS_BLINK_INTERVAL_MS = 100;  // Minimum interval between access blinks
-static unsigned long cameraIdleTimeoutMs = 10000;
+static unsigned long cameraIdleTimeoutMs = 3000;
 static unsigned long recordingStartTime = 0;
 static uint32_t recordingDurationMs = 0;
 static unsigned long recordingLastFrameAt = 0;
@@ -126,6 +127,9 @@ static constexpr unsigned long FIRMWARE_RESTART_DELAY_MS = 1500;
 static constexpr uint32_t AVI_HAS_INDEX_FLAG = 0x00000010UL;
 static constexpr uint32_t AVI_KEYFRAME_FLAG = 0x00000010UL;
 static constexpr size_t AVI_HEADER_SIZE = 224;
+static constexpr uint32_t AVI_MOVI_LIST_HEADER_SIZE = 4;
+static constexpr const char *CAPTURE_DIRECTORY = "/capture";
+static constexpr const char *AVI_VIDEO_CHUNK_ID = "00dc";
 static constexpr const char *SERIAL_LOG_FILE_PATH = "/log.txt";
 
 static bool initSDCard();
@@ -276,6 +280,34 @@ struct StoredConfig {
   bool ledAccessBlink = false;  // LED blink on URL access
 };
 
+struct FrameSizeOption {
+  framesize_t value;
+  const char *label;
+};
+
+static constexpr FrameSizeOption FRAME_SIZE_OPTIONS[] = {
+  {FRAMESIZE_QXGA, "QXGA"},
+  {FRAMESIZE_P_3MP, "P-3MP"},
+  {FRAMESIZE_P_HD, "P-HD"},
+  {FRAMESIZE_FHD, "FHD"},
+  {FRAMESIZE_UXGA, "UXGA"},
+  {FRAMESIZE_SXGA, "SXGA"},
+  {FRAMESIZE_HD, "HD"},
+  {FRAMESIZE_XGA, "XGA"},
+  {FRAMESIZE_SVGA, "SVGA"},
+  {FRAMESIZE_VGA, "VGA"},
+  {FRAMESIZE_HVGA, "HVGA"},
+  {FRAMESIZE_CIF, "CIF"},
+  {FRAMESIZE_QVGA, "QVGA"},
+  {FRAMESIZE_240X240, "240x240"},
+  {FRAMESIZE_HQVGA, "HQVGA"},
+  {FRAMESIZE_QCIF, "QCIF"},
+  {FRAMESIZE_QQVGA, "QQVGA"},
+  {FRAMESIZE_96X96, "96x96"}
+};
+
+static constexpr framesize_t DEFAULT_SENSOR_MAX_FRAMESIZE = FRAMESIZE_QXGA;
+
 static StoredConfig runtimeConfig;
 static bool syncClockWithNtp();
 static camera_fb_t *lockAndCaptureFrame(TickType_t timeoutTicks = pdMS_TO_TICKS(1000));
@@ -290,6 +322,85 @@ static bool loadRuntimeConfigWithRetries(StoredConfig &cfg);
 static bool initCameraWithRetries();
 static bool waitForIO0Released(unsigned long timeoutMs);
 static void servicePendingFirmwareRestart();
+static void setWifiModemSleep(bool enabled, const char *reason = nullptr);
+
+static framesize_t getSensorMaxFrameSize(sensor_t *sensor) {
+  if (sensor) {
+    camera_sensor_info_t *sensorInfo = esp_camera_sensor_get_info(&sensor->id);
+    if (sensorInfo) {
+      return sensorInfo->max_size;
+    }
+  }
+
+  return DEFAULT_SENSOR_MAX_FRAMESIZE;
+}
+
+static bool isValidFrameSizeValue(sensor_t *sensor, int value) {
+  return value >= 0
+      && value < FRAMESIZE_INVALID
+      && value <= (int)getSensorMaxFrameSize(sensor);
+}
+
+static const char *frameSizeLabel(framesize_t value) {
+  for (size_t i = 0; i < sizeof(FRAME_SIZE_OPTIONS) / sizeof(FRAME_SIZE_OPTIONS[0]); ++i) {
+    if (FRAME_SIZE_OPTIONS[i].value == value) {
+      return FRAME_SIZE_OPTIONS[i].label;
+    }
+  }
+
+  return "Unknown";
+}
+
+static void logSensorFrameSize(sensor_t *sensor, const char *prefix) {
+  if (!sensor || sensor->status.framesize < 0 || sensor->status.framesize >= FRAMESIZE_INVALID) {
+    Serial.printf("%s: invalid framesize %d\n", prefix, sensor ? sensor->status.framesize : -1);
+    return;
+  }
+
+  const resolution_info_t &info = resolution[sensor->status.framesize];
+  Serial.printf("%s: %s (%ux%u, enum=%d)\n",
+    prefix,
+    frameSizeLabel(sensor->status.framesize),
+    info.width,
+    info.height,
+    sensor->status.framesize);
+}
+
+static String buildFrameSizeOptionsHtml(framesize_t selected) {
+  sensor_t *sensor = esp_camera_sensor_get();
+  framesize_t maxSize = getSensorMaxFrameSize(sensor);
+
+  if (!isValidFrameSizeValue(sensor, selected)) {
+    selected = maxSize >= FRAMESIZE_VGA ? FRAMESIZE_VGA : maxSize;
+  }
+
+  String html;
+  html.reserve(1200);
+
+  for (size_t i = 0; i < sizeof(FRAME_SIZE_OPTIONS) / sizeof(FRAME_SIZE_OPTIONS[0]); ++i) {
+    const FrameSizeOption &option = FRAME_SIZE_OPTIONS[i];
+    if (option.value > maxSize) {
+      continue;
+    }
+
+    const resolution_info_t &info = resolution[option.value];
+    html += "<option value=\"";
+    html += String((int)option.value);
+    html += "\"";
+    if (option.value == selected) {
+      html += " selected";
+    }
+    html += ">";
+    html += option.label;
+    html += " ";
+    html += String(info.width);
+    html += "&times;";
+    html += String(info.height);
+    html += "</option>";
+  }
+
+  return html;
+}
 
 // ─── LED Control Functions ────────────────────────────────────────────────────
 static void initLED() {
@@ -672,6 +783,40 @@ static void serviceNtpSync() {
   syncClockWithNtp();
 }
 
+static void setWifiModemSleep(bool enabled, const char *reason) {
+  wifi_mode_t mode = WiFi.getMode();
+  if (mode != WIFI_STA && mode != WIFI_AP_STA) {
+    wifiModemSleepEnabled = false;
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED || wifiModemSleepEnabled == enabled) {
+    return;
+  }
+
+  if (!WiFi.setSleep(enabled)) {
+    if (reason && reason[0] != '\0') {
+      Serial.printf("[WIFI] Failed to %s modem sleep (%s)\n",
+        enabled ? "enable" : "disable",
+        reason);
+    } else {
+      Serial.printf("[WIFI] Failed to %s modem sleep\n",
+        enabled ? "enable" : "disable");
+    }
+    return;
+  }
+
+  wifiModemSleepEnabled = enabled;
+  if (reason && reason[0] != '\0') {
+    Serial.printf("[WIFI] Modem sleep %s (%s)\n",
+      enabled ? "enabled" : "disabled",
+      reason);
+  } else {
+    Serial.printf("[WIFI] Modem sleep %s\n",
+      enabled ? "enabled" : "disabled");
+  }
+}
+
 static void deriveKey(uint8_t key[16]) {
   static const uint8_t salt[16] = {
     0x2C, 0x47, 0xB1, 0x93, 0x5E, 0xAA, 0x14, 0x78,
@@ -718,6 +863,10 @@ static bool writeU32LE(File &file, uint32_t value) {
   return file.write(bytes, sizeof(bytes)) == sizeof(bytes);
 }
 
+static bool writeAviChunkHeader(File &file, const char *chunkId, uint32_t chunkSize) {
+  return writeFourCC(file, chunkId) && writeU32LE(file, chunkSize);
+}
+
 static bool writeMjpegFramePayload(File &file, const uint8_t *data, size_t len) {
   if (!data || len == 0U) {
     return false;
@@ -750,6 +899,54 @@ static uint32_t gcdU32(uint32_t a, uint32_t b) {
     b = rem;
   }
   return a == 0U ? 1U : a;
+}
+
+static void resetRecordingState() {
+  recordingActive = false;
+  recordingStartTime = 0;
+  recordingDurationMs = 0;
+  recordingLastFrameAt = 0;
+  recordingFrameCount = 0;
+  recordingMaxFrameSize = 0;
+  recordingWidth = 0;
+  recordingHeight = 0;
+  recordingMoviListSize = AVI_MOVI_LIST_HEADER_SIZE;
+  recordingPath = "";
+  recordingIndex.clear();
+}
+
+static bool ensureCaptureDirectory() {
+  if (SD_MMC.exists(CAPTURE_DIRECTORY)) {
+    return true;
+  }
+  return SD_MMC.mkdir(CAPTURE_DIRECTORY);
+}
+
+static bool beginRecordingFile(const String &path) {
+  if (recordingFile) {
+    recordingFile.close();
+  }
+
+  resetRecordingState();
+
+  recordingFile = SD_MMC.open(path, FILE_WRITE);
+  if (!recordingFile) {
+    return false;
+  }
+
+  uint8_t aviHeader[AVI_HEADER_SIZE] = {0};
+  if (recordingFile.write(aviHeader, sizeof(aviHeader)) != sizeof(aviHeader)) {
+    recordingFile.close();
+    SD_MMC.remove(path);
+    return false;
+  }
+
+  recordingPath = path;
+  recordingActive = true;
+  recordingStartTime = millis();
+  recordingMoviListSize = AVI_MOVI_LIST_HEADER_SIZE;
+  recordingIndex.clear();
+  return true;
 }
 
 static bool hexToBytes(const String &hex, std::vector<uint8_t> &out) {
@@ -925,11 +1122,22 @@ static void applyStoredCameraSettings(const StoredConfig &cfg) {
     return;
   }
 
+  int framesizeResult = 0;
+  if (!isValidFrameSizeValue(sensor, cfg.cameraSettings.framesize)) {
+    Serial.printf("[CAM] Stored framesize %d is not supported by this sensor\n", cfg.cameraSettings.framesize);
+    framesizeResult = -1;
+  } else {
+    framesizeResult = sensor->set_framesize(sensor, (framesize_t)cfg.cameraSettings.framesize);
+    if (framesizeResult == 0) {
+      logSensorFrameSize(sensor, "[CAM] Applied stored framesize");
+    }
+  }
+
   struct PendingSetting {
     const char *name;
     int result;
   } pending[] = {
-    {"framesize", sensor->set_framesize(sensor, (framesize_t)cfg.cameraSettings.framesize)},
+    {"framesize", framesizeResult},
     {"quality", sensor->set_quality(sensor, cfg.cameraSettings.quality)},
     {"brightness", sensor->set_brightness(sensor, cfg.cameraSettings.brightness)},
     {"contrast", sensor->set_contrast(sensor, cfg.cameraSettings.contrast)},
@@ -1004,10 +1212,13 @@ static String urlEncode(const String &value) {
   return escaped;
 }
 
-static void sendHtmlWithToken(const char *html) {
-  String page(html);
+static void sendHtmlWithToken(String page) {
   page.replace("__ROUTE_TOKEN__", routeAccessToken);
   server.send(200, "text/html", page);
+}
+
+static void sendHtmlWithToken(const char *html) {
+  sendHtmlWithToken(String(html));
 }
 
 static bool encryptPayload(const std::vector<uint8_t> &plain, String &ivHex, String &cipherHex) {
@@ -1570,16 +1781,7 @@ header span{font-size:.85em;color:#888}
     <h3>Camera Settings</h3>
     <div class="cg">
       <label>Resolution</label>
-      <select id="framesize">
-        <option value="10">UXGA 1600×1200</option>
-        <option value="9">SXGA 1280×1024</option>
-        <option value="8">XGA 1024×768</option>
-        <option value="7">SVGA 800×600</option>
-        <option value="6" selected>VGA 640×480</option>
-        <option value="5">CIF 400×296</option>
-        <option value="4">QVGA 320×240</option>
-        <option value="0">QQVGA 160×120</option>
-      </select>
+      <select id="framesize">__FRAME_SIZE_OPTIONS__</select>
     </div>
     <div class="cg">
       <div class="row"><label>Brightness</label><span id="brightness_v">0</span></div>
@@ -1646,7 +1848,11 @@ function ctrl(v,val,persist){
   var url='/control?var='+encodeURIComponent(v)+'&val='+encodeURIComponent(val);
   if(persist===false){url+='&persist=0';}
   else{url+='&persist=1';}
-  fetch(url);
+  return fetch(url).then(function(r){
+    return r.text().then(function(text){
+      return {ok:r.ok,text:text||''};
+    });
+  });
 }
 function closeStreamConnection(){
   if(!navigator.sendBeacon){
@@ -1686,6 +1892,26 @@ function setRecordingState(isRecording,statusText){
   btn.textContent=recordingMode?'⏹️ Stop':'⏺️ Record';
   if(statusText!==undefined){status.textContent=statusText;}
 }
+function bindFrameSizeControl(){
+  var el=id('framesize');
+  if(!el)return;
+  el.addEventListener('change',function(){
+    var shouldResumeStream=streamVisible;
+    setRecordingState(recordingMode,'Applying resolution change...');
+    if(shouldResumeStream){releaseStream(true);}
+    ctrl('framesize',el.value,true).then(function(result){
+      return loadStatus().catch(function(){}).then(function(){
+        if(!result.ok){setRecordingState(recordingMode,result.text||'Failed to change resolution');}
+        else if(recordingMode){setRecordingState(true,'Recording...');}
+        else{id('rec_status').textContent='';}
+        if(shouldResumeStream){setTimeout(function(){setStreamVisibility(true);},150);}
+      });
+    }).catch(function(){
+      if(shouldResumeStream){setStreamVisibility(true);}
+      setRecordingState(recordingMode,'Failed to change resolution');
+    });
+  });
+}
 function bindSelectControl(name){
   var el=id(name);
   if(!el)return;
@@ -1706,7 +1932,22 @@ function bindCheckboxControl(name){
   if(!el)return;
   el.addEventListener('change',function(){ctrl(name,chk(el));});
 }
-['framesize','special_effect','wb_mode'].forEach(bindSelectControl);
+function applyStatus(s){
+  ['framesize','brightness','contrast','saturation','quality','special_effect','wb_mode'].forEach(function(k){
+    if(s[k]!==undefined){var e=id(k);if(e)e.value=s[k];var v=id(k+'_v');if(v)v.innerText=s[k];}
+  });
+  ['awb','aec','hmirror','vflip','lenc'].forEach(function(k){if(s[k]!==undefined){var e=id(k);if(e)e.checked=!!s[k];}});
+  setStreamVisibility(s.stream_visible!==undefined?!!s.stream_visible:true);
+  if(s.recording_active!==undefined){setRecordingState(!!s.recording_active,s.recording_active?'Recording...':'');}
+}
+function loadStatus(){
+  return fetch('/status').then(function(r){return r.json();}).then(function(s){
+    applyStatus(s);
+    return s;
+  });
+}
+bindFrameSizeControl();
+['special_effect','wb_mode'].forEach(bindSelectControl);
 ['brightness','contrast','saturation','quality'].forEach(bindRangeControl);
 ['awb','aec','hmirror','vflip','lenc'].forEach(bindCheckboxControl);
 id('stream_toggle_btn').addEventListener('click',function(){
@@ -1750,14 +1991,7 @@ id('ip_label').innerText=h;
 window.addEventListener('pagehide',function(){releaseStream(true);});
 window.addEventListener('beforeunload',function(){releaseStream(true);});
 setStreamVisibility(false);
-fetch('/status').then(function(r){return r.json();}).then(function(s){
-  ['framesize','brightness','contrast','saturation','quality','special_effect','wb_mode'].forEach(function(k){
-    if(s[k]!==undefined){var e=id(k);if(e)e.value=s[k];var v=id(k+'_v');if(v)v.innerText=s[k];}
-  });
-  ['awb','aec','hmirror','vflip','lenc'].forEach(function(k){if(s[k]!==undefined){var e=id(k);if(e)e.checked=!!s[k];}});
-  setStreamVisibility(s.stream_visible!==undefined?!!s.stream_visible:true);
-  if(s.recording_active!==undefined){setRecordingState(!!s.recording_active,s.recording_active?'Recording...':'');}
-}).catch(function(){
+loadStatus().catch(function(){
   setStreamVisibility(true);
 });
 </script>
@@ -2498,6 +2732,8 @@ static void handleStreamWorker() {
       return;
     }
 
+    setWifiModemSleep(false, "active stream");
+
     WiFiClient client = streamServer.client();
     Serial.println("[STREAM] Client connected");
     streamClientAbortRequested = false;
@@ -2563,6 +2799,7 @@ static void handleStreamWorker() {
     streamClientAbortRequested = false;
     streamClientConnected = false;
     client.stop();
+    setWifiModemSleep(true, "idle");
     Serial.println("[STREAM] Client disconnected");
 }
 
@@ -2662,7 +2899,14 @@ static void handleSave() {
 // ─── Route handlers: STA (camera) mode ───────────────────────────────────────
 static void handleCameraRoot() {
     if (!checkAuth()) return;
-    sendHtmlWithToken(MAIN_HTML);
+    framesize_t selected = FRAMESIZE_VGA;
+    if (runtimeConfig.hasCameraSettings && runtimeConfig.cameraSettings.framesize >= 0) {
+      selected = (framesize_t)runtimeConfig.cameraSettings.framesize;
+    }
+
+    String page(MAIN_HTML);
+    page.replace("__FRAME_SIZE_OPTIONS__", buildFrameSizeOptionsHtml(selected));
+    sendHtmlWithToken(page);
 }
 
 static String wifiEncryptionLabel(wifi_auth_mode_t authMode) {
@@ -2983,41 +3227,73 @@ static void handleControl() {
         return;
       }
 
+    if (!cameraMutex || xSemaphoreTake(cameraMutex, pdMS_TO_TICKS(1500)) != pdTRUE) {
+        server.send(503, "text/plain", "Camera busy");
+        return;
+    }
+
     sensor_t *s = esp_camera_sensor_get();
-    if (!s) {
+    if (!cameraInitialized || !s) {
+        xSemaphoreGive(cameraMutex);
         server.send(503, "text/plain", "Camera sensor not available");
         return;
     }
 
     int res = 0;
-    if      (varName == "framesize")      res = s->set_framesize(s, (framesize_t)val);
-    else if (varName == "quality")        res = s->set_quality(s, val);
-    else if (varName == "brightness")     res = s->set_brightness(s, val);
-    else if (varName == "contrast")       res = s->set_contrast(s, val);
-    else if (varName == "saturation")     res = s->set_saturation(s, val);
-    else if (varName == "sharpness")      res = s->set_sharpness(s, val);
-    else if (varName == "special_effect") res = s->set_special_effect(s, val);
-    else if (varName == "awb")            res = s->set_whitebal(s, val);
-    else if (varName == "awb_gain")       res = s->set_awb_gain(s, val);
-    else if (varName == "wb_mode")        res = s->set_wb_mode(s, val);
-    else if (varName == "aec")            res = s->set_exposure_ctrl(s, val);
-    else if (varName == "aec2")           res = s->set_aec2(s, val);
-    else if (varName == "aec_value")      res = s->set_aec_value(s, val);
-    else if (varName == "ae_level")       res = s->set_ae_level(s, val);
-    else if (varName == "agc")            res = s->set_gain_ctrl(s, val);
-    else if (varName == "agc_gain")       res = s->set_agc_gain(s, val);
-    else if (varName == "gainceiling")    res = s->set_gainceiling(s, (gainceiling_t)val);
-    else if (varName == "bpc")            res = s->set_bpc(s, val);
-    else if (varName == "wpc")            res = s->set_wpc(s, val);
-    else if (varName == "raw_gma")        res = s->set_raw_gma(s, val);
-    else if (varName == "lenc")           res = s->set_lenc(s, val);
-    else if (varName == "hmirror")        res = s->set_hmirror(s, val);
-    else if (varName == "vflip")          res = s->set_vflip(s, val);
-    else if (varName == "dcw")            res = s->set_dcw(s, val);
-    else if (varName == "colorbar")       res = s->set_colorbar(s, val);
+    int statusCode = 200;
+    const char *message = "OK";
+    if (varName == "framesize") {
+        if (recordingActive) {
+            statusCode = 409;
+            message = "Stop recording before changing resolution";
+        } else if (!isValidFrameSizeValue(s, val)) {
+            statusCode = 400;
+            message = "Unsupported resolution";
+        } else {
+            res = s->set_framesize(s, (framesize_t)val);
+            if (res == 0) {
+                logSensorFrameSize(s, "[CAM] Updated framesize");
+            }
+        }
+    } else if (varName == "quality")        res = s->set_quality(s, val);
+    else if (varName == "brightness")       res = s->set_brightness(s, val);
+    else if (varName == "contrast")         res = s->set_contrast(s, val);
+    else if (varName == "saturation")       res = s->set_saturation(s, val);
+    else if (varName == "sharpness")        res = s->set_sharpness(s, val);
+    else if (varName == "special_effect")   res = s->set_special_effect(s, val);
+    else if (varName == "awb")              res = s->set_whitebal(s, val);
+    else if (varName == "awb_gain")         res = s->set_awb_gain(s, val);
+    else if (varName == "wb_mode")          res = s->set_wb_mode(s, val);
+    else if (varName == "aec")              res = s->set_exposure_ctrl(s, val);
+    else if (varName == "aec2")             res = s->set_aec2(s, val);
+    else if (varName == "aec_value")        res = s->set_aec_value(s, val);
+    else if (varName == "ae_level")         res = s->set_ae_level(s, val);
+    else if (varName == "agc")              res = s->set_gain_ctrl(s, val);
+    else if (varName == "agc_gain")         res = s->set_agc_gain(s, val);
+    else if (varName == "gainceiling")      res = s->set_gainceiling(s, (gainceiling_t)val);
+    else if (varName == "bpc")              res = s->set_bpc(s, val);
+    else if (varName == "wpc")              res = s->set_wpc(s, val);
+    else if (varName == "raw_gma")          res = s->set_raw_gma(s, val);
+    else if (varName == "lenc")             res = s->set_lenc(s, val);
+    else if (varName == "hmirror")          res = s->set_hmirror(s, val);
+    else if (varName == "vflip")            res = s->set_vflip(s, val);
+    else if (varName == "dcw")              res = s->set_dcw(s, val);
+    else if (varName == "colorbar")         res = s->set_colorbar(s, val);
     else {
+        xSemaphoreGive(cameraMutex);
         server.send(400, "text/plain", "Unknown variable");
         return;
+    }
+
+    if (statusCode == 200 && res == 0) {
+      lastCameraActivityAt = millis();
+    }
+
+    xSemaphoreGive(cameraMutex);
+
+    if (statusCode != 200) {
+      server.send(statusCode, "text/plain", message);
+      return;
     }
 
     if (res == 0) {
@@ -3871,6 +4147,10 @@ static void handleCaptureSD() {
 }
 
 static bool writeAviHeader(File &file, uint32_t riffSize, uint32_t durationMs, uint32_t frameCount, uint32_t maxFrameSize, uint16_t width, uint16_t height, uint32_t moviListSize) {
+  // ESP32-CAM can emit JPEG frames directly, so we keep recordings as MJPG in
+  // an AVI container. This is the simplest standards-compliant output we can
+  // generate here, but Android's documented native video support favors MP4/
+  // WebM containers, so playback on phones may still depend on the app used.
   if (durationMs == 0U) {
     durationMs = frameCount == 0U ? 1U : (frameCount * RECORDING_FRAME_INTERVAL_MS);
   }
@@ -3986,12 +4266,12 @@ static bool finalizeRecordingFile() {
     return false;
   }
 
-  if (!writeFourCC(recordingFile, "idx1") || !writeU32LE(recordingFile, indexSize)) {
+  if (!writeAviChunkHeader(recordingFile, "idx1", indexSize)) {
     return false;
   }
 
   for (size_t i = 0; i < recordingIndex.size(); ++i) {
-    if (!writeFourCC(recordingFile, "00dc") ||
+    if (!writeFourCC(recordingFile, AVI_VIDEO_CHUNK_ID) ||
         !writeU32LE(recordingFile, AVI_KEYFRAME_FLAG) ||
         !writeU32LE(recordingFile, recordingIndex[i].offset) ||
         !writeU32LE(recordingFile, recordingIndex[i].size)) {
@@ -4024,17 +4304,7 @@ static void stopRecordingSession(bool keepFile) {
     SD_MMC.remove(recordingPath);
   }
 
-  recordingActive = false;
-  recordingStartTime = 0;
-  recordingDurationMs = 0;
-  recordingLastFrameAt = 0;
-  recordingFrameCount = 0;
-  recordingMaxFrameSize = 0;
-  recordingWidth = 0;
-  recordingHeight = 0;
-  recordingMoviListSize = 4;
-  recordingPath = "";
-  recordingIndex.clear();
+  resetRecordingState();
 }
 
 static bool appendRecordingFrame(camera_fb_t *fb) {
@@ -4054,7 +4324,7 @@ static bool appendRecordingFrame(camera_fb_t *fb) {
   entry.offset = recordingMoviListSize;
   entry.size = (uint32_t)fb->len;
 
-  if (!writeFourCC(recordingFile, "00dc") || !writeU32LE(recordingFile, entry.size)) {
+  if (!writeAviChunkHeader(recordingFile, AVI_VIDEO_CHUNK_ID, entry.size)) {
     return false;
   }
   if (!writeMjpegFramePayload(recordingFile, fb->buf, fb->len)) {
@@ -4150,43 +4420,20 @@ static void handleRecordStart() {
     statusCode = 400;
     message = "Recording already in progress";
   } else {
-    if (!SD_MMC.exists("/capture")) {
-      SD_MMC.mkdir("/capture");
-    }
-
-    uint32_t sequence = 0;
-    if (!nextCaptureSequence(sequence)) {
+    if (!ensureCaptureDirectory()) {
       statusCode = 500;
-      message = "Failed to update capture sequence";
+      message = "Failed to create capture directory";
     } else {
-      recordingPath = buildCapturePath(sequence, "avi");
-      if (recordingFile) {
-        recordingFile.close();
-      }
-      recordingFile = SD_MMC.open(recordingPath, FILE_WRITE);
-      if (!recordingFile) {
-        recordingPath = "";
+      uint32_t sequence = 0;
+      if (!nextCaptureSequence(sequence)) {
         statusCode = 500;
-        message = "Failed to open recording file";
+        message = "Failed to update capture sequence";
       } else {
-        uint8_t aviHeader[AVI_HEADER_SIZE] = {0};
-        if (recordingFile.write(aviHeader, sizeof(aviHeader)) != sizeof(aviHeader)) {
-          recordingFile.close();
-          SD_MMC.remove(recordingPath);
-          recordingPath = "";
+        String path = buildCapturePath(sequence, "avi");
+        if (!beginRecordingFile(path)) {
           statusCode = 500;
-          message = "Failed to initialize AVI file";
+          message = "Failed to initialize AVI recording file";
         } else {
-          recordingActive = true;
-          recordingStartTime = millis();
-          recordingDurationMs = 0;
-          recordingLastFrameAt = 0;
-          recordingFrameCount = 0;
-          recordingMaxFrameSize = 0;
-          recordingWidth = 0;
-          recordingHeight = 0;
-          recordingMoviListSize = 4;
-          recordingIndex.clear();
           message = String("Recording started: ") + recordingPath;
         }
       }
@@ -4327,6 +4574,7 @@ static void registerCameraRoutes() {
 }
 
 static void startSetupAPMode() {
+  wifiModemSleepEnabled = false;
   bool ok = startSoftAPWithRetries(AP_SETUP_SSID, AP_SETUP_PASS);
   if (!ok) {
     Serial.println("[WIFI] Setup AP start failed");
@@ -4345,6 +4593,7 @@ static void startSetupAPMode() {
 }
 
 static void startCameraAPMode() {
+  wifiModemSleepEnabled = false;
   if (!cfgDeviceName.isEmpty()) {
     if (!WiFi.softAPsetHostname(cfgDeviceName.c_str())) {
       Serial.println("[WIFI] Failed to set AP hostname");
@@ -4400,6 +4649,7 @@ static void startSTAMode() {
   }
 
   WiFi.persistent(false);
+  wifiModemSleepEnabled = false;
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(false);
 
@@ -4414,6 +4664,7 @@ static void startSTAMode() {
     delay(150);
     WiFi.mode(WIFI_STA);
     delay(150);
+    WiFi.setSleep(false);
 
     if (!cfgDeviceName.isEmpty()) {
       if (!WiFi.setHostname(cfgDeviceName.c_str())) {
@@ -4453,6 +4704,7 @@ static void startSTAMode() {
       registerCameraRoutes();
       server.begin();
       startAuxHttpServers();
+      setWifiModemSleep(true, "idle");
       Serial.println("[HTTP] Camera server ready on port 80");
       return;
     }
@@ -4536,9 +4788,10 @@ void setup() {
 }
 
 void loop() {
-    server.handleClient();
+  server.handleClient();
   serviceNtpSync();
   serviceRecording();
   serviceCameraIdleTimeout();
   servicePendingFirmwareRestart();
+  delay(2);
 }
