@@ -2349,6 +2349,9 @@ static bool startSoftAPWithRetries(const char *ssid, const char *password) {
   return false;
 }
 
+// Forward declaration
+static bool checkAuth();
+
 static void handleStream() {
     if (!checkAuth()) return;
 
