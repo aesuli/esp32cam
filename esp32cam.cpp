@@ -31,7 +31,10 @@
 #include <FS.h>
 #include <SD_MMC.h>
 #include <Update.h>
+#include <esp_bt.h>
+#include <esp_err.h>
 #include <esp_system.h>
+#include <esp_wifi.h>
 #include <mbedtls/aes.h>
 #include <time.h>
 #include <sys/time.h>
@@ -53,6 +56,11 @@ static constexpr int LED_GPIO    = 33;  // Internal red LED on ESP32-CAM
 static constexpr int AP_CHANNEL = 1;
 static constexpr bool AP_HIDDEN = false;
 static constexpr int AP_MAX_CONNECTIONS = 4;
+// Default TX power levels (overridden by stored config if available)
+static constexpr wifi_power_t DEFAULT_TX_POWER_STA = WIFI_POWER_19_5dBm;
+static constexpr wifi_power_t DEFAULT_TX_POWER_AP  = WIFI_POWER_8_5dBm;
+// Beacon interval for fallback AP in TU (1 TU = 1024 µs). Default is 100; Must be a multiple of 100, range 100–60000.
+static constexpr uint16_t AP_FALLBACK_BEACON_INTERVAL_TU = 10000;
 static constexpr const char *NTP_SERVER = "pool.ntp.org";
 static constexpr const char *TIME_ZONE = "BRT3";
 static constexpr int CONFIG_LOAD_RETRIES = 5;
@@ -95,9 +103,14 @@ static bool   flashEnabled = false;
 static bool   cameraInitialized = false;
 static bool   ledAccessBlinkEnabled = false;
 static bool   wifiModemSleepEnabled = false;
+static bool   staConnectedAtBoot = false;
+static volatile bool staLinkUp = false;
 static unsigned long lastUrlAccessBlink = 0;
 static unsigned long lastCameraActivityAt = 0;
+static unsigned long lastStaReconnectAttemptAt = 0;
 static constexpr unsigned long LED_ACCESS_BLINK_INTERVAL_MS = 100;  // Minimum interval between access blinks
+static constexpr unsigned long STA_RECONNECT_INTERVAL_MS = 30000;
+static constexpr unsigned long STA_CONNECT_TIMEOUT_MS = 20000;
 static unsigned long cameraIdleTimeoutMs = 3000;
 static unsigned long recordingStartTime = 0;
 static uint32_t recordingDurationMs = 0;
@@ -278,6 +291,8 @@ struct StoredConfig {
   bool hasCameraSettings = false;
   CameraSettings cameraSettings;
   bool ledAccessBlink = false;  // LED blink on URL access
+  int8_t txPowerSta = (int8_t)DEFAULT_TX_POWER_STA;  // wifi_power_t cast to int8
+  int8_t txPowerAp  = (int8_t)DEFAULT_TX_POWER_AP;
 };
 
 struct FrameSizeOption {
@@ -323,6 +338,30 @@ static bool initCameraWithRetries();
 static bool waitForIO0Released(unsigned long timeoutMs);
 static void servicePendingFirmwareRestart();
 static void setWifiModemSleep(bool enabled, const char *reason = nullptr);
+static void registerCameraRoutes();
+static void startAuxHttpServers();
+
+static void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      Serial.println("[WIFI] STA associated with AP");
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      staLinkUp = true;
+      Serial.printf("[WIFI] STA got IP: %s\n", WiFi.localIP().toString().c_str());
+      break;
+
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      staLinkUp = false;
+      Serial.printf("[WIFI] STA disconnected (reason=%u)\n",
+        (unsigned int)info.wifi_sta_disconnected.reason);
+      break;
+
+    default:
+      break;
+  }
+}
 
 static framesize_t getSensorMaxFrameSize(sensor_t *sensor) {
   if (sensor) {
@@ -783,14 +822,148 @@ static void serviceNtpSync() {
   syncClockWithNtp();
 }
 
+static bool connectToSavedStaNetworks(bool showLedFeedback, bool initializeCameraHttpServices) {
+  if (runtimeConfig.wifiList.empty()) {
+    Serial.println("[WIFI] No saved STA networks");
+    return false;
+  }
+
+  WiFi.persistent(false);
+  wifiModemSleepEnabled = false;
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(false);
+
+  for (size_t i = 0; i < runtimeConfig.wifiList.size(); ++i) {
+    const WifiCredential &wifi = runtimeConfig.wifiList[i];
+
+    // Hard reset STA state between credential attempts so each SSID starts
+    // from a clean state machine and scan context.
+    WiFi.disconnect(true, false);
+    delay(200);
+    WiFi.mode(WIFI_OFF);
+    delay(150);
+    WiFi.mode(WIFI_STA);
+    delay(150);
+    WiFi.setSleep(false);
+
+    if (!cfgDeviceName.isEmpty()) {
+      if (!WiFi.setHostname(cfgDeviceName.c_str())) {
+        Serial.println("[WIFI] Failed to set STA hostname");
+      } else {
+        Serial.printf("[WIFI] STA hostname set to: %s\n", cfgDeviceName.c_str());
+      }
+    }
+
+    if (wifi.wifiPass.isEmpty()) {
+      WiFi.begin(wifi.ssid.c_str());
+    } else {
+      WiFi.begin(wifi.ssid.c_str(), wifi.wifiPass.c_str());
+    }
+
+    if (showLedFeedback) {
+      // LED feedback: double blink when testing WiFi credentials
+      ledWifiTestSequence();
+    }
+
+    Serial.printf("[WIFI] Trying network %u/%u: %s\n",
+      (unsigned int)(i + 1),
+      (unsigned int)runtimeConfig.wifiList.size(),
+      wifi.ssid.c_str());
+
+    int result = (int)WiFi.waitForConnectResult(STA_CONNECT_TIMEOUT_MS);
+
+    // Stop any stale connection attempt before trying the next credential.
+    if (result != (int)WL_CONNECTED || WiFi.status() != WL_CONNECTED) {
+      // Keep radio powered so periodic reconnect service can continue.
+      WiFi.disconnect(false, false);
+      delay(100);
+    }
+
+    if (result == (int)WL_CONNECTED && WiFi.status() == WL_CONNECTED) {
+      staLinkUp = true;
+      if (showLedFeedback) {
+        // LED feedback: short blink on success
+        ledWifiSuccessSequence();
+      }
+
+      WiFi.setTxPower((wifi_power_t)runtimeConfig.txPowerSta);
+      Serial.printf("[WIFI] STA TX power set to %d (raw)\n", (int)runtimeConfig.txPowerSta);
+      Serial.printf("[WIFI] Connected to %s — IP: %s\n", wifi.ssid.c_str(), WiFi.localIP().toString().c_str());
+      syncClockWithNtp();
+
+      if (initializeCameraHttpServices) {
+        registerCameraRoutes();
+        server.begin();
+        startAuxHttpServers();
+        Serial.println("[HTTP] Camera server ready on port 80");
+      }
+
+      setWifiModemSleep(true, "idle");
+      return true;
+    }
+
+    if (showLedFeedback) {
+      // LED feedback: long blink on failure
+      ledWifiFailureSequence();
+    }
+    Serial.printf("[WIFI] Failed to connect to %s (status=%d)\n", wifi.ssid.c_str(), (int)result);
+  }
+
+  staLinkUp = false;
+
+  // Make sure STA is still armed for the next periodic reconnect cycle.
+  if (WiFi.getMode() != WIFI_STA && WiFi.getMode() != WIFI_AP_STA) {
+    WiFi.mode(WIFI_STA);
+    delay(50);
+    WiFi.setSleep(false);
+  }
+
+  return false;
+}
+
+static void serviceStaReconnect() {
+  if (!staConnectedAtBoot) {
+    return;
+  }
+
+  wifi_mode_t mode = WiFi.getMode();
+  bool staCapableMode = (mode == WIFI_STA || mode == WIFI_AP_STA);
+  bool linkDown = (!staLinkUp || WiFi.status() != WL_CONNECTED);
+  if (!staCapableMode || !linkDown) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if ((now - lastStaReconnectAttemptAt) < STA_RECONNECT_INTERVAL_MS) {
+    return;
+  }
+
+  lastStaReconnectAttemptAt = now;
+  Serial.println("[WIFI] STA link lost — attempting reconnect to saved networks");
+
+  if (connectToSavedStaNetworks(false, false)) {
+    Serial.println("[WIFI] STA reconnect successful");
+  } else {
+    Serial.println("[WIFI] STA reconnect failed; will retry");
+  }
+}
+
 static void setWifiModemSleep(bool enabled, const char *reason) {
   wifi_mode_t mode = WiFi.getMode();
-  if (mode != WIFI_STA && mode != WIFI_AP_STA) {
+  bool isStaMode = (mode == WIFI_STA || mode == WIFI_AP_STA);
+  bool isApMode  = (mode == WIFI_AP);
+
+  if (!isStaMode && !isApMode) {
     wifiModemSleepEnabled = false;
     return;
   }
 
-  if (WiFi.status() != WL_CONNECTED || wifiModemSleepEnabled == enabled) {
+  // In STA mode only apply when the station link is up
+  if (isStaMode && WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  if (wifiModemSleepEnabled == enabled) {
     return;
   }
 
@@ -1319,65 +1492,13 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
     appendCameraSettings(plain, cfg.cameraSettings);
   }
   appendU8(plain, cfg.ledAccessBlink ? 1 : 0);
+  appendU8(plain, (uint8_t)cfg.txPowerSta);
+  appendU8(plain, (uint8_t)cfg.txPowerAp);
 
   return encryptPayload(plain, ivHex, cipherHex);
-  }
-
-
-static bool decryptConfigV1(const String &ivHex, const String &cipherHex, StoredConfig &cfg) {
-  std::vector<uint8_t> plain;
-  if (!decryptPayload(ivHex, cipherHex, plain)) {
-    return false;
-  }
-
-  size_t offset = 0;
-  WifiCredential wifi;
-  if (!readField(plain, offset, wifi.ssid)) return false;
-  if (!readField(plain, offset, wifi.wifiPass)) return false;
-  if (!readField(plain, offset, cfg.adminPass)) return false;
-
-  cfg.wifiList.clear();
-  if (!wifi.ssid.isEmpty()) {
-    cfg.wifiList.push_back(wifi);
-  }
-  cfg.deviceName = "ESP32-CAM";
-  return offset == plain.size() && !cfg.adminPass.isEmpty();
 }
 
-static bool decryptConfigV2(const String &ivHex, const String &cipherHex, StoredConfig &cfg) {
-  std::vector<uint8_t> plain;
-  if (!decryptPayload(ivHex, cipherHex, plain)) {
-    return false;
-  }
-
-  size_t offset = 0;
-  if (plain.size() < 2) {
-    return false;
-  }
-
-  uint16_t wifiCount = (uint16_t)plain[offset] | ((uint16_t)plain[offset + 1] << 8);
-  offset += 2;
-
-  cfg.wifiList.clear();
-  cfg.wifiList.reserve(wifiCount);
-  for (uint16_t i = 0; i < wifiCount; ++i) {
-    WifiCredential wifi;
-    if (!readField(plain, offset, wifi.ssid)) return false;
-    if (!readField(plain, offset, wifi.wifiPass)) return false;
-    cfg.wifiList.push_back(wifi);
-  }
-  if (!readField(plain, offset, cfg.adminPass)) {
-    cfg.adminPass = "";
-    cfg.deviceName = "ESP32-CAM";
-    return false;
-  }
-  if (!readField(plain, offset, cfg.deviceName)) {
-    cfg.deviceName = "ESP32-CAM";
-  }
-  return offset == plain.size() && !cfg.adminPass.isEmpty();
-}
-
-static bool decryptConfigV3(const String &ivHex, const String &cipherHex, StoredConfig &cfg) {
+static bool decryptConfigV5(const String &ivHex, const String &cipherHex, StoredConfig &cfg) {
   std::vector<uint8_t> plain;
   if (!decryptPayload(ivHex, cipherHex, plain)) {
     return false;
@@ -1420,63 +1541,26 @@ static bool decryptConfigV3(const String &ivHex, const String &cipherHex, Stored
     return false;
   }
 
-  return offset == plain.size() && !cfg.adminPass.isEmpty();
-}
-
-static bool decryptConfigV4(const String &ivHex, const String &cipherHex, StoredConfig &cfg) {
-  std::vector<uint8_t> plain;
-  if (!decryptPayload(ivHex, cipherHex, plain)) {
-    return false;
-  }
-
-  size_t offset = 0;
-  if (plain.size() < 2) {
-    return false;
-  }
-
-  uint16_t wifiCount = (uint16_t)plain[offset] | ((uint16_t)plain[offset + 1] << 8);
-  offset += 2;
-
-  cfg.wifiList.clear();
-  cfg.wifiList.reserve(wifiCount);
-  for (uint16_t i = 0; i < wifiCount; ++i) {
-    WifiCredential wifi;
-    if (!readField(plain, offset, wifi.ssid)) return false;
-    if (!readField(plain, offset, wifi.wifiPass)) return false;
-    cfg.wifiList.push_back(wifi);
-  }
-  if (!readField(plain, offset, cfg.adminPass)) {
-    cfg.adminPass = "";
-    cfg.deviceName = "ESP32-CAM";
-    cfg.hasCameraSettings = false;
-    return false;
-  }
-  if (!readField(plain, offset, cfg.deviceName)) {
-    cfg.deviceName = "ESP32-CAM";
-  }
-
-  uint8_t hasCameraSettings = 0;
-  if (!readU8(plain, offset, hasCameraSettings)) {
-    cfg.hasCameraSettings = false;
-    return false;
-  }
-
-  cfg.hasCameraSettings = (hasCameraSettings != 0);
-  if (cfg.hasCameraSettings && !readCameraSettings(plain, offset, cfg.cameraSettings)) {
-    return false;
-  }
-
-  // Read LED access blink setting (with backward compatibility for old configs)
   uint8_t ledAccessBlink = 0;
-  if (offset < plain.size()) {
-    if (!readU8(plain, offset, ledAccessBlink)) {
-      cfg.ledAccessBlink = false;
-    } else {
-      cfg.ledAccessBlink = (ledAccessBlink != 0);
-    }
-  } else {
+  if (!readU8(plain, offset, ledAccessBlink)) {
     cfg.ledAccessBlink = false;
+    return false;
   }
+  cfg.ledAccessBlink = (ledAccessBlink != 0);
+
+  uint8_t txPowerSta = (uint8_t)DEFAULT_TX_POWER_STA;
+  if (!readU8(plain, offset, txPowerSta)) {
+    cfg.txPowerSta = (int8_t)DEFAULT_TX_POWER_STA;
+    return false;
+  }
+  cfg.txPowerSta = (int8_t)txPowerSta;
+
+  uint8_t txPowerAp = (uint8_t)DEFAULT_TX_POWER_AP;
+  if (!readU8(plain, offset, txPowerAp)) {
+    cfg.txPowerAp = (int8_t)DEFAULT_TX_POWER_AP;
+    return false;
+  }
+  cfg.txPowerAp = (int8_t)txPowerAp;
 
   return offset == plain.size() && !cfg.adminPass.isEmpty();
 }
@@ -1500,7 +1584,7 @@ static bool saveConfigToSD(const StoredConfig &cfg) {
     return false;
   }
 
-  file.println("ESP32CAMCFG4");
+  file.println("ESP32CAMCFG5");
   file.println(ivHex);
   file.println(cipherHex);
   file.close();
@@ -1533,40 +1617,11 @@ static bool loadConfigFromSD(StoredConfig &cfg) {
   ivHex.trim();
   cipherHex.trim();
 
-  if (magic == "ESP32CAMCFG1") {
-    if (!decryptConfigV1(ivHex, cipherHex, cfg)) {
-      Serial.println("[CFG] Failed to decrypt legacy config");
-      return false;
-    }
-    return !cfg.adminPass.isEmpty();
-  }
-
-  if (magic != "ESP32CAMCFG2") {
-    if (magic != "ESP32CAMCFG3" && magic != "ESP32CAMCFG4") {
-      Serial.println("[CFG] Invalid config format");
-      return false;
-    }
-  }
-
-  if (magic == "ESP32CAMCFG2") {
-    if (!decryptConfigV2(ivHex, cipherHex, cfg)) {
+  if (magic == "ESP32CAMCFG5") {
+    if (!decryptConfigV5(ivHex, cipherHex, cfg)) {
       Serial.println("[CFG] Failed to decrypt config");
       return false;
     }
-    return !cfg.adminPass.isEmpty();
-  }
-
-  if (magic == "ESP32CAMCFG3") {
-    if (!decryptConfigV3(ivHex, cipherHex, cfg)) {
-      Serial.println("[CFG] Failed to decrypt config");
-      return false;
-    }
-    return !cfg.adminPass.isEmpty();
-  }
-
-  if (!decryptConfigV4(ivHex, cipherHex, cfg)) {
-    Serial.println("[CFG] Failed to decrypt config");
-    return false;
   }
 
   return !cfg.adminPass.isEmpty();
@@ -2117,6 +2172,48 @@ header h1{color:#e94560;font-size:1.3em}
     <div style="font-size:.85em;color:#bbb;margin-top:10px">When enabled, LED blinks briefly on each URL request. Boot sequences are unaffected.</div>
   </div>
   <div class="panel">
+    <h3>TX Power</h3>
+    <form class="form" id="txpower_form">
+      <div>
+        <label>STA Mode (dBm)</label>
+        <select id="txpower_sta">
+          <option value="-4">-1 dBm</option>
+          <option value="8">2 dBm</option>
+          <option value="20">5 dBm</option>
+          <option value="28">7 dBm</option>
+          <option value="34">8.5 dBm</option>
+          <option value="44">11 dBm</option>
+          <option value="52">13 dBm</option>
+          <option value="60">15 dBm</option>
+          <option value="68">17 dBm</option>
+          <option value="72">18 dBm</option>
+          <option value="76">19 dBm</option>
+          <option value="78">19.5 dBm (max)</option>
+        </select>
+      </div>
+      <div>
+        <label>AP Fallback Mode (dBm)</label>
+        <select id="txpower_ap">
+          <option value="-4">-1 dBm</option>
+          <option value="8">2 dBm</option>
+          <option value="20">5 dBm</option>
+          <option value="28">7 dBm</option>
+          <option value="34">8.5 dBm</option>
+          <option value="44">11 dBm</option>
+          <option value="52">13 dBm</option>
+          <option value="60">15 dBm</option>
+          <option value="68">17 dBm</option>
+          <option value="72">18 dBm</option>
+          <option value="76">19 dBm</option>
+          <option value="78">19.5 dBm (max)</option>
+        </select>
+      </div>
+      <button type="submit">Save</button>
+    </form>
+    <div id="txpower_status" class="status"></div>
+    <div style="font-size:.85em;color:#bbb;margin-top:10px">Lower TX power reduces consumption. AP fallback clients are nearby so 8.5 dBm is a reasonable default. Changes apply immediately.</div>
+  </div>
+  <div class="panel">
     <h3>Firmware Update</h3>
     <form class="form" id="firmware_form">
       <div>
@@ -2138,6 +2235,7 @@ function setAdminStatus(msg,err){var e=id('admin_status');e.textContent=msg;e.cl
 function setNameStatus(msg,err){var e=id('name_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setTimeStatus(msg,err){var e=id('time_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setLedStatus(msg,err){var e=id('led_status');e.textContent=msg;e.className=err?'status error':'status';}
+function setTxPowerStatus(msg,err){var e=id('txpower_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setFirmwareStatus(msg,err){var e=id('firmware_status');e.textContent=msg;e.className=err?'status error':'status';}
 function formData(obj){return Object.keys(obj).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(obj[k]);}).join('&');}
 function toDateTimeLocalValue(epoch){
@@ -2229,6 +2327,20 @@ id('led_form').addEventListener('submit',function(e){
   e.preventDefault();
   fetch('/admin/led',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({ledAccessBlink:id('led_access_blink').checked?'1':'0'})}).then(function(r){r.text().then(function(msg){setLedStatus(msg||'Saved',!r.ok);refreshLedStatus();});});
 });
+function refreshTxPower(){
+  fetch('/admin/txpower').then(function(r){
+    if(!r.ok){throw new Error('Failed to load TX power settings');}
+    return r.json();
+  }).then(function(d){
+    var sSel=id('txpower_sta');var aSel=id('txpower_ap');
+    for(var i=0;i<sSel.options.length;i++){if(parseInt(sSel.options[i].value)===d.txPowerSta){sSel.selectedIndex=i;break;}}
+    for(var i=0;i<aSel.options.length;i++){if(parseInt(aSel.options[i].value)===d.txPowerAp){aSel.selectedIndex=i;break;}}
+  }).catch(function(){});
+}
+id('txpower_form').addEventListener('submit',function(e){
+  e.preventDefault();
+  fetch('/admin/txpower',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({txPowerSta:id('txpower_sta').value,txPowerAp:id('txpower_ap').value})}).then(function(r){r.text().then(function(msg){setTxPowerStatus(msg||'Saved',!r.ok);});});
+});
 id('firmware_form').addEventListener('submit',function(e){
   e.preventDefault();
   var input=id('firmware_file');
@@ -2248,6 +2360,7 @@ refreshWiFiList();
 refreshDeviceName();
 refreshTimeStatus();
 refreshLedStatus();
+refreshTxPower();
 </script>
 </body>
 </html>)html";
@@ -3590,6 +3703,70 @@ static void handleAdminLedSet() {
   server.send(200, "text/plain", "LED configuration saved");
 }
 
+// Valid wifi_power_t raw values accepted from the UI
+static bool isValidTxPowerValue(int v) {
+  switch (v) {
+    case WIFI_POWER_MINUS_1dBm:
+    case WIFI_POWER_2dBm:
+    case WIFI_POWER_5dBm:
+    case WIFI_POWER_7dBm:
+    case WIFI_POWER_8_5dBm:
+    case WIFI_POWER_11dBm:
+    case WIFI_POWER_13dBm:
+    case WIFI_POWER_15dBm:
+    case WIFI_POWER_17dBm:
+    case WIFI_POWER_18_5dBm:
+    case WIFI_POWER_19dBm:
+    case WIFI_POWER_19_5dBm:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static void handleAdminTxPowerGet() {
+  if (!checkAuth()) return;
+
+  String json = "{\"txPowerSta\":" + String((int)runtimeConfig.txPowerSta) +
+                ",\"txPowerAp\":"  + String((int)runtimeConfig.txPowerAp) + "}";
+  server.send(200, "application/json", json);
+}
+
+static void handleAdminTxPowerSet() {
+  if (!checkAuth()) return;
+
+  if (!server.hasArg("txPowerSta") || !server.hasArg("txPowerAp")) {
+    server.send(400, "text/plain", "Missing txPowerSta or txPowerAp");
+    return;
+  }
+
+  int newSta = server.arg("txPowerSta").toInt();
+  int newAp  = server.arg("txPowerAp").toInt();
+
+  if (!isValidTxPowerValue(newSta) || !isValidTxPowerValue(newAp)) {
+    server.send(400, "text/plain", "Invalid TX power value");
+    return;
+  }
+
+  runtimeConfig.txPowerSta = (int8_t)newSta;
+  runtimeConfig.txPowerAp  = (int8_t)newAp;
+
+  // Apply immediately to the active interface
+  wifi_mode_t mode = WiFi.getMode();
+  if (mode == WIFI_STA || mode == WIFI_AP_STA) {
+    WiFi.setTxPower((wifi_power_t)newSta);
+  } else if (mode == WIFI_AP) {
+    WiFi.setTxPower((wifi_power_t)newAp);
+  }
+
+  if (!persistRuntimeConfig(runtimeConfig)) {
+    server.send(500, "text/plain", "Failed to save TX power configuration");
+    return;
+  }
+
+  server.send(200, "text/plain", "TX power saved");
+}
+
 static void handleAdminPage() {
   if (!checkAuth()) return;
   sendHtmlWithToken(ADMIN_HTML);
@@ -4558,6 +4735,8 @@ static void registerCameraRoutes() {
   server.on("/admin/time/sync",HTTP_POST, handleAdminTimeSync);
   server.on("/admin/led",     HTTP_GET,  handleAdminLedGet);
   server.on("/admin/led",     HTTP_POST, handleAdminLedSet);
+  server.on("/admin/txpower", HTTP_GET,  handleAdminTxPowerGet);
+  server.on("/admin/txpower", HTTP_POST, handleAdminTxPowerSet);
   server.on("/admin/update",  HTTP_POST, handleFirmwareUploadMain);
   server.on("/wifi/list",     HTTP_GET,  handleWifiList);
   server.on("/wifi/add",      HTTP_POST, handleWifiAdd);
@@ -4608,6 +4787,29 @@ static void startCameraAPMode() {
     return;
   }
 
+  // Reduce TX power — client is always nearby in fallback mode
+  WiFi.setTxPower((wifi_power_t)runtimeConfig.txPowerAp);
+  Serial.printf("[WIFI] Fallback AP TX power set to %d (raw)\n", (int)runtimeConfig.txPowerAp);
+
+  // Increase beacon interval: fewer beacon TX events.
+  {
+    wifi_config_t apCfg = {};
+    if (esp_wifi_get_config(WIFI_IF_AP, &apCfg) == ESP_OK) {
+      apCfg.ap.beacon_interval = AP_FALLBACK_BEACON_INTERVAL_TU;
+      if (esp_wifi_set_config(WIFI_IF_AP, &apCfg) == ESP_OK) {
+        Serial.printf("[WIFI] Fallback AP: beacon_interval=%u TU\n",
+                      AP_FALLBACK_BEACON_INTERVAL_TU);
+      } else {
+        Serial.println("[WIFI] Failed to apply extended fallback AP config");
+      }
+    }
+  }
+
+  // Enable modem sleep so idle periods between frames/requests save power
+  WiFi.setSleep(true);
+  wifiModemSleepEnabled = true;
+  Serial.printf("[WIFI] Fallback AP power: reduced TX + modem sleep enabled\n");
+
   // LED feedback: triple blink when fallback AP activated
   ledFallbackAPSequence();
 
@@ -4648,70 +4850,10 @@ static void startSTAMode() {
     return;
   }
 
-  WiFi.persistent(false);
-  wifiModemSleepEnabled = false;
-  WiFi.setSleep(false);
-  WiFi.setAutoReconnect(false);
-
-  for (size_t i = 0; i < runtimeConfig.wifiList.size(); ++i) {
-    const WifiCredential &wifi = runtimeConfig.wifiList[i];
-
-    // Hard reset STA state between credential attempts so each SSID starts
-    // from a clean state machine and scan context.
-    WiFi.disconnect(true, true);
-    delay(200);
-    WiFi.mode(WIFI_OFF);
-    delay(150);
-    WiFi.mode(WIFI_STA);
-    delay(150);
-    WiFi.setSleep(false);
-
-    if (!cfgDeviceName.isEmpty()) {
-      if (!WiFi.setHostname(cfgDeviceName.c_str())) {
-        Serial.println("[WIFI] Failed to set STA hostname");
-      } else {
-        Serial.printf("[WIFI] STA hostname set to: %s\n", cfgDeviceName.c_str());
-      }
-    }
-
-    if (wifi.wifiPass.isEmpty()) {
-      WiFi.begin(wifi.ssid.c_str());
-    } else {
-      WiFi.begin(wifi.ssid.c_str(), wifi.wifiPass.c_str());
-    }
-
-    // LED feedback: double blink when testing WiFi credentials
-    ledWifiTestSequence();
-
-    Serial.printf("[WIFI] Trying network %u/%u: %s\n",
-      (unsigned int)(i + 1),
-      (unsigned int)runtimeConfig.wifiList.size(),
-      wifi.ssid.c_str());
-
-    int result = (int)WiFi.waitForConnectResult(20000UL);
-
-    // Stop any stale connection attempt before trying the next credential.
-    if (result != (int)WL_CONNECTED || WiFi.status() != WL_CONNECTED) {
-      WiFi.disconnect(true, true);
-      delay(100);
-    }
-
-    if (result == (int)WL_CONNECTED && WiFi.status() == WL_CONNECTED) {
-      // LED feedback: short blink on success
-      ledWifiSuccessSequence();
-      Serial.printf("[WIFI] Connected to %s — IP: %s\n", wifi.ssid.c_str(), WiFi.localIP().toString().c_str());
-      syncClockWithNtp();
-      registerCameraRoutes();
-      server.begin();
-      startAuxHttpServers();
-      setWifiModemSleep(true, "idle");
-      Serial.println("[HTTP] Camera server ready on port 80");
-      return;
-    }
-
-    // LED feedback: long blink on failure
-    ledWifiFailureSequence();
-    Serial.printf("[WIFI] Failed to connect to %s (status=%d)\n", wifi.ssid.c_str(), (int)result);
+  if (connectToSavedStaNetworks(true, true)) {
+    staConnectedAtBoot = true;
+    lastStaReconnectAttemptAt = millis();
+    return;
   }
 
   Serial.println("[WIFI] All saved networks failed — switching to fallback AP");
@@ -4737,6 +4879,7 @@ static void servicePendingFirmwareRestart() {
 void setup() {
   Serial.begin(115200);
   Serial.println("\n[BOOT] ESP32-CAM starting");
+  WiFi.onEvent(onWifiEvent);
 
   // Initialize LED and provide boot feedback
   initLED();
@@ -4790,6 +4933,7 @@ void setup() {
 void loop() {
   server.handleClient();
   serviceNtpSync();
+  serviceStaReconnect();
   serviceRecording();
   serviceCameraIdleTimeout();
   servicePendingFirmwareRestart();
