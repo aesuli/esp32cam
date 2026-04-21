@@ -44,6 +44,10 @@
 #include <cstdarg>
 #include "camera_pins.h"
 
+#ifndef FIRMWARE_VERSION
+#define FIRMWARE_VERSION "dev"
+#endif
+
 // ─── Pin definitions ──────────────────────────────────────────────────────────
 static constexpr int BUTTON_GPIO = 12;
 static constexpr int PIR_GPIO    = 13;
@@ -80,6 +84,7 @@ static constexpr uint32_t CAMERA_XCLK_FREQS_HZ[] = {
 // ─── SD configuration storage ──────────────────────────────────────────────────
 #define CONFIG_FILE_PATH "/config.enc"
 #define CAPTURE_COUNTER_FILE_PATH "/capture_counter.txt"
+#define SD_SORT_FILE_PATH "/.sort"
 
 // ─── Globals ──────────────────────────────────────────────────────────────────
 static constexpr uint16_t HTTP_MAIN_PORT = 80;
@@ -124,10 +129,13 @@ static File   recordingFile;
 static String recordingPath;
 static File   sdUploadFile;
 static bool   sdUploadFailed = false;
+static bool   sdUploadBlocked = false;
 static String sdUploadPath;
 static bool   firmwareUploadFailed = false;
 static bool   firmwareUploadSuccess = false;
 static unsigned long firmwareRestartAt = 0;
+static bool   adminRestartPending = false;
+static unsigned long adminRestartAt = 0;
 static uint32_t captureSequence = 0;
 static bool captureSequenceLoaded = false;
 static SemaphoreHandle_t cameraMutex = nullptr;
@@ -144,6 +152,8 @@ static constexpr uint32_t AVI_MOVI_LIST_HEADER_SIZE = 4;
 static constexpr const char *CAPTURE_DIRECTORY = "/capture";
 static constexpr const char *AVI_VIDEO_CHUNK_ID = "00dc";
 static constexpr const char *SERIAL_LOG_FILE_PATH = "/log.txt";
+static constexpr const char *FIRMWARE_VERSION_TEXT = FIRMWARE_VERSION;
+static constexpr const char *FIRMWARE_BUILD_TEXT = __DATE__ " " __TIME__;
 
 static bool initSDCard();
 
@@ -151,9 +161,10 @@ static bool gLogWriteInProgress = false;
 static bool gLogSdReady = false;
 static bool gLogSdFailureReported = false;
 static bool gLogFileFailureReported = false;
+static bool gLoggingEnabled = true;
 
 static bool appendSerialLogChunk(const uint8_t *data, size_t len) {
-  if (!data || len == 0 || gLogWriteInProgress) {
+  if (!gLoggingEnabled || !data || len == 0 || gLogWriteInProgress) {
     return false;
   }
 
@@ -163,7 +174,9 @@ static bool appendSerialLogChunk(const uint8_t *data, size_t len) {
     gLogSdReady = initSDCard();
     if (!gLogSdReady) {
       if (!gLogSdFailureReported) {
-        ::Serial.println("[LOG] SD logging disabled: initSDCard failed");
+        if (gLoggingEnabled) {
+          ::Serial.println("[LOG] SD logging disabled: initSDCard failed");
+        }
         gLogSdFailureReported = true;
       }
       gLogWriteInProgress = false;
@@ -175,7 +188,9 @@ static bool appendSerialLogChunk(const uint8_t *data, size_t len) {
     File createFile = SD_MMC.open(SERIAL_LOG_FILE_PATH, FILE_WRITE);
     if (!createFile) {
       if (!gLogFileFailureReported) {
-        ::Serial.println("[LOG] Failed to create /log.txt");
+        if (gLoggingEnabled) {
+          ::Serial.println("[LOG] Failed to create /log.txt");
+        }
         gLogFileFailureReported = true;
       }
       gLogWriteInProgress = false;
@@ -187,7 +202,9 @@ static bool appendSerialLogChunk(const uint8_t *data, size_t len) {
   File file = SD_MMC.open(SERIAL_LOG_FILE_PATH, FILE_APPEND);
   if (!file) {
     if (!gLogFileFailureReported) {
-      ::Serial.println("[LOG] Failed to open /log.txt for append");
+      if (gLoggingEnabled) {
+        ::Serial.println("[LOG] Failed to open /log.txt for append");
+      }
       gLogFileFailureReported = true;
     }
     gLogWriteInProgress = false;
@@ -199,7 +216,9 @@ static bool appendSerialLogChunk(const uint8_t *data, size_t len) {
   file.close();
 
   if (written != len && !gLogFileFailureReported) {
-    ::Serial.println("[LOG] Partial write to /log.txt");
+    if (gLoggingEnabled) {
+      ::Serial.println("[LOG] Partial write to /log.txt");
+    }
     gLogFileFailureReported = true;
   }
 
@@ -214,12 +233,18 @@ class SerialMirror : public Print {
   }
 
   size_t write(uint8_t b) override {
+    if (!gLoggingEnabled) {
+      return 1;
+    }
     size_t out = ::Serial.write(b);
     appendSerialLogChunk(&b, 1);
     return out;
   }
 
   size_t write(const uint8_t *buffer, size_t size) override {
+    if (!gLoggingEnabled) {
+      return size;
+    }
     size_t out = ::Serial.write(buffer, size);
     appendSerialLogChunk(buffer, size);
     return out;
@@ -291,6 +316,7 @@ struct StoredConfig {
   bool hasCameraSettings = false;
   CameraSettings cameraSettings;
   bool ledAccessBlink = false;  // LED blink on URL access
+  bool loggingEnabled = true;
   int8_t txPowerSta = (int8_t)DEFAULT_TX_POWER_STA;  // wifi_power_t cast to int8
   int8_t txPowerAp  = (int8_t)DEFAULT_TX_POWER_AP;
 };
@@ -337,6 +363,7 @@ static bool loadRuntimeConfigWithRetries(StoredConfig &cfg);
 static bool initCameraWithRetries();
 static bool waitForIO0Released(unsigned long timeoutMs);
 static void servicePendingFirmwareRestart();
+static void servicePendingAdminRestart();
 static void setWifiModemSleep(bool enabled, const char *reason = nullptr);
 static void registerCameraRoutes();
 static void startAuxHttpServers();
@@ -1492,6 +1519,7 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
     appendCameraSettings(plain, cfg.cameraSettings);
   }
   appendU8(plain, cfg.ledAccessBlink ? 1 : 0);
+  appendU8(plain, cfg.loggingEnabled ? 1 : 0);
   appendU8(plain, (uint8_t)cfg.txPowerSta);
   appendU8(plain, (uint8_t)cfg.txPowerAp);
 
@@ -1548,16 +1576,32 @@ static bool decryptConfigV5(const String &ivHex, const String &cipherHex, Stored
   }
   cfg.ledAccessBlink = (ledAccessBlink != 0);
 
+  cfg.loggingEnabled = true;
+  if (offset < plain.size()) {
+    uint8_t loggingEnabled = 1;
+    if (!readU8(plain, offset, loggingEnabled)) {
+      return false;
+    }
+    cfg.loggingEnabled = (loggingEnabled != 0);
+  }
+
   uint8_t txPowerSta = (uint8_t)DEFAULT_TX_POWER_STA;
-  if (!readU8(plain, offset, txPowerSta)) {
+  if (offset >= plain.size()) {
     cfg.txPowerSta = (int8_t)DEFAULT_TX_POWER_STA;
+    cfg.txPowerAp = (int8_t)DEFAULT_TX_POWER_AP;
+    return true;
+  }
+  if (!readU8(plain, offset, txPowerSta)) {
     return false;
   }
   cfg.txPowerSta = (int8_t)txPowerSta;
 
   uint8_t txPowerAp = (uint8_t)DEFAULT_TX_POWER_AP;
-  if (!readU8(plain, offset, txPowerAp)) {
+  if (offset >= plain.size()) {
     cfg.txPowerAp = (int8_t)DEFAULT_TX_POWER_AP;
+    return true;
+  }
+  if (!readU8(plain, offset, txPowerAp)) {
     return false;
   }
   cfg.txPowerAp = (int8_t)txPowerAp;
@@ -2172,6 +2216,18 @@ header h1{color:#e94560;font-size:1.3em}
     <div style="font-size:.85em;color:#bbb;margin-top:10px">When enabled, LED blinks briefly on each URL request. Boot sequences are unaffected.</div>
   </div>
   <div class="panel">
+    <h3>Logging</h3>
+    <form class="form" id="logging_form">
+      <div style="display:flex;align-items:center;gap:10px">
+        <label for="logging_enabled" style="margin:0">Enable serial + file logging</label>
+        <input id="logging_enabled" type="checkbox" style="width:auto">
+      </div>
+      <button type="submit">Save</button>
+    </form>
+    <div id="logging_status" class="status"></div>
+    <div style="font-size:.85em;color:#bbb;margin-top:10px">Disables all firmware logs globally, including serial output and /log.txt writes.</div>
+  </div>
+  <div class="panel">
     <h3>TX Power</h3>
     <form class="form" id="txpower_form">
       <div>
@@ -2215,6 +2271,7 @@ header h1{color:#e94560;font-size:1.3em}
   </div>
   <div class="panel">
     <h3>Firmware Update</h3>
+    <div class="status" style="color:#bbb;margin-bottom:10px">Current version: <strong style="color:#eee">__FIRMWARE_VERSION__</strong><br>Build: __FIRMWARE_BUILD__</div>
     <form class="form" id="firmware_form">
       <div>
         <label>Firmware Binary (.bin)</label>
@@ -2224,6 +2281,18 @@ header h1{color:#e94560;font-size:1.3em}
     </form>
     <div id="firmware_status" class="status"></div>
     <div style="font-size:.85em;color:#bbb;margin-top:10px">Upload the compiled firmware binary. The device will reboot automatically after a successful update.</div>
+  </div>
+  <div class="panel">
+    <h3>System Reset</h3>
+    <form class="form" id="reset_form">
+      <button type="submit">Restart Device</button>
+    </form>
+    <div id="reset_status" class="status"></div>
+    <div style="font-size:.85em;color:#bbb;margin-top:10px">Restarts the ESP32-CAM without changing saved settings.</div>
+    <form class="form" id="factory_reset_form" style="margin-top:10px">
+      <button type="submit">Factory Reset (Delete Config)</button>
+    </form>
+    <div id="factory_reset_status" class="status"></div>
   </div>
 </div>
 <script>
@@ -2235,8 +2304,11 @@ function setAdminStatus(msg,err){var e=id('admin_status');e.textContent=msg;e.cl
 function setNameStatus(msg,err){var e=id('name_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setTimeStatus(msg,err){var e=id('time_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setLedStatus(msg,err){var e=id('led_status');e.textContent=msg;e.className=err?'status error':'status';}
+function setLoggingStatus(msg,err){var e=id('logging_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setTxPowerStatus(msg,err){var e=id('txpower_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setFirmwareStatus(msg,err){var e=id('firmware_status');e.textContent=msg;e.className=err?'status error':'status';}
+function setResetStatus(msg,err){var e=id('reset_status');e.textContent=msg;e.className=err?'status error':'status';}
+function setFactoryResetStatus(msg,err){var e=id('factory_reset_status');e.textContent=msg;e.className=err?'status error':'status';}
 function formData(obj){return Object.keys(obj).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(obj[k]);}).join('&');}
 function toDateTimeLocalValue(epoch){
   var d=new Date((Number(epoch)||0)*1000);
@@ -2327,6 +2399,18 @@ id('led_form').addEventListener('submit',function(e){
   e.preventDefault();
   fetch('/admin/led',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({ledAccessBlink:id('led_access_blink').checked?'1':'0'})}).then(function(r){r.text().then(function(msg){setLedStatus(msg||'Saved',!r.ok);refreshLedStatus();});});
 });
+function refreshLoggingStatus(){
+  fetch('/admin/logging').then(function(r){
+    if(!r.ok){throw new Error('Failed to load logging settings');}
+    return r.json();
+  }).then(function(d){
+    id('logging_enabled').checked=d.loggingEnabled!==false;
+  }).catch(function(){});
+}
+id('logging_form').addEventListener('submit',function(e){
+  e.preventDefault();
+  fetch('/admin/logging',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({loggingEnabled:id('logging_enabled').checked?'1':'0'})}).then(function(r){r.text().then(function(msg){setLoggingStatus(msg||'Saved',!r.ok);refreshLoggingStatus();});});
+});
 function refreshTxPower(){
   fetch('/admin/txpower').then(function(r){
     if(!r.ok){throw new Error('Failed to load TX power settings');}
@@ -2356,10 +2440,31 @@ id('firmware_form').addEventListener('submit',function(e){
     });
   }).catch(function(err){setFirmwareStatus(err.message||'Firmware upload failed',true);});
 });
+id('reset_form').addEventListener('submit',function(e){
+  e.preventDefault();
+  if(!confirm('Restart device now?')){return;}
+  setResetStatus('Scheduling restart...',false);
+  fetch('/admin/reset',{method:'POST'}).then(function(r){
+    return r.text().then(function(msg){
+      setResetStatus(msg||'Restart requested',!r.ok);
+    });
+  }).catch(function(err){setResetStatus(err.message||'Restart failed',true);});
+});
+id('factory_reset_form').addEventListener('submit',function(e){
+  e.preventDefault();
+  if(!confirm('Delete stored configuration and restart to setup mode?')){return;}
+  setFactoryResetStatus('Deleting configuration and scheduling restart...',false);
+  fetch('/admin/factory-reset',{method:'POST'}).then(function(r){
+    return r.text().then(function(msg){
+      setFactoryResetStatus(msg||'Factory reset requested',!r.ok);
+    });
+  }).catch(function(err){setFactoryResetStatus(err.message||'Factory reset failed',true);});
+});
 refreshWiFiList();
 refreshDeviceName();
 refreshTimeStatus();
 refreshLedStatus();
+refreshLoggingStatus();
 refreshTxPower();
 </script>
 </body>
@@ -2386,6 +2491,13 @@ header h1{color:#e94560;font-size:1.3em}
 .actions label,.actions button{background:#16213e;color:#fff;border:1px solid #234573;padding:8px 12px;border-radius:4px;cursor:pointer;font-size:.9em}
 .actions button:hover{background:#234573}
 .actions input[type=file]{display:none}
+.folder-create{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.folder-create input{background:#16213e;color:#fff;border:1px solid #234573;padding:8px 10px;border-radius:4px;min-width:200px}
+.folder-create button{background:#16213e;color:#fff;border:1px solid #234573;padding:8px 12px;border-radius:4px;cursor:pointer;font-size:.9em}
+.folder-create button:hover{background:#234573}
+.dropzone{border:2px dashed #234573;border-radius:8px;padding:14px 12px;margin-bottom:10px;text-align:center;color:#9ec5ff;background:#111c38;transition:background .15s,border-color .15s,color .15s}
+.dropzone strong{color:#dbeafe}
+.dropzone.active{border-color:#7dd3fc;background:#0d2f47;color:#dbeafe}
 .pathbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
 .pathbar button{background:#16213e;color:#fff;border:1px solid #234573;padding:8px 12px;border-radius:4px;cursor:pointer;font-size:.85em}
 .pathbar button:hover{background:#234573}
@@ -2427,19 +2539,24 @@ header h1{color:#e94560;font-size:1.3em}
     <button onclick="loadFiles()">Refresh</button>
     <label>Upload: <input id="upload_file" type="file" onchange="uploadFile(this)"></label>
   </div>
+  <div class="folder-create">
+    <input id="new_folder_name" type="text" placeholder="New folder name" maxlength="64">
+    <button onclick="createFolder()">Create Folder</button>
+  </div>
+  <div id="dropzone" class="dropzone"><strong>Drag and drop files here</strong> to upload into the current folder</div>
   <div class="pathbar">
     <button onclick="goUp()">Up</button>
     <div id="crumbs" class="crumbs"></div>
   </div>
   <div class="sortbar">
     <label for="sort_by">Sort by</label>
-    <select id="sort_by" onchange="applySortAndRender()">
+    <select id="sort_by" onchange="onSortChanged()">
       <option value="name">Name</option>
       <option value="size">Size</option>
       <option value="type">Type</option>
     </select>
     <label for="sort_dir">Direction</label>
-    <select id="sort_dir" onchange="applySortAndRender()">
+    <select id="sort_dir" onchange="onSortChanged()">
       <option value="asc">Ascending</option>
       <option value="desc">Descending</option>
     </select>
@@ -2463,6 +2580,12 @@ function normalizePath(p){
   if(!path.startsWith('/')) path='/'+path;
   if(path.length>1 && path.endsWith('/')) path=path.slice(0,-1);
   return path;
+}
+function validFolderName(name){
+  var n=String(name||'').trim();
+  if(!n||n==='.'||n==='..')return false;
+  if(n.indexOf('/')!==-1||n.indexOf('\\')!==-1||n.indexOf('..')!==-1)return false;
+  return true;
 }
 function baseName(path){
   var clean=normalizePath(path);
@@ -2548,8 +2671,8 @@ function renderItems(items){
   var rows=items.map(function(item){
     if(item.isDir){
       return '<div class="file-item">'
-        +'<div class="file-left"><div class="thumb"></div><div class="meta"><strong>'+esc(item.name)+'</strong><span>Folder • '+esc(item.path)+'</span></div></div>'
-        +'<div class="file-actions"><button onclick="openDir(\''+item.path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\')">Open</button></div>'
+        +'<div class="file-left" ondblclick="openDir(\''+item.path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\')"><div class="thumb"></div><div class="meta"><strong>'+esc(item.name)+'</strong><span>Folder • '+esc(item.path)+'</span></div></div>'
+        +'<div class="file-actions"><button onclick="openDir(\''+item.path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\')">Open</button><button onclick="deleteFolder(\''+item.path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\')">Delete</button></div>'
         +'</div>';
     }
 
@@ -2557,8 +2680,8 @@ function renderItems(items){
       ?'<img class="thumb" loading="lazy" src="'+transferBase+'/sd/view?file='+encodeURIComponent(item.path)+'&t='+transferToken+'" alt="preview">'
       :'<div class="thumb"></div>';
     return '<div class="file-item">'
-      +'<div class="file-left">'+preview+'<div class="meta"><strong>'+esc(item.name)+'</strong><span>'+formatSize(item.size)+' • '+esc(item.path)+'</span></div></div>'
-      +'<div class="file-actions"><a href="'+transferBase+'/sd/download?file='+encodeURIComponent(item.path)+'&t='+transferToken+'">Download</a><a href="'+transferBase+'/sd/view?file='+encodeURIComponent(item.path)+'&t='+transferToken+'" target="_blank" rel="noopener">Open</a><button onclick="deleteFile(\''+item.path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\')">Delete</button></div>'
+      +'<div class="file-left" ondblclick="openFile(\''+item.path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\')">'+preview+'<div class="meta"><strong>'+esc(item.name)+'</strong><span>'+formatSize(item.size)+' • '+esc(item.path)+'</span></div></div>'
+      +'<div class="file-actions"><a href="'+transferBase+'/sd/download?file='+encodeURIComponent(item.path)+'&t='+transferToken+'">Download</a><a href="#" onclick="openFile(\''+item.path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\');return false;">Open</a><button onclick="deleteFile(\''+item.path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\')">Delete</button></div>'
       +'</div>';
   }).join('');
 
@@ -2574,6 +2697,15 @@ function applySortAndRender(){
 function openDir(path){
   currentDir=normalizePath(path);
   loadFiles();
+}
+function openFile(path){
+  var p=String(path||'').toLowerCase();
+  var isVideo=p.endsWith('.avi')||p.endsWith('.mp4')||p.endsWith('.mjpg')||p.endsWith('.mov')||p.endsWith('.webm');
+  if(isVideo){
+    window.location.assign('/sd/player?file='+encodeURIComponent(path));
+    return;
+  }
+  window.location.assign(transferBase+'/sd/view?file='+encodeURIComponent(path)+'&t='+transferToken);
 }
 function goUp(){
   if(currentDir==='/') return;
@@ -2608,20 +2740,112 @@ function deleteFile(name){
     });
   }).catch(function(e){setStatus(e.message||'Delete failed',true);});
 }
-function uploadFile(input){
-  if(!input.files.length)return;
-  setStatus('Uploading '+input.files[0].name+'...',false);
-  var fd=new FormData();fd.append('file',input.files[0]);
-  fetch(transferBase+'/sd/upload?t='+transferToken,{method:'POST',body:fd}).then(function(r){
+function createFolder(){
+  var input=document.getElementById('new_folder_name');
+  var name=String(input.value||'').trim();
+  if(!validFolderName(name)){
+    setStatus('Invalid folder name',true);
+    return;
+  }
+  setStatus('Creating folder '+name+'...',false);
+  var body='dir='+encodeURIComponent(currentDir)+'&name='+encodeURIComponent(name);
+  fetch('/sd/mkdir',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body}).then(function(r){
+    return r.text().then(function(t){
+      if(!r.ok){throw new Error(t||'Failed to create folder');}
+      setStatus(t||'Folder created',false);
+      input.value='';
+      loadFiles();
+    });
+  }).catch(function(e){setStatus(e.message||'Failed to create folder',true);});
+}
+function deleteFolder(path){
+  if(path==='/'||!path){
+    setStatus('Cannot delete root folder',true);
+    return;
+  }
+  if(!confirm('Delete folder '+path+' and all contents?'))return;
+  setStatus('Deleting folder '+path+'...',false);
+  fetch('/sd/rmdir',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'dir='+encodeURIComponent(path)}).then(function(r){
+    return r.text().then(function(t){
+      if(!r.ok){throw new Error(t||'Failed to delete folder');}
+      setStatus(t||'Folder deleted',false);
+      loadFiles();
+    });
+  }).catch(function(e){setStatus(e.message||'Failed to delete folder',true);});
+}
+function uploadFileObject(file){
+  if(!file)return;
+  setStatus('Uploading '+file.name+'...',false);
+  var fd=new FormData();fd.append('file',file);
+  fetch(transferBase+'/sd/upload?t='+transferToken+'&dir='+encodeURIComponent(currentDir),{method:'POST',body:fd}).then(function(r){
     return r.text().then(function(t){
       if(!r.ok){throw new Error(t||'Upload failed');}
       setStatus(t||'Upload complete',false);
       loadFiles();
-      input.value='';
     });
   }).catch(function(e){setStatus(e.message||'Upload failed',true);});
 }
-loadFiles();
+function uploadFile(input){
+  if(!input.files.length)return;
+  uploadFileObject(input.files[0]);
+  input.value='';
+}
+function isValidSortBy(v){
+  return v==='name'||v==='size'||v==='type';
+}
+function isValidSortDir(v){
+  return v==='asc'||v==='desc';
+}
+function saveSortPreference(){
+  var by=document.getElementById('sort_by').value;
+  var dir=document.getElementById('sort_dir').value;
+  fetch('/sd/sort',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'by='+encodeURIComponent(by)+'&dir='+encodeURIComponent(dir)}).catch(function(){});
+}
+function loadSortPreference(){
+  return fetch('/sd/sort').then(function(r){
+    return r.json().then(function(d){
+      if(!r.ok){throw new Error(d.error||'Failed to load sort preference');}
+      return d;
+    });
+  }).then(function(d){
+    document.getElementById('sort_by').value=isValidSortBy(d.by)?d.by:'name';
+    document.getElementById('sort_dir').value=isValidSortDir(d.dir)?d.dir:'asc';
+  }).catch(function(){
+    document.getElementById('sort_by').value='name';
+    document.getElementById('sort_dir').value='asc';
+  });
+}
+function onSortChanged(){
+  applySortAndRender();
+  saveSortPreference();
+}
+function setupDropzone(){
+  var zone=document.getElementById('dropzone');
+  if(!zone)return;
+  function over(e){
+    e.preventDefault();
+    zone.classList.add('active');
+  }
+  function leave(e){
+    e.preventDefault();
+    zone.classList.remove('active');
+  }
+  zone.addEventListener('dragenter',over);
+  zone.addEventListener('dragover',over);
+  zone.addEventListener('dragleave',leave);
+  zone.addEventListener('drop',function(e){
+    e.preventDefault();
+    zone.classList.remove('active');
+    var files=e.dataTransfer&&e.dataTransfer.files;
+    if(!files||!files.length){
+      setStatus('No file dropped',true);
+      return;
+    }
+    uploadFileObject(files[0]);
+  });
+}
+setupDropzone();
+loadSortPreference().then(function(){loadFiles();});
 </script>
 </body>
 </html>)html";
@@ -3510,6 +3734,140 @@ static bool normalizeAndValidateSDPath(const String &inputPath, String &outPath)
   return true;
 }
 
+static bool isValidSortByValue(const String &value) {
+  return value == "name" || value == "size" || value == "type";
+}
+
+static bool isValidSortDirValue(const String &value) {
+  return value == "asc" || value == "desc";
+}
+
+static void loadSDSortPreferences(String &sortBy, String &sortDir) {
+  sortBy = "name";
+  sortDir = "asc";
+
+  if (!SD_MMC.exists(SD_SORT_FILE_PATH)) {
+    return;
+  }
+
+  File file = SD_MMC.open(SD_SORT_FILE_PATH, FILE_READ);
+  if (!file) {
+    return;
+  }
+
+  String content = file.readString();
+  file.close();
+
+  int byPos = content.indexOf("by=");
+  if (byPos >= 0) {
+    int byStart = byPos + 3;
+    int byEnd = content.indexOf('\n', byStart);
+    String byValue = (byEnd >= 0) ? content.substring(byStart, byEnd) : content.substring(byStart);
+    byValue.trim();
+    if (isValidSortByValue(byValue)) {
+      sortBy = byValue;
+    }
+  }
+
+  int dirPos = content.indexOf("dir=");
+  if (dirPos >= 0) {
+    int dirStart = dirPos + 4;
+    int dirEnd = content.indexOf('\n', dirStart);
+    String dirValue = (dirEnd >= 0) ? content.substring(dirStart, dirEnd) : content.substring(dirStart);
+    dirValue.trim();
+    if (isValidSortDirValue(dirValue)) {
+      sortDir = dirValue;
+    }
+  }
+}
+
+static bool saveSDSortPreferences(const String &sortBy, const String &sortDir) {
+  SD_MMC.remove(SD_SORT_FILE_PATH);
+  File file = SD_MMC.open(SD_SORT_FILE_PATH, FILE_WRITE);
+  if (!file) {
+    return false;
+  }
+
+  String content = "by=" + sortBy + "\ndir=" + sortDir + "\n";
+  size_t written = file.print(content);
+  file.close();
+  return written == content.length();
+}
+
+static bool validateNewSDName(const String &name) {
+  if (name.isEmpty() || name == "." || name == "..") {
+    return false;
+  }
+
+  if (name.indexOf('/') != -1 || name.indexOf('\\') != -1 || name.indexOf("..") != -1) {
+    return false;
+  }
+
+  return true;
+}
+
+static bool isProtectedSDPath(const String &path) {
+  return path == CONFIG_FILE_PATH || path == CAPTURE_COUNTER_FILE_PATH || path == SD_SORT_FILE_PATH;
+}
+
+static bool isHiddenSDPath(const String &path) {
+  return path == SD_SORT_FILE_PATH;
+}
+
+static bool removeSDDirectoryRecursive(const String &dirPath, bool &blockedProtectedPath) {
+  File dir = SD_MMC.open(dirPath, FILE_READ);
+  if (!dir || !dir.isDirectory()) {
+    return false;
+  }
+
+  File entry = dir.openNextFile();
+  while (entry) {
+    String rawName = String(entry.name());
+    String itemPath = rawName;
+    if (!itemPath.startsWith("/")) {
+      itemPath = (dirPath == "/") ? ("/" + rawName) : (dirPath + "/" + rawName);
+    }
+
+    String normalizedPath;
+    if (!normalizeAndValidateSDPath(itemPath, normalizedPath)) {
+      entry.close();
+      dir.close();
+      return false;
+    }
+
+    if (isProtectedSDPath(normalizedPath)) {
+      blockedProtectedPath = true;
+      entry.close();
+      dir.close();
+      return false;
+    }
+
+    bool isDir = entry.isDirectory();
+    entry.close();
+
+    if (isDir) {
+      if (!removeSDDirectoryRecursive(normalizedPath, blockedProtectedPath)) {
+        dir.close();
+        return false;
+      }
+      if (!SD_MMC.rmdir(normalizedPath)) {
+        dir.close();
+        return false;
+      }
+    } else {
+      if (!SD_MMC.remove(normalizedPath)) {
+        dir.close();
+        return false;
+      }
+    }
+
+    entry = dir.openNextFile();
+  }
+
+  dir.close();
+  return true;
+}
+
 static bool appendSDFilesRecursive(const String &dirPath, String &json, bool &first, uint8_t depth) {
   File dir = SD_MMC.open(dirPath, FILE_READ);
   if (!dir || !dir.isDirectory()) {
@@ -3703,6 +4061,34 @@ static void handleAdminLedSet() {
   server.send(200, "text/plain", "LED configuration saved");
 }
 
+static void handleAdminLoggingGet() {
+  if (!checkAuth()) return;
+
+  String json = "{\"loggingEnabled\":" + String(gLoggingEnabled ? "true" : "false") + "}";
+  server.send(200, "application/json", json);
+}
+
+static void handleAdminLoggingSet() {
+  if (!checkAuth()) return;
+
+  if (!server.hasArg("loggingEnabled")) {
+    server.send(400, "text/plain", "Missing loggingEnabled parameter");
+    return;
+  }
+
+  bool newValue = (server.arg("loggingEnabled") == "1" || server.arg("loggingEnabled") == "true");
+
+  runtimeConfig.loggingEnabled = newValue;
+  gLoggingEnabled = newValue;
+
+  if (!persistRuntimeConfig(runtimeConfig)) {
+    server.send(500, "text/plain", "Failed to save logging configuration");
+    return;
+  }
+
+  server.send(200, "text/plain", "Logging configuration saved");
+}
+
 // Valid wifi_power_t raw values accepted from the UI
 static bool isValidTxPowerValue(int v) {
   switch (v) {
@@ -3767,9 +4153,45 @@ static void handleAdminTxPowerSet() {
   server.send(200, "text/plain", "TX power saved");
 }
 
+static void handleAdminReset() {
+  if (!checkAuth()) {
+    return;
+  }
+
+  handleUrlAccess();
+  adminRestartPending = true;
+  adminRestartAt = millis() + FIRMWARE_RESTART_DELAY_MS;
+  server.send(200, "text/plain", "Restart requested. Device will reboot shortly.");
+}
+
+static void handleAdminFactoryReset() {
+  if (!checkAuth()) {
+    return;
+  }
+
+  handleUrlAccess();
+
+  if (!initSDCard()) {
+    server.send(500, "text/plain", "SD card not available");
+    return;
+  }
+
+  if (SD_MMC.exists(CONFIG_FILE_PATH) && !SD_MMC.remove(CONFIG_FILE_PATH)) {
+    server.send(500, "text/plain", "Failed to delete configuration file");
+    return;
+  }
+
+  adminRestartPending = true;
+  adminRestartAt = millis() + FIRMWARE_RESTART_DELAY_MS;
+  server.send(200, "text/plain", "Configuration deleted. Rebooting to setup mode shortly.");
+}
+
 static void handleAdminPage() {
   if (!checkAuth()) return;
-  sendHtmlWithToken(ADMIN_HTML);
+  String page(ADMIN_HTML);
+  page.replace("__FIRMWARE_VERSION__", FIRMWARE_VERSION_TEXT);
+  page.replace("__FIRMWARE_BUILD__", FIRMWARE_BUILD_TEXT);
+  sendHtmlWithToken(page);
 }
 
 static void handleSDPage() {
@@ -3819,6 +4241,12 @@ static void handleSDList() {
 
     String normalizedPath;
     if (normalizeAndValidateSDPath(itemPath, normalizedPath)) {
+      if (isProtectedSDPath(normalizedPath) || isHiddenSDPath(normalizedPath)) {
+        entry.close();
+        entry = dir.openNextFile();
+        continue;
+      }
+
       String itemName = normalizedPath;
       int slash = itemName.lastIndexOf('/');
       if (slash >= 0) {
@@ -3870,6 +4298,12 @@ static void handleSDDownloadWorker() {
     return;
   }
 
+  if (isProtectedSDPath(filePath)) {
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(403, "text/plain", "Access denied");
+    return;
+  }
+
   File file = SD_MMC.open(filePath, FILE_READ);
   if (!file || file.isDirectory()) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
@@ -3899,7 +4333,18 @@ static void handleSDDownloadMain() {
     return;
   }
 
-  server.sendHeader("Location", buildLocalUrl(HTTP_TRANSFER_PORT, String("/sd/download?file=") + urlEncode(server.arg("file")), true));
+  String filePath;
+  if (!normalizeAndValidateSDPath(server.arg("file"), filePath)) {
+    server.send(400, "text/plain", "Invalid file path");
+    return;
+  }
+
+  if (isProtectedSDPath(filePath)) {
+    server.send(403, "text/plain", "Access denied");
+    return;
+  }
+
+  server.sendHeader("Location", buildLocalUrl(HTTP_TRANSFER_PORT, String("/sd/download?file=") + urlEncode(filePath), true));
   server.send(302, "text/plain", "Redirecting to transfer server");
 }
 
@@ -3918,6 +4363,333 @@ static String sdMimeTypeForPath(const String &filePath) {
   if (lower.endsWith(".txt") || lower.endsWith(".log") || lower.endsWith(".csv")) return "text/plain";
   if (lower.endsWith(".json")) return "application/json";
   return "application/octet-stream";
+}
+
+static bool sdIsVideoPath(const String &filePath) {
+  String lower = filePath;
+  lower.toLowerCase();
+  return lower.endsWith(".avi")
+      || lower.endsWith(".mp4")
+      || lower.endsWith(".mjpg")
+      || lower.endsWith(".mov")
+      || lower.endsWith(".webm");
+}
+
+static bool readU32LE(File &file, uint32_t &value) {
+  uint8_t bytes[4];
+  if (file.read(bytes, sizeof(bytes)) != (int)sizeof(bytes)) {
+    return false;
+  }
+
+  value = (uint32_t)bytes[0]
+        | ((uint32_t)bytes[1] << 8)
+        | ((uint32_t)bytes[2] << 16)
+        | ((uint32_t)bytes[3] << 24);
+  return true;
+}
+
+static bool skipChunkData(File &file, uint32_t chunkSize) {
+  uint32_t skip = chunkSize + (chunkSize & 1U);
+  uint32_t nextPos = (uint32_t)file.position() + skip;
+  return file.seek(nextPos);
+}
+
+static void handleSDPlaybackWorker() {
+  if (!checkAuth(transferServer, true)) {
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(401, "text/plain", "Unauthorized");
+    return;
+  }
+
+  if (!transferServer.hasArg("file")) {
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(400, "text/plain", "file parameter required");
+    return;
+  }
+
+  if (!initSDCard()) {
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(500, "text/plain", "SD card not available");
+    return;
+  }
+
+  String filePath;
+  if (!normalizeAndValidateSDPath(transferServer.arg("file"), filePath)) {
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(400, "text/plain", "Invalid file path");
+    return;
+  }
+
+  if (isProtectedSDPath(filePath)) {
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(403, "text/plain", "Access denied");
+    return;
+  }
+
+  String lower = filePath;
+  lower.toLowerCase();
+  if (!lower.endsWith(".avi")) {
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(415, "text/plain", "Playback stream currently supports AVI MJPEG files only");
+    return;
+  }
+
+  File file = SD_MMC.open(filePath, FILE_READ);
+  if (!file || file.isDirectory()) {
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(404, "text/plain", "File not found");
+    return;
+  }
+
+  uint32_t fileSize = (uint32_t)file.size();
+  if (fileSize < 16U || !file.seek(12U)) {
+    file.close();
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(400, "text/plain", "Invalid AVI file");
+    return;
+  }
+
+  bool moviFound = false;
+  uint32_t moviStart = 0;
+  uint32_t moviEnd = 0;
+
+  while ((uint32_t)file.position() + 8U <= fileSize) {
+    char chunkId[4];
+    if (file.read((uint8_t *)chunkId, 4) != 4) {
+      break;
+    }
+
+    uint32_t chunkSize = 0;
+    if (!readU32LE(file, chunkSize)) {
+      break;
+    }
+
+    if (memcmp(chunkId, "LIST", 4) == 0) {
+      char listType[4];
+      if (file.read((uint8_t *)listType, 4) != 4) {
+        break;
+      }
+
+      if (memcmp(listType, "movi", 4) == 0) {
+        uint32_t payloadSize = chunkSize >= 4U ? (chunkSize - 4U) : 0U;
+        moviStart = (uint32_t)file.position();
+        moviEnd = moviStart + payloadSize;
+        if (moviEnd > fileSize) {
+          moviEnd = fileSize;
+        }
+        moviFound = true;
+        break;
+      }
+
+      if (chunkSize < 4U) {
+        break;
+      }
+
+      uint32_t remaining = chunkSize - 4U;
+      uint32_t skip = remaining + (chunkSize & 1U);
+      if (!file.seek((uint32_t)file.position() + skip)) {
+        break;
+      }
+    } else {
+      if (!skipChunkData(file, chunkSize)) {
+        break;
+      }
+    }
+  }
+
+  if (!moviFound || moviStart >= moviEnd || !file.seek(moviStart)) {
+    file.close();
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(400, "text/plain", "Could not locate AVI movi data");
+    return;
+  }
+
+  WiFiClient client = transferServer.client();
+  transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+  client.print(
+      "HTTP/1.1 200 OK\r\n"
+      "Content-Type: multipart/x-mixed-replace; boundary=--jpgbound\r\n"
+      "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+      "Pragma: no-cache\r\n"
+      "Connection: close\r\n"
+      "\r\n"
+  );
+
+  uint8_t frameBuf[1024];
+  while (client.connected() && (uint32_t)file.position() + 8U <= moviEnd) {
+    char chunkId[4];
+    if (file.read((uint8_t *)chunkId, 4) != 4) {
+      break;
+    }
+
+    uint32_t chunkSize = 0;
+    if (!readU32LE(file, chunkSize)) {
+      break;
+    }
+
+    uint32_t dataStart = (uint32_t)file.position();
+    uint32_t dataEnd = dataStart + chunkSize;
+    if (dataEnd > moviEnd) {
+      break;
+    }
+
+    bool isVideoChunk = memcmp(chunkId, AVI_VIDEO_CHUNK_ID, 4) == 0;
+    if (isVideoChunk && chunkSize > 0U) {
+      char partHeader[128];
+      int hlen = snprintf(partHeader, sizeof(partHeader),
+        "--jpgbound\r\n"
+        "Content-Type: image/jpeg\r\n"
+        "Content-Length: %u\r\n"
+        "\r\n",
+        (unsigned int)chunkSize);
+
+      bool ok = client.write((const uint8_t *)partHeader, (size_t)hlen) == (size_t)hlen;
+      uint32_t remaining = chunkSize;
+      while (ok && remaining > 0U) {
+        size_t toRead = remaining > sizeof(frameBuf) ? sizeof(frameBuf) : (size_t)remaining;
+        int readNow = file.read(frameBuf, toRead);
+        if (readNow <= 0) {
+          ok = false;
+          break;
+        }
+        if (client.write(frameBuf, (size_t)readNow) != (size_t)readNow) {
+          ok = false;
+          break;
+        }
+        remaining -= (uint32_t)readNow;
+      }
+      if (ok) {
+        ok = client.print("\r\n") > 0;
+      }
+
+      if (!ok) {
+        break;
+      }
+
+      if ((chunkSize & 1U) != 0U) {
+        file.read();
+      }
+      delay(RECORDING_FRAME_INTERVAL_MS);
+      continue;
+    }
+
+    if (!file.seek(dataEnd + (chunkSize & 1U))) {
+      break;
+    }
+  }
+
+  file.close();
+  client.stop();
+}
+
+static void handleSDPlayerMain() {
+  if (!checkAuth(server)) {
+    return;
+  }
+
+  if (!server.hasArg("file")) {
+    server.send(400, "text/plain", "file parameter required");
+    return;
+  }
+
+  if (!initSDCard()) {
+    server.send(500, "text/plain", "SD card not available");
+    return;
+  }
+
+  String filePath;
+  if (!normalizeAndValidateSDPath(server.arg("file"), filePath)) {
+    server.send(400, "text/plain", "Invalid file path");
+    return;
+  }
+
+  if (isProtectedSDPath(filePath)) {
+    server.send(403, "text/plain", "Access denied");
+    return;
+  }
+
+  File file = SD_MMC.open(filePath, FILE_READ);
+  if (!file || file.isDirectory()) {
+    server.send(404, "text/plain", "File not found");
+    return;
+  }
+  file.close();
+
+  if (!sdIsVideoPath(filePath)) {
+    server.sendHeader("Location", String("/sd/view?file=") + urlEncode(filePath));
+    server.send(302, "text/plain", "Redirecting to file view");
+    return;
+  }
+
+  String mediaUrl = buildLocalUrl(HTTP_TRANSFER_PORT, String("/sd/view?file=") + urlEncode(filePath), true);
+  String playbackUrl = buildLocalUrl(HTTP_TRANSFER_PORT, String("/sd/playback?file=") + urlEncode(filePath), true);
+  String downloadUrl = buildLocalUrl(HTTP_TRANSFER_PORT, String("/sd/download?file=") + urlEncode(filePath), true);
+  String mime = sdMimeTypeForPath(filePath);
+  String lower = filePath;
+  lower.toLowerCase();
+  bool useImagePlayback = lower.endsWith(".avi");
+
+  String filename = filePath;
+  int slash = filename.lastIndexOf('/');
+  if (slash >= 0) {
+    filename = filename.substring(slash + 1);
+  }
+
+  String page = R"html(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32-CAM - SD Video</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;min-height:100vh}
+nav{background:#16213e;padding:8px 20px;display:flex;gap:12px;flex-wrap:wrap}
+nav a{color:#eee;text-decoration:none;padding:8px 12px;border-radius:4px;border:1px solid #234573}
+nav a:hover{background:#234573}
+.wrap{max-width:1080px;margin:0 auto;padding:16px}
+.panel{background:#16213e;border:1px solid #234573;border-radius:10px;padding:14px}
+.title{color:#e94560;margin-bottom:10px}
+.meta{font-size:.9em;color:#bbb;margin-bottom:10px}
+video,img{width:100%;max-height:75vh;background:#000;border:1px solid #234573;border-radius:8px;display:block;object-fit:contain}
+.hint{font-size:.85em;color:#bbb;margin-top:10px;line-height:1.4}
+.actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+.actions a{background:#e94560;color:#fff;text-decoration:none;padding:8px 12px;border-radius:4px}
+.actions a:hover{background:#c73652}
+</style>
+</head>
+<body>
+<nav>
+  <a href="/">📷 Camera</a>
+  <a href="/sd">💾 SD Browser</a>
+  <a href="/admin">⚙️ Admin</a>
+</nav>
+<div class="wrap">
+  <div class="panel">
+    <h2 class="title">SD Video Viewer</h2>
+    <div class="meta">File: __FILENAME__</div>
+    __PLAYER_MEDIA__
+    <div class="actions">
+      <a href="__MEDIA_URL__">Open Raw</a>
+      <a href="__DOWNLOAD_URL__">Download</a>
+    </div>
+    <div class="hint">__PLAYER_HINT__</div>
+  </div>
+</div>
+</body>
+</html>)html";
+
+  page.replace("__FILENAME__", filename);
+  page.replace("__MEDIA_URL__", mediaUrl);
+  page.replace("__DOWNLOAD_URL__", downloadUrl);
+  if (useImagePlayback) {
+    page.replace("__PLAYER_MEDIA__", "<img src=\"" + playbackUrl + "\" alt=\"AVI playback\">");
+    page.replace("__PLAYER_HINT__", "AVI playback is rendered as MJPEG frames (stream style), similar to the live camera view.");
+  } else {
+    page.replace("__PLAYER_MEDIA__", "<video controls playsinline preload=\"metadata\" src=\"" + mediaUrl + "\" type=\"" + mime + "\"></video>");
+    page.replace("__PLAYER_HINT__", "If playback does not start, your browser likely does not support this container/codec and may require download instead.");
+  }
+  server.send(200, "text/html", page);
 }
 
 static void handleSDViewWorker() {
@@ -3946,6 +4718,12 @@ static void handleSDViewWorker() {
     return;
   }
 
+  if (isProtectedSDPath(filePath)) {
+    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+    transferServer.send(403, "text/plain", "Access denied");
+    return;
+  }
+
   File file = SD_MMC.open(filePath, FILE_READ);
   if (!file || file.isDirectory()) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
@@ -3968,7 +4746,18 @@ static void handleSDViewMain() {
     return;
   }
 
-  server.sendHeader("Location", buildLocalUrl(HTTP_TRANSFER_PORT, String("/sd/view?file=") + urlEncode(server.arg("file")), true));
+  String filePath;
+  if (!normalizeAndValidateSDPath(server.arg("file"), filePath)) {
+    server.send(400, "text/plain", "Invalid file path");
+    return;
+  }
+
+  if (isProtectedSDPath(filePath)) {
+    server.send(403, "text/plain", "Access denied");
+    return;
+  }
+
+  server.sendHeader("Location", buildLocalUrl(HTTP_TRANSFER_PORT, String("/sd/view?file=") + urlEncode(filePath), true));
   server.send(302, "text/plain", "Redirecting to transfer server");
 }
 
@@ -3994,11 +4783,187 @@ static void handleSDDelete() {
     return;
   }
 
+  if (isProtectedSDPath(filePath)) {
+    server.send(403, "text/plain", "Access denied");
+    return;
+  }
+
   if (SD_MMC.remove(filePath)) {
     server.send(200, "text/plain", "File deleted");
   } else {
     server.send(500, "text/plain", "Failed to delete file");
   }
+}
+
+static void handleSDSortGet() {
+  if (!checkAuth()) {
+    server.send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+    return;
+  }
+
+  if (!initSDCard()) {
+    server.send(500, "application/json", "{\"error\":\"SD card not available\"}");
+    return;
+  }
+
+  String sortBy;
+  String sortDir;
+  loadSDSortPreferences(sortBy, sortDir);
+
+  String json = "{\"by\":\"" + jsonEscape(sortBy) + "\",\"dir\":\"" + jsonEscape(sortDir) + "\"}";
+  server.send(200, "application/json", json);
+}
+
+static void handleSDSortSet() {
+  if (!checkAuth()) {
+    server.send(401, "text/plain", "Unauthorized");
+    return;
+  }
+
+  if (!server.hasArg("by") || !server.hasArg("dir")) {
+    server.send(400, "text/plain", "by and dir parameters are required");
+    return;
+  }
+
+  if (!initSDCard()) {
+    server.send(500, "text/plain", "SD card not available");
+    return;
+  }
+
+  String sortBy = server.arg("by");
+  String sortDir = server.arg("dir");
+  sortBy.trim();
+  sortDir.trim();
+
+  if (!isValidSortByValue(sortBy) || !isValidSortDirValue(sortDir)) {
+    server.send(400, "text/plain", "Invalid sort values");
+    return;
+  }
+
+  if (!saveSDSortPreferences(sortBy, sortDir)) {
+    server.send(500, "text/plain", "Failed to save sort preferences");
+    return;
+  }
+
+  server.send(200, "text/plain", "Sort preferences saved");
+}
+
+static void handleSDMakeDir() {
+  if (!checkAuth()) {
+    server.send(401, "text/plain", "Unauthorized");
+    return;
+  }
+
+  if (!server.hasArg("dir") || !server.hasArg("name")) {
+    server.send(400, "text/plain", "dir and name parameters are required");
+    return;
+  }
+
+  if (!initSDCard()) {
+    server.send(500, "text/plain", "SD card not available");
+    return;
+  }
+
+  String dirPath;
+  if (!normalizeAndValidateSDPath(server.arg("dir"), dirPath)) {
+    server.send(400, "text/plain", "Invalid directory path");
+    return;
+  }
+
+  String folderName = server.arg("name");
+  folderName.trim();
+  if (!validateNewSDName(folderName)) {
+    server.send(400, "text/plain", "Invalid folder name");
+    return;
+  }
+
+  File parent = SD_MMC.open(dirPath, FILE_READ);
+  if (!parent || !parent.isDirectory()) {
+    server.send(404, "text/plain", "Parent directory not found");
+    return;
+  }
+  parent.close();
+
+  String targetPath = (dirPath == "/") ? ("/" + folderName) : (dirPath + "/" + folderName);
+  String normalizedTarget;
+  if (!normalizeAndValidateSDPath(targetPath, normalizedTarget)) {
+    server.send(400, "text/plain", "Invalid target path");
+    return;
+  }
+
+  if (isProtectedSDPath(normalizedTarget)) {
+    server.send(403, "text/plain", "Access denied");
+    return;
+  }
+
+  if (SD_MMC.exists(normalizedTarget)) {
+    server.send(409, "text/plain", "A file or folder with this name already exists");
+    return;
+  }
+
+  if (!SD_MMC.mkdir(normalizedTarget)) {
+    server.send(500, "text/plain", "Failed to create folder");
+    return;
+  }
+
+  server.send(200, "text/plain", "Folder created");
+}
+
+static void handleSDRemoveDir() {
+  if (!checkAuth()) {
+    server.send(401, "text/plain", "Unauthorized");
+    return;
+  }
+
+  if (!server.hasArg("dir")) {
+    server.send(400, "text/plain", "dir parameter required");
+    return;
+  }
+
+  if (!initSDCard()) {
+    server.send(500, "text/plain", "SD card not available");
+    return;
+  }
+
+  String dirPath;
+  if (!normalizeAndValidateSDPath(server.arg("dir"), dirPath)) {
+    server.send(400, "text/plain", "Invalid directory path");
+    return;
+  }
+
+  if (dirPath == "/") {
+    server.send(400, "text/plain", "Cannot delete root folder");
+    return;
+  }
+
+  if (isProtectedSDPath(dirPath)) {
+    server.send(403, "text/plain", "Access denied");
+    return;
+  }
+
+  File dir = SD_MMC.open(dirPath, FILE_READ);
+  if (!dir || !dir.isDirectory()) {
+    server.send(404, "text/plain", "Folder not found");
+    return;
+  }
+  dir.close();
+
+  bool blockedProtectedPath = false;
+  if (!removeSDDirectoryRecursive(dirPath, blockedProtectedPath)) {
+    if (blockedProtectedPath) {
+      server.send(403, "text/plain", "Folder contains protected content");
+    } else {
+      server.send(500, "text/plain", "Failed to delete folder contents");
+    }
+    return;
+  }
+
+  if (!SD_MMC.rmdir(dirPath)) {
+    server.send(500, "text/plain", "Failed to delete folder");
+    return;
+  }
+
+  server.send(200, "text/plain", "Folder deleted");
 }
 
 static void handleSDUploadData() {
@@ -4016,7 +4981,23 @@ static void handleSDUploadData() {
 
   if (upload.status == UPLOAD_FILE_START) {
     sdUploadFailed = false;
+    sdUploadBlocked = false;
     sdUploadPath = "";
+
+    String targetDir = "/";
+    if (server.hasArg("dir")) {
+      if (!normalizeAndValidateSDPath(server.arg("dir"), targetDir)) {
+        sdUploadFailed = true;
+        return;
+      }
+    }
+
+    File targetDirFile = SD_MMC.open(targetDir, FILE_READ);
+    if (!targetDirFile || !targetDirFile.isDirectory()) {
+      sdUploadFailed = true;
+      return;
+    }
+    targetDirFile.close();
 
     String filename = upload.filename;
     filename.replace('\\', '/');
@@ -4030,7 +5011,27 @@ static void handleSDUploadData() {
       return;
     }
 
-    sdUploadPath = "/" + filename;
+    sdUploadPath = (targetDir == "/") ? ("/" + filename) : (targetDir + "/" + filename);
+    if (!normalizeAndValidateSDPath(sdUploadPath, sdUploadPath)) {
+      sdUploadFailed = true;
+      return;
+    }
+
+    if (isProtectedSDPath(sdUploadPath)) {
+      sdUploadBlocked = true;
+      return;
+    }
+
+    File existing = SD_MMC.open(sdUploadPath, FILE_READ);
+    if (existing) {
+      bool isDir = existing.isDirectory();
+      existing.close();
+      if (isDir) {
+        sdUploadFailed = true;
+        return;
+      }
+    }
+
     SD_MMC.remove(sdUploadPath);
     sdUploadFile = SD_MMC.open(sdUploadPath, FILE_WRITE);
     if (!sdUploadFile) {
@@ -4089,7 +5090,23 @@ static void handleSDUploadDataWorker() {
 
   if (upload.status == UPLOAD_FILE_START) {
     sdUploadFailed = false;
+    sdUploadBlocked = false;
     sdUploadPath = "";
+
+    String targetDir = "/";
+    if (transferServer.hasArg("dir")) {
+      if (!normalizeAndValidateSDPath(transferServer.arg("dir"), targetDir)) {
+        sdUploadFailed = true;
+        return;
+      }
+    }
+
+    File targetDirFile = SD_MMC.open(targetDir, FILE_READ);
+    if (!targetDirFile || !targetDirFile.isDirectory()) {
+      sdUploadFailed = true;
+      return;
+    }
+    targetDirFile.close();
 
     String filename = upload.filename;
     filename.replace('\\', '/');
@@ -4103,7 +5120,27 @@ static void handleSDUploadDataWorker() {
       return;
     }
 
-    sdUploadPath = "/" + filename;
+    sdUploadPath = (targetDir == "/") ? ("/" + filename) : (targetDir + "/" + filename);
+    if (!normalizeAndValidateSDPath(sdUploadPath, sdUploadPath)) {
+      sdUploadFailed = true;
+      return;
+    }
+
+    if (isProtectedSDPath(sdUploadPath)) {
+      sdUploadBlocked = true;
+      return;
+    }
+
+    File existing = SD_MMC.open(sdUploadPath, FILE_READ);
+    if (existing) {
+      bool isDir = existing.isDirectory();
+      existing.close();
+      if (isDir) {
+        sdUploadFailed = true;
+        return;
+      }
+    }
+
     SD_MMC.remove(sdUploadPath);
     sdUploadFile = SD_MMC.open(sdUploadPath, FILE_WRITE);
     if (!sdUploadFile) {
@@ -4159,7 +5196,9 @@ static void handleSDUploadWorker() {
 
   transferServer.sendHeader("Access-Control-Allow-Origin", "*");
 
-  if (sdUploadFailed) {
+  if (sdUploadBlocked) {
+    transferServer.send(403, "text/plain", "Access denied");
+  } else if (sdUploadFailed) {
     transferServer.send(500, "text/plain", "Upload failed");
   } else if (sdUploadPath.isEmpty()) {
     transferServer.send(400, "text/plain", "No file provided");
@@ -4169,6 +5208,7 @@ static void handleSDUploadWorker() {
 
   sdUploadPath = "";
   sdUploadFailed = false;
+  sdUploadBlocked = false;
 }
 
 static void handleSDUploadMain() {
@@ -4179,7 +5219,17 @@ static void handleSDUploadMain() {
   }
 
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.sendHeader("Location", buildLocalUrl(HTTP_TRANSFER_PORT, "/sd/upload", true));
+  String uploadPath = "/sd/upload";
+  if (server.hasArg("dir")) {
+    String dirPath;
+    if (!normalizeAndValidateSDPath(server.arg("dir"), dirPath)) {
+      server.send(400, "text/plain", "Invalid directory path");
+      return;
+    }
+    uploadPath += "?dir=" + urlEncode(dirPath);
+  }
+
+  server.sendHeader("Location", buildLocalUrl(HTTP_TRANSFER_PORT, uploadPath, true));
   server.send(307, "text/plain", "Redirecting to transfer server");
 }
 
@@ -4697,6 +5747,7 @@ static void startAuxHttpServers() {
   if (!transferServerTaskHandle) {
     transferServer.on("/sd/download", HTTP_GET, handleSDDownloadWorker);
     transferServer.on("/sd/view", HTTP_GET, handleSDViewWorker);
+    transferServer.on("/sd/playback", HTTP_GET, handleSDPlaybackWorker);
     transferServer.on("/sd/upload", HTTP_POST, handleSDUploadWorker, handleSDUploadDataWorker);
     transferServer.on("/admin/update", HTTP_POST, handleFirmwareUploadWorker, handleFirmwareUploadDataWorker);
     transferServer.onNotFound([]() {
@@ -4735,8 +5786,12 @@ static void registerCameraRoutes() {
   server.on("/admin/time/sync",HTTP_POST, handleAdminTimeSync);
   server.on("/admin/led",     HTTP_GET,  handleAdminLedGet);
   server.on("/admin/led",     HTTP_POST, handleAdminLedSet);
+  server.on("/admin/logging", HTTP_GET,  handleAdminLoggingGet);
+  server.on("/admin/logging", HTTP_POST, handleAdminLoggingSet);
   server.on("/admin/txpower", HTTP_GET,  handleAdminTxPowerGet);
   server.on("/admin/txpower", HTTP_POST, handleAdminTxPowerSet);
+  server.on("/admin/reset",   HTTP_POST, handleAdminReset);
+  server.on("/admin/factory-reset", HTTP_POST, handleAdminFactoryReset);
   server.on("/admin/update",  HTTP_POST, handleFirmwareUploadMain);
   server.on("/wifi/list",     HTTP_GET,  handleWifiList);
   server.on("/wifi/add",      HTTP_POST, handleWifiAdd);
@@ -4745,7 +5800,12 @@ static void registerCameraRoutes() {
   server.on("/sd/list",       HTTP_GET,  handleSDList);
   server.on("/sd/download",   HTTP_GET,  handleSDDownloadMain);
   server.on("/sd/view",       HTTP_GET,  handleSDViewMain);
+  server.on("/sd/player",     HTTP_GET,  handleSDPlayerMain);
   server.on("/sd/delete",     HTTP_POST, handleSDDelete);
+  server.on("/sd/sort",       HTTP_GET,  handleSDSortGet);
+  server.on("/sd/sort",       HTTP_POST, handleSDSortSet);
+  server.on("/sd/mkdir",      HTTP_POST, handleSDMakeDir);
+  server.on("/sd/rmdir",      HTTP_POST, handleSDRemoveDir);
   server.on("/sd/upload",     HTTP_POST, handleSDUploadMain);
   server.on("/record/start",  HTTP_POST, handleRecordStart);
   server.on("/record/stop",   HTTP_POST, handleRecordStop);
@@ -4875,6 +5935,23 @@ static void servicePendingFirmwareRestart() {
   ESP.restart();
 }
 
+static void servicePendingAdminRestart() {
+  if (!adminRestartPending || adminRestartAt == 0) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if ((long)(now - adminRestartAt) < 0) {
+    return;
+  }
+
+  adminRestartPending = false;
+  adminRestartAt = 0;
+  Serial.println("[ADMIN] Restarting on admin request");
+  delay(100);
+  ESP.restart();
+}
+
 // ─── Arduino entry points ─────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
@@ -4908,6 +5985,7 @@ void setup() {
     cfgAccessPass = cfg.adminPass;
     cfgDeviceName = cfg.deviceName;
     ledAccessBlinkEnabled = cfg.ledAccessBlink;
+    gLoggingEnabled = cfg.loggingEnabled;
     if (cfgDeviceName.isEmpty()) {
       cfgDeviceName = "ESP32-CAM";
     }
@@ -4915,6 +5993,7 @@ void setup() {
   } else {
     cfgDeviceName = "ESP32-CAM";
     ledAccessBlinkEnabled = false;
+    gLoggingEnabled = true;
     isConfigured = false;
   }
     routeAccessToken = String((uint32_t)esp_random(), HEX) + String((uint32_t)esp_random(), HEX);
@@ -4937,5 +6016,6 @@ void loop() {
   serviceRecording();
   serviceCameraIdleTimeout();
   servicePendingFirmwareRestart();
+  servicePendingAdminRestart();
   delay(2);
 }

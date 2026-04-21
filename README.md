@@ -82,13 +82,18 @@ The firmware provides a three-page web interface (all require authentication):
 - Change the device name
 - Set or sync device time
 - Enable or disable LED URL-access blink
+- Enable or disable global logging (serial output and `/log.txt` SD logging)
 - Upload a new firmware binary for OTA update
 
 ### SD Browser page
 - Browse files on the microSD card
+- Create folders in the current directory
 - Download any file to your computer
 - Delete files from the card
-- Upload new files to the card
+- Delete folders from the card (recursive)
+- Upload new files to the currently open folder
+- Double-click folders to open and files to view (Open buttons remain available)
+- Sorting preferences are persisted in hidden `/.sort` on SD (default: Name + Ascending when missing)
 
 ## Capture and recording
 
