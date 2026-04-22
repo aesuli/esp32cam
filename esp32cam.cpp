@@ -33,8 +33,10 @@
 #include <Update.h>
 #include <esp_bt.h>
 #include <esp_err.h>
+#include <esp_sleep.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
+#include <driver/rtc_io.h>
 #include <mbedtls/aes.h>
 #include <time.h>
 #include <sys/time.h>
@@ -49,9 +51,15 @@
 #endif
 
 // ─── Pin definitions ──────────────────────────────────────────────────────────
+// Button wiring: one side to GPIO12, other side to GND (INPUT_PULLUP, active LOW).
+// PIR wiring: VCC -> 5V (or module-supported rail), DATA -> GPIO13, GND -> GND.
 static constexpr int BUTTON_GPIO = 12;
 static constexpr int PIR_GPIO    = 13;
 static constexpr int LED_GPIO    = 33;  // Internal red LED on ESP32-CAM
+static constexpr unsigned long BUTTON_DEBOUNCE_MS = 40;
+static constexpr unsigned long BUTTON_SLEEP_DELAY_MS = 1000;
+static constexpr unsigned long BUTTON_BLINK_ON_MS = 70;
+static constexpr unsigned long BUTTON_BLINK_OFF_MS = 70;
 
 // ─── AP setup credentials ─────────────────────────────────────────────────────
 #define AP_SETUP_SSID   "ESP32-CAM-Setup"
@@ -109,10 +117,16 @@ static bool   cameraInitialized = false;
 static bool   ledAccessBlinkEnabled = false;
 static bool   wifiModemSleepEnabled = false;
 static bool   staConnectedAtBoot = false;
+static bool   buttonLastRawPressed = false;
+static bool   buttonStablePressed = false;
+static bool   buttonSleepArmed = true;
+static bool   buttonSleepRequestPending = false;
 static volatile bool staLinkUp = false;
 static unsigned long lastUrlAccessBlink = 0;
 static unsigned long lastCameraActivityAt = 0;
 static unsigned long lastStaReconnectAttemptAt = 0;
+static unsigned long buttonLastChangeAt = 0;
+static unsigned long buttonSleepRequestAt = 0;
 static constexpr unsigned long LED_ACCESS_BLINK_INTERVAL_MS = 100;  // Minimum interval between access blinks
 static constexpr unsigned long STA_RECONNECT_INTERVAL_MS = 30000;
 static constexpr unsigned long STA_CONNECT_TIMEOUT_MS = 20000;
@@ -364,6 +378,11 @@ static bool initCameraWithRetries();
 static bool waitForIO0Released(unsigned long timeoutMs);
 static void servicePendingFirmwareRestart();
 static void servicePendingAdminRestart();
+static void configureButtonWakeup();
+static void handleWakeupIndicator();
+static void serviceButtonSleepRequest();
+static void prepareDeviceForDeepSleep();
+[[noreturn]] static void enterDeepSleepFromButton();
 static void setWifiModemSleep(bool enabled, const char *reason = nullptr);
 static void registerCameraRoutes();
 static void startAuxHttpServers();
@@ -5952,6 +5971,106 @@ static void servicePendingAdminRestart() {
   ESP.restart();
 }
 
+static void configureButtonWakeup() {
+  esp_err_t err = esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_GPIO, 0);
+  if (err != ESP_OK) {
+    Serial.printf("[SLEEP] Failed to enable EXT0 wakeup on GPIO%d (err=0x%x)\n", BUTTON_GPIO, err);
+    return;
+  }
+
+  rtc_gpio_pullup_en((gpio_num_t)BUTTON_GPIO);
+  rtc_gpio_pulldown_dis((gpio_num_t)BUTTON_GPIO);
+  Serial.printf("[SLEEP] Wakeup source configured: GPIO%d LOW\n", BUTTON_GPIO);
+}
+
+static void handleWakeupIndicator() {
+  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+  if (cause == ESP_SLEEP_WAKEUP_EXT0) {
+    Serial.printf("[BOOT] Wakeup from deep sleep via button GPIO%d\n", BUTTON_GPIO);
+    ledBlinkCount(2, BUTTON_BLINK_ON_MS, BUTTON_BLINK_OFF_MS);
+    return;
+  }
+
+  ledBootSequence();
+}
+
+static void prepareDeviceForDeepSleep() {
+  streamClientAbortRequested = true;
+
+  if (recordingMutex && xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(1500)) == pdTRUE) {
+    if (recordingActive) {
+      Serial.println("[SLEEP] Stopping active recording before deep sleep");
+      stopRecordingSession(true);
+    }
+    xSemaphoreGive(recordingMutex);
+  }
+
+  digitalWrite(LED_FLASH_GPIO_NUM, LOW);
+  flashEnabled = false;
+
+  if (cameraMutex && xSemaphoreTake(cameraMutex, pdMS_TO_TICKS(1500)) == pdTRUE) {
+    if (cameraInitialized) {
+      esp_err_t err = esp_camera_deinit();
+      if (err != ESP_OK) {
+        Serial.printf("[SLEEP] Camera deinit failed: 0x%x\n", err);
+      } else {
+        cameraInitialized = false;
+      }
+    }
+    xSemaphoreGive(cameraMutex);
+  }
+
+  powerDownCameraHardware();
+  setWifiModemSleep(false, "deep sleep");
+  WiFi.softAPdisconnect(true);
+  WiFi.disconnect(false, false);
+  WiFi.mode(WIFI_OFF);
+}
+
+[[noreturn]] static void enterDeepSleepFromButton() {
+  Serial.printf("[SLEEP] Button long-action detected on GPIO%d\n", BUTTON_GPIO);
+  prepareDeviceForDeepSleep();
+  ledBlinkCount(3, BUTTON_BLINK_ON_MS, BUTTON_BLINK_OFF_MS);
+  Serial.println("[SLEEP] Entering deep sleep");
+  delay(20);
+  esp_deep_sleep_start();
+
+  for (;;) {
+    delay(1000);
+  }
+}
+
+static void serviceButtonSleepRequest() {
+  unsigned long now = millis();
+  bool rawPressed = (digitalRead(BUTTON_GPIO) == LOW);
+
+  if (rawPressed != buttonLastRawPressed) {
+    buttonLastRawPressed = rawPressed;
+    buttonLastChangeAt = now;
+  }
+
+  if ((now - buttonLastChangeAt) >= BUTTON_DEBOUNCE_MS && rawPressed != buttonStablePressed) {
+    buttonStablePressed = rawPressed;
+
+    if (!buttonStablePressed) {
+      buttonSleepArmed = true;
+      return;
+    }
+
+    if (buttonSleepArmed && !buttonSleepRequestPending) {
+      buttonSleepRequestPending = true;
+      buttonSleepRequestAt = now;
+      buttonSleepArmed = false;
+      Serial.printf("[BUTTON] Sleep requested, entering deep sleep in %lu ms\n", BUTTON_SLEEP_DELAY_MS);
+    }
+  }
+
+  if (buttonSleepRequestPending && (now - buttonSleepRequestAt) >= BUTTON_SLEEP_DELAY_MS) {
+    buttonSleepRequestPending = false;
+    enterDeepSleepFromButton();
+  }
+}
+
 // ─── Arduino entry points ─────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
@@ -5960,7 +6079,7 @@ void setup() {
 
   // Initialize LED and provide boot feedback
   initLED();
-  ledBootSequence();
+  handleWakeupIndicator();
 
   cameraMutex = xSemaphoreCreateMutex();
   recordingMutex = xSemaphoreCreateMutex();
@@ -5976,7 +6095,16 @@ void setup() {
   pinMode(LED_FLASH_GPIO_NUM, OUTPUT);
   digitalWrite(LED_FLASH_GPIO_NUM, LOW);
   powerDownCameraHardware();
-  Serial.printf("[GPIO] Button on GPIO%d, PIR on GPIO%d\n", BUTTON_GPIO, PIR_GPIO);
+  configureButtonWakeup();
+
+  buttonLastRawPressed = (digitalRead(BUTTON_GPIO) == LOW);
+  buttonStablePressed = buttonLastRawPressed;
+  buttonLastChangeAt = millis();
+  buttonSleepArmed = !buttonStablePressed;
+  buttonSleepRequestPending = false;
+
+  Serial.printf("[GPIO] Button: GPIO%d (to GND, active LOW), PIR DATA: GPIO%d\n", BUTTON_GPIO, PIR_GPIO);
+  Serial.println("[GPIO] PIR power: VCC -> 5V (or compatible rail), GND -> GND");
 
   // Load stored encrypted configuration from SD card.
   StoredConfig cfg;
@@ -6015,6 +6143,7 @@ void loop() {
   serviceStaReconnect();
   serviceRecording();
   serviceCameraIdleTimeout();
+  serviceButtonSleepRequest();
   servicePendingFirmwareRestart();
   servicePendingAdminRestart();
   delay(2);
