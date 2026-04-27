@@ -3,9 +3,9 @@
  *
  * Hardware:
  *   - AI-Thinker ESP32-CAM with OV3660 camera sensor
- *   - microSD in 1-bit mode to keep GPIO12/GPIO13 free
- *   - GPIO12 reserved for push button (future local controls)
- *   - GPIO13 reserved for PIR input
+ *   - microSD in 1-bit mode so SDMMC does not actively drive GPIO12/GPIO13
+ *   - GPIO13 reserved for push button (shared with SD DAT3 pull network)
+ *   - GPIO12 reserved for PIR input (shared with SD DAT2 pull network)
  *
  * First Boot (unconfigured or missing config file):
  *   Broadcasts protected WiFi AP "ESP32-CAM-Setup"
@@ -51,15 +51,17 @@
 #endif
 
 // ─── Pin definitions ──────────────────────────────────────────────────────────
-// Button wiring: one side to GPIO12, other side to GND (INPUT_PULLUP, active LOW).
-// PIR wiring: VCC -> 5V (or module-supported rail), DATA -> GPIO13, GND -> GND.
-static constexpr int BUTTON_GPIO = 12;
-static constexpr int PIR_GPIO    = 13;
+// Button wiring: one side to GPIO13, other side to GND (INPUT_PULLUP, active LOW).
+// PIR wiring: VCC -> 5V (or module-supported rail), DATA -> GPIO12, GND -> GND.
+// Note: GPIO12/GPIO13 remain electrically tied to SD DAT2/DAT3 while the card is mounted.
+static constexpr int BUTTON_GPIO = 13;
+static constexpr int PIR_GPIO    = 12;
 static constexpr int LED_GPIO    = 33;  // Internal red LED on ESP32-CAM
 static constexpr unsigned long BUTTON_DEBOUNCE_MS = 40;
 static constexpr unsigned long BUTTON_SLEEP_DELAY_MS = 1000;
 static constexpr unsigned long BUTTON_BLINK_ON_MS = 70;
 static constexpr unsigned long BUTTON_BLINK_OFF_MS = 70;
+static constexpr bool APP_UART_CONSOLE_ENABLED = true;
 
 // ─── AP setup credentials ─────────────────────────────────────────────────────
 #define AP_SETUP_SSID   "ESP32-CAM-Setup"
@@ -121,12 +123,27 @@ static bool   buttonLastRawPressed = false;
 static bool   buttonStablePressed = false;
 static bool   buttonSleepArmed = true;
 static bool   buttonSleepRequestPending = false;
+static bool   motionRawHigh = false;
+static bool   motionLatched = false;
+static bool   motionBootEventPending = false;
+static volatile bool motionEdgePending = false;
+static volatile uint32_t motionEdgeCount = 0;
+static uint8_t motionPendingImages = 0;
+static bool   motionVideoManagedRecording = false;
+static bool   motionActionWindowActive = false;
 static volatile bool staLinkUp = false;
 static unsigned long lastUrlAccessBlink = 0;
 static unsigned long lastCameraActivityAt = 0;
 static unsigned long lastStaReconnectAttemptAt = 0;
 static unsigned long buttonLastChangeAt = 0;
 static unsigned long buttonSleepRequestAt = 0;
+static unsigned long motionHighSinceAt = 0;
+static unsigned long motionLastDetectedAt = 0;
+static unsigned long motionLastActivityAt = 0;
+static unsigned long motionNextImageAt = 0;
+static unsigned long motionRecordingStopAt = 0;
+static unsigned long motionIgnoreUntilAt = 0;
+static esp_sleep_wakeup_cause_t bootWakeCause = ESP_SLEEP_WAKEUP_UNDEFINED;
 static constexpr unsigned long LED_ACCESS_BLINK_INTERVAL_MS = 100;  // Minimum interval between access blinks
 static constexpr unsigned long STA_RECONNECT_INTERVAL_MS = 30000;
 static constexpr unsigned long STA_CONNECT_TIMEOUT_MS = 20000;
@@ -176,9 +193,11 @@ static bool gLogSdReady = false;
 static bool gLogSdFailureReported = false;
 static bool gLogFileFailureReported = false;
 static bool gLoggingEnabled = true;
+static bool gLogSdMirrorEnabled = false;
+static bool gSdCardMounted = false;
 
 static bool appendSerialLogChunk(const uint8_t *data, size_t len) {
-  if (!gLoggingEnabled || !data || len == 0 || gLogWriteInProgress) {
+  if (!gLoggingEnabled || !gLogSdMirrorEnabled || !data || len == 0 || gLogWriteInProgress) {
     return false;
   }
 
@@ -187,12 +206,7 @@ static bool appendSerialLogChunk(const uint8_t *data, size_t len) {
   if (!gLogSdReady) {
     gLogSdReady = initSDCard();
     if (!gLogSdReady) {
-      if (!gLogSdFailureReported) {
-        if (gLoggingEnabled) {
-          ::Serial.println("[LOG] SD logging disabled: initSDCard failed");
-        }
-        gLogSdFailureReported = true;
-      }
+      gLogSdFailureReported = true;
       gLogWriteInProgress = false;
       return false;
     }
@@ -201,12 +215,7 @@ static bool appendSerialLogChunk(const uint8_t *data, size_t len) {
   if (!SD_MMC.exists(SERIAL_LOG_FILE_PATH)) {
     File createFile = SD_MMC.open(SERIAL_LOG_FILE_PATH, FILE_WRITE);
     if (!createFile) {
-      if (!gLogFileFailureReported) {
-        if (gLoggingEnabled) {
-          ::Serial.println("[LOG] Failed to create /log.txt");
-        }
-        gLogFileFailureReported = true;
-      }
+      gLogFileFailureReported = true;
       gLogWriteInProgress = false;
       return false;
     }
@@ -215,12 +224,7 @@ static bool appendSerialLogChunk(const uint8_t *data, size_t len) {
 
   File file = SD_MMC.open(SERIAL_LOG_FILE_PATH, FILE_APPEND);
   if (!file) {
-    if (!gLogFileFailureReported) {
-      if (gLoggingEnabled) {
-        ::Serial.println("[LOG] Failed to open /log.txt for append");
-      }
-      gLogFileFailureReported = true;
-    }
+    gLogFileFailureReported = true;
     gLogWriteInProgress = false;
     return false;
   }
@@ -230,9 +234,6 @@ static bool appendSerialLogChunk(const uint8_t *data, size_t len) {
   file.close();
 
   if (written != len && !gLogFileFailureReported) {
-    if (gLoggingEnabled) {
-      ::Serial.println("[LOG] Partial write to /log.txt");
-    }
     gLogFileFailureReported = true;
   }
 
@@ -243,25 +244,34 @@ static bool appendSerialLogChunk(const uint8_t *data, size_t len) {
 class SerialMirror : public Print {
  public:
   void begin(unsigned long baud) {
-    ::Serial.begin(baud);
+    if (APP_UART_CONSOLE_ENABLED) {
+      ::Serial.begin(baud);
+    } else {
+      (void)baud;
+      ::Serial.end();
+    }
   }
 
   size_t write(uint8_t b) override {
     if (!gLoggingEnabled) {
       return 1;
     }
-    size_t out = ::Serial.write(b);
     appendSerialLogChunk(&b, 1);
-    return out;
+    if (APP_UART_CONSOLE_ENABLED) {
+      return ::Serial.write(b);
+    }
+    return 1;
   }
 
   size_t write(const uint8_t *buffer, size_t size) override {
     if (!gLoggingEnabled) {
       return size;
     }
-    size_t out = ::Serial.write(buffer, size);
     appendSerialLogChunk(buffer, size);
-    return out;
+    if (APP_UART_CONSOLE_ENABLED) {
+      return ::Serial.write(buffer, size);
+    }
+    return size;
   }
 
   int printf(const char *format, ...) {
@@ -323,12 +333,26 @@ struct CameraSettings {
   int16_t streamVisible = 1;
 };
 
+struct MotionSettings {
+  bool enabled = false;
+  bool captureImage = false;
+  uint8_t imageCount = 1;            // 1..10
+  uint8_t imageDelayDs = 1;          // deciseconds: 1..20 (0.1s..2.0s)
+  bool captureVideo = false;
+  uint8_t videoDurationSec = 5;      // 1..30
+  bool wakeOnMotion = false;
+  bool autoStandby = false;
+  uint16_t standbyAfterSec = 30;     // 5..120
+  uint16_t detectionIntervalSec = 0; // 0,5,10,30,60,600
+};
+
 struct StoredConfig {
   std::vector<WifiCredential> wifiList;
   String adminPass;
   String deviceName;
   bool hasCameraSettings = false;
   CameraSettings cameraSettings;
+  MotionSettings motionSettings;
   bool ledAccessBlink = false;  // LED blink on URL access
   bool loggingEnabled = true;
   int8_t txPowerSta = (int8_t)DEFAULT_TX_POWER_STA;  // wifi_power_t cast to int8
@@ -379,10 +403,33 @@ static bool waitForIO0Released(unsigned long timeoutMs);
 static void servicePendingFirmwareRestart();
 static void servicePendingAdminRestart();
 static void configureButtonWakeup();
+static void configureMotionWakeup(bool enabled);
+static void applyPirInputMode();
+static void restoreInputPinsAfterSDInit();
+static void logSharedPinCaveats();
+static void updateSdLoggingState();
+static bool pirSupportsRtcWakeup();
+static void IRAM_ATTR onPirEdgeInterrupt();
 static void handleWakeupIndicator();
 static void serviceButtonSleepRequest();
+static void serviceMotionDetection();
+static void serviceMotionActions();
+static void serviceMotionAutoStandby();
+static void triggerMotionEvent(const char *source);
+static void closeMotionActionWindow();
+static bool captureImageToSD(String &savedPath);
+static bool startRecordingSessionInternal(String &message);
+static bool stopRecordingSessionInternal(String &message);
+static void handleMotionGraphPage();
+static void handleMotionReadings();
+static bool isValidMotionIntervalSec(uint16_t seconds);
+static void clampMotionSettings(MotionSettings &settings);
+static void handleMotionPage();
+static void handleMotionConfigGet();
+static void handleMotionConfigSet();
 static void prepareDeviceForDeepSleep();
 [[noreturn]] static void enterDeepSleepFromButton();
+[[noreturn]] static void enterDeepSleepNow(const char *reason, int blinkCount, bool allowMotionWake);
 static void setWifiModemSleep(bool enabled, const char *reason = nullptr);
 static void registerCameraRoutes();
 static void startAuxHttpServers();
@@ -574,21 +621,27 @@ static void powerDownCameraHardware() {
 }
 
 static bool initSDCard() {
-  static bool sdInitialized = false;
-  if (sdInitialized) {
+  if (gSdCardMounted) {
     return true;
   }
 
-  // 1-bit mode keeps GPIO12 and GPIO13 free for button/PIR.
+  // 1-bit mode stops SDMMC from actively using DAT1/DAT2/DAT3, but the socket
+  // and the card still keep GPIO12/GPIO13 electrically tied to DAT2/DAT3.
   // Retry several times: SD cards can be slow to respond on cold boot.
   for (int attempt = 1; attempt <= 5; ++attempt) {
-    if (SD_MMC.begin("/sdcard", true)) {
+    bool mounted = SD_MMC.begin("/sdcard", true);
+    restoreInputPinsAfterSDInit();
+    if (mounted) {
       if (SD_MMC.cardType() != CARD_NONE) {
-        sdInitialized = true;
+        gSdCardMounted = true;
         Serial.printf("[SD] Mounted in 1-bit mode (attempt %d)\n", attempt);
+        Serial.printf("[SD] GPIO%d/GPIO%d remain shared with SD DAT2/DAT3 pull-ups while a card is inserted\n",
+          BUTTON_GPIO, PIR_GPIO);
         return true;
       }
       SD_MMC.end();
+      gSdCardMounted = false;
+      restoreInputPinsAfterSDInit();
       Serial.printf("[SD] No card detected on attempt %d\n", attempt);
     } else {
       Serial.printf("[SD] Mount failed on attempt %d\n", attempt);
@@ -1235,6 +1288,21 @@ static bool readU8(const std::vector<uint8_t> &buf, size_t &offset, uint8_t &out
   return true;
 }
 
+static void appendU16(std::vector<uint8_t> &buf, uint16_t value) {
+  buf.push_back((uint8_t)(value & 0xFF));
+  buf.push_back((uint8_t)((value >> 8) & 0xFF));
+}
+
+static bool readU16(const std::vector<uint8_t> &buf, size_t &offset, uint16_t &out) {
+  if (offset + 2 > buf.size()) {
+    return false;
+  }
+
+  out = (uint16_t)buf[offset] | ((uint16_t)buf[offset + 1] << 8);
+  offset += 2;
+  return true;
+}
+
 static void appendI16(std::vector<uint8_t> &buf, int16_t value) {
   uint16_t raw = (uint16_t)value;
   buf.push_back((uint8_t)(raw & 0xFF));
@@ -1522,7 +1590,7 @@ static bool decryptPayload(const String &ivHex, const String &cipherHex, std::ve
 
 static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipherHex) {
   std::vector<uint8_t> plain;
-  plain.reserve(cfg.adminPass.length() + cfg.deviceName.length() + cfg.wifiList.size() * 32 + 40);
+  plain.reserve(cfg.adminPass.length() + cfg.deviceName.length() + cfg.wifiList.size() * 32 + 64);
 
   uint16_t wifiCount = (uint16_t)cfg.wifiList.size();
   plain.push_back((uint8_t)(wifiCount & 0xFF));
@@ -1542,10 +1610,21 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
   appendU8(plain, (uint8_t)cfg.txPowerSta);
   appendU8(plain, (uint8_t)cfg.txPowerAp);
 
+  appendU8(plain, cfg.motionSettings.enabled ? 1 : 0);
+  appendU8(plain, cfg.motionSettings.captureImage ? 1 : 0);
+  appendU8(plain, cfg.motionSettings.imageCount);
+  appendU8(plain, cfg.motionSettings.imageDelayDs);
+  appendU8(plain, cfg.motionSettings.captureVideo ? 1 : 0);
+  appendU8(plain, cfg.motionSettings.videoDurationSec);
+  appendU8(plain, cfg.motionSettings.wakeOnMotion ? 1 : 0);
+  appendU8(plain, cfg.motionSettings.autoStandby ? 1 : 0);
+  appendU16(plain, cfg.motionSettings.standbyAfterSec);
+  appendU16(plain, cfg.motionSettings.detectionIntervalSec);
+
   return encryptPayload(plain, ivHex, cipherHex);
 }
 
-static bool decryptConfigV5(const String &ivHex, const String &cipherHex, StoredConfig &cfg) {
+static bool decryptConfigV6(const String &ivHex, const String &cipherHex, StoredConfig &cfg) {
   std::vector<uint8_t> plain;
   if (!decryptPayload(ivHex, cipherHex, plain)) {
     return false;
@@ -1608,6 +1687,7 @@ static bool decryptConfigV5(const String &ivHex, const String &cipherHex, Stored
   if (offset >= plain.size()) {
     cfg.txPowerSta = (int8_t)DEFAULT_TX_POWER_STA;
     cfg.txPowerAp = (int8_t)DEFAULT_TX_POWER_AP;
+    clampMotionSettings(cfg.motionSettings);
     return true;
   }
   if (!readU8(plain, offset, txPowerSta)) {
@@ -1618,6 +1698,7 @@ static bool decryptConfigV5(const String &ivHex, const String &cipherHex, Stored
   uint8_t txPowerAp = (uint8_t)DEFAULT_TX_POWER_AP;
   if (offset >= plain.size()) {
     cfg.txPowerAp = (int8_t)DEFAULT_TX_POWER_AP;
+    clampMotionSettings(cfg.motionSettings);
     return true;
   }
   if (!readU8(plain, offset, txPowerAp)) {
@@ -1625,6 +1706,55 @@ static bool decryptConfigV5(const String &ivHex, const String &cipherHex, Stored
   }
   cfg.txPowerAp = (int8_t)txPowerAp;
 
+  if (offset < plain.size()) {
+    uint8_t b = 0;
+    if (!readU8(plain, offset, b)) return false;
+    cfg.motionSettings.enabled = (b != 0);
+
+    if (offset < plain.size()) {
+      if (!readU8(plain, offset, b)) return false;
+      cfg.motionSettings.captureImage = (b != 0);
+    }
+    if (offset < plain.size()) {
+      if (!readU8(plain, offset, cfg.motionSettings.imageCount)) return false;
+    }
+    if (offset < plain.size()) {
+      if (!readU8(plain, offset, cfg.motionSettings.imageDelayDs)) return false;
+    }
+    if (offset < plain.size()) {
+      if (!readU8(plain, offset, b)) return false;
+      cfg.motionSettings.captureVideo = (b != 0);
+    }
+    if (offset < plain.size()) {
+      if (!readU8(plain, offset, cfg.motionSettings.videoDurationSec)) return false;
+    }
+    if (offset < plain.size()) {
+      if (!readU8(plain, offset, b)) return false;
+      cfg.motionSettings.wakeOnMotion = (b != 0);
+    }
+    if (offset < plain.size()) {
+      if (!readU8(plain, offset, b)) return false;
+      cfg.motionSettings.autoStandby = (b != 0);
+    }
+    if (offset + 2 <= plain.size()) {
+      if (!readU16(plain, offset, cfg.motionSettings.standbyAfterSec)) return false;
+    }
+    if (offset + 2 <= plain.size()) {
+      if (!readU16(plain, offset, cfg.motionSettings.detectionIntervalSec)) return false;
+    }
+    // Backward compatibility: older configs may include a trailing sensitivity byte.
+    if (offset < plain.size()) {
+      uint8_t legacySensitivity = 0;
+      if (!readU8(plain, offset, legacySensitivity)) return false;
+    }
+    // Backward compatibility: older configs may include a trailing PIR input mode byte.
+    if (offset < plain.size()) {
+      uint8_t legacyPirInputMode = 0;
+      if (!readU8(plain, offset, legacyPirInputMode)) return false;
+    }
+  }
+
+  clampMotionSettings(cfg.motionSettings);
   return offset == plain.size() && !cfg.adminPass.isEmpty();
 }
 
@@ -1647,7 +1777,7 @@ static bool saveConfigToSD(const StoredConfig &cfg) {
     return false;
   }
 
-  file.println("ESP32CAMCFG5");
+  file.println("ESP32CAMCFG6");
   file.println(ivHex);
   file.println(cipherHex);
   file.close();
@@ -1680,19 +1810,21 @@ static bool loadConfigFromSD(StoredConfig &cfg) {
   ivHex.trim();
   cipherHex.trim();
 
-  if (magic == "ESP32CAMCFG5") {
-    if (!decryptConfigV5(ivHex, cipherHex, cfg)) {
+  if (magic == "ESP32CAMCFG6" || magic == "ESP32CAMCFG5") {
+    if (!decryptConfigV6(ivHex, cipherHex, cfg)) {
       Serial.println("[CFG] Failed to decrypt config");
       return false;
     }
   }
 
+  clampMotionSettings(cfg.motionSettings);
   return !cfg.adminPass.isEmpty();
 }
 
 static bool persistRuntimeConfig(const StoredConfig &cfg) {
   StoredConfig updated = cfg;
   syncCameraSettingsFromSensor(updated);
+  clampMotionSettings(updated.motionSettings);
 
   if (!saveConfigToSD(updated)) {
     return false;
@@ -1705,12 +1837,69 @@ static bool persistRuntimeConfig(const StoredConfig &cfg) {
   return true;
 }
 
+static bool isValidMotionIntervalSec(uint16_t seconds) {
+  return seconds == 0 || seconds == 5 || seconds == 10 || seconds == 30 || seconds == 60 || seconds == 600;
+}
+
+static void clampMotionSettings(MotionSettings &settings) {
+  if (settings.imageCount < 1) settings.imageCount = 1;
+  if (settings.imageCount > 10) settings.imageCount = 10;
+  if (settings.imageDelayDs < 1) settings.imageDelayDs = 1;
+  if (settings.imageDelayDs > 20) settings.imageDelayDs = 20;
+  if (settings.videoDurationSec < 1) settings.videoDurationSec = 1;
+  if (settings.videoDurationSec > 30) settings.videoDurationSec = 30;
+  if (settings.standbyAfterSec < 5) settings.standbyAfterSec = 5;
+  if (settings.standbyAfterSec > 120) settings.standbyAfterSec = 120;
+  if (!isValidMotionIntervalSec(settings.detectionIntervalSec)) {
+    settings.detectionIntervalSec = 0;
+  }
+}
+
+static void applyPirInputMode() {
+  pinMode(PIR_GPIO, INPUT_PULLDOWN);
+  Serial.printf("[GPIO] PIR mode applied on GPIO%d: INPUT_PULLDOWN\n", PIR_GPIO);
+}
+
+static void restoreInputPinsAfterSDInit() {
+  pinMode(BUTTON_GPIO, INPUT_PULLUP);
+  applyPirInputMode();
+  attachInterrupt(digitalPinToInterrupt(PIR_GPIO), onPirEdgeInterrupt, CHANGE);
+}
+
+static void logSharedPinCaveats() {
+  if (PIR_GPIO == 12) {
+    Serial.println("[GPIO] Warning: PIR on GPIO12 shares SD DAT2 and the ESP32 strap/pulldown network; weak HIGH outputs may remain LOW with an SD card inserted");
+  } else if (PIR_GPIO == 13) {
+    Serial.println("[GPIO] Warning: PIR on GPIO13 shares SD DAT3 and its pull-up network; the line can read HIGH or edge on card insert/remove");
+  }
+
+  if (BUTTON_GPIO == 12) {
+    Serial.println("[GPIO] Note: button on GPIO12 shares SD DAT2; a strong switch to GND usually works, but the line is not isolated from the SD socket");
+  } else if (BUTTON_GPIO == 13) {
+    Serial.println("[GPIO] Note: button on GPIO13 shares SD DAT3; a strong switch to GND usually works, but the line is not isolated from the SD socket");
+  }
+}
+
+static void updateSdLoggingState() {
+  gLogSdMirrorEnabled = gLoggingEnabled;
+}
+
+static bool pirSupportsRtcWakeup() {
+  return rtc_gpio_is_valid_gpio((gpio_num_t)PIR_GPIO);
+}
+
+static void IRAM_ATTR onPirEdgeInterrupt() {
+  motionEdgePending = true;
+  ++motionEdgeCount;
+}
+
 // ─── HTML pages (stored in flash) ─────────────────────────────────────────────
 
 // Navigation bar HTML (reused across pages)
 static const char NAV_HTML[] PROGMEM = R"html(
 <nav style="background:#16213e;padding:8px 20px;display:flex;gap:12px;flex-wrap:wrap">
   <a href="/" style="color:#e94560;text-decoration:none;padding:8px 12px;border-radius:4px;border:1px solid #234573">📷 Camera</a>
+  <a href="/motion" style="color:#eee;text-decoration:none;padding:8px 12px;border-radius:4px;border:1px solid #234573">🚶 Motion</a>
   <a href="/sd" style="color:#eee;text-decoration:none;padding:8px 12px;border-radius:4px;border:1px solid #234573;hover:background:#234573">💾 SD Browser</a>
   <a href="/admin" style="color:#eee;text-decoration:none;padding:8px 12px;border-radius:4px;border:1px solid #234573">⚙️ Admin</a>
 </nav>
@@ -1877,6 +2066,7 @@ header span{font-size:.85em;color:#888}
 <body>
 <nav>
   <a href="/" style="color:#e94560">📷 Camera</a>
+  <a href="/motion">🚶 Motion</a>
   <a href="/sd">💾 SD Browser</a>
   <a href="/admin">⚙️ Admin</a>
 </nav>
@@ -2152,6 +2342,7 @@ header h1{color:#e94560;font-size:1.3em}
 <body>
 <nav>
   <a href="/">📷 Camera</a>
+  <a href="/motion">🚶 Motion</a>
   <a href="/sd">💾 SD Browser</a>
   <a href="/admin" style="color:#e94560">⚙️ Admin</a>
 </nav>
@@ -2547,6 +2738,7 @@ header h1{color:#e94560;font-size:1.3em}
 <body>
 <nav>
   <a href="/">📷 Camera</a>
+  <a href="/motion">🚶 Motion</a>
   <a href="/sd" style="color:#e94560">💾 SD Browser</a>
   <a href="/admin">⚙️ Admin</a>
 </nav>
@@ -4099,6 +4291,7 @@ static void handleAdminLoggingSet() {
 
   runtimeConfig.loggingEnabled = newValue;
   gLoggingEnabled = newValue;
+  updateSdLoggingState();
 
   if (!persistRuntimeConfig(runtimeConfig)) {
     server.send(500, "text/plain", "Failed to save logging configuration");
@@ -4211,6 +4404,336 @@ static void handleAdminPage() {
   page.replace("__FIRMWARE_VERSION__", FIRMWARE_VERSION_TEXT);
   page.replace("__FIRMWARE_BUILD__", FIRMWARE_BUILD_TEXT);
   sendHtmlWithToken(page);
+}
+
+static void handleMotionPage() {
+  if (!checkAuth()) return;
+
+  static const char MOTION_HTML[] PROGMEM = R"html(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32-CAM - Motion</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;min-height:100vh}
+nav{background:#16213e;padding:8px 20px;display:flex;gap:12px;flex-wrap:wrap}
+nav a{color:#eee;text-decoration:none;padding:8px 12px;border-radius:4px;border:1px solid #234573;cursor:pointer}
+nav a:hover{background:#234573}
+header{background:#16213e;padding:12px 20px}
+header h1{color:#e94560;font-size:1.3em}
+.wrap{max-width:760px;margin:0 auto;padding:14px}
+.panel{background:#16213e;border-radius:8px;padding:14px}
+h3{color:#7dd3fc;margin-bottom:10px}
+.cg{margin-bottom:12px}
+.cg label{display:block;font-size:.9em;color:#bbb;margin-bottom:6px}
+input[type=range],select{width:100%}
+select,input{background:#0f3460;color:#eee;border:1px solid #234573;border-radius:4px;padding:8px}
+.row{display:grid;grid-template-columns:1fr 120px;gap:10px;align-items:center}
+.small{font-size:.82em;color:#9fb3d1;margin-top:4px}
+.status{min-height:20px;margin-top:10px;color:#7dd3fc}
+.status.error{color:#ff8a8a}
+.btn{background:#e94560;color:#fff;border:none;border-radius:4px;padding:9px 14px;cursor:pointer}
+.btn:hover{background:#c73652}
+</style>
+</head>
+<body>
+<nav>
+  <a href="/">📷 Camera</a>
+  <a href="/motion" style="color:#e94560">🚶 Motion</a>
+  <a href="/sd">💾 SD Browser</a>
+  <a href="/admin">⚙️ Admin</a>
+</nav>
+<header><h1>🚶 Motion Detection</h1></header>
+<div class="wrap">
+  <div class="panel">
+    <h3>Settings</h3>
+    <div class="cg"><a href="/motion/graph" style="color:#7dd3fc;text-decoration:none">Open Motion Graph</a></div>
+    <div class="cg"><label><input id="enabled" type="checkbox"> Enable motion detection</label></div>
+    <div class="cg"><label><input id="wake_on_motion" type="checkbox"> Wake up on motion</label></div>
+    <div class="cg"><label><input id="auto_standby" type="checkbox"> Automatic stand-by</label></div>
+
+    <div class="cg row">
+      <label for="standby_after_sec">No activity before stand-by (seconds)</label>
+      <input id="standby_after_sec" type="number" min="5" max="120" step="1">
+    </div>
+
+    <div class="cg"><label><input id="capture_image" type="checkbox"> Capture image(s) on motion</label></div>
+    <div class="cg row">
+      <label for="image_count">Number of images (1-10)</label>
+      <input id="image_count" type="number" min="1" max="10" step="1">
+    </div>
+    <div class="cg row">
+      <label for="image_delay_ds">Delay between images (0.1-2.0 sec)</label>
+      <input id="image_delay_ds" type="number" min="0.1" max="2.0" step="0.1">
+    </div>
+
+    <div class="cg"><label><input id="capture_video" type="checkbox"> Capture video on motion</label></div>
+    <div class="cg row">
+      <label for="video_duration_sec">Video duration (1-30 sec)</label>
+      <input id="video_duration_sec" type="number" min="1" max="30" step="1">
+    </div>
+
+    <div class="cg row">
+      <label for="detection_interval_sec">Interval between detections</label>
+      <select id="detection_interval_sec">
+        <option value="0">Soon after capture</option>
+        <option value="5">+5 seconds</option>
+        <option value="10">+10 seconds</option>
+        <option value="30">+30 seconds</option>
+        <option value="60">+1 minute</option>
+        <option value="600">+10 minutes</option>
+      </select>
+    </div>
+
+    <button class="btn" id="save_btn">Save Motion Settings</button>
+    <div class="status" id="status"></div>
+  </div>
+</div>
+<script>
+function id(n){return document.getElementById(n);}
+function setStatus(msg,err){var e=id('status');e.textContent=msg||'';e.className=err?'status error':'status';}
+function asInt(v,d){var n=parseInt(v,10);return isNaN(n)?d:n;}
+function loadConfig(){
+  fetch('/motion/config').then(function(r){
+    if(!r.ok){throw new Error('Failed to load motion config');}
+    return r.json();
+  }).then(function(c){
+    id('enabled').checked=!!c.enabled;
+    id('wake_on_motion').checked=!!c.wakeOnMotion;
+    id('auto_standby').checked=!!c.autoStandby;
+    id('standby_after_sec').value=c.standbyAfterSec;
+    id('capture_image').checked=!!c.captureImage;
+    id('image_count').value=c.imageCount;
+    id('image_delay_ds').value=((c.imageDelayDs||1)/10).toFixed(1);
+    id('capture_video').checked=!!c.captureVideo;
+    id('video_duration_sec').value=c.videoDurationSec;
+    id('detection_interval_sec').value=String(c.detectionIntervalSec||0);
+  }).catch(function(e){setStatus(e.message,true);});
+}
+id('save_btn').addEventListener('click',function(){
+  var payload={
+    enabled:id('enabled').checked?1:0,
+    wakeOnMotion:id('wake_on_motion').checked?1:0,
+    autoStandby:id('auto_standby').checked?1:0,
+    standbyAfterSec:asInt(id('standby_after_sec').value,30),
+    captureImage:id('capture_image').checked?1:0,
+    imageCount:asInt(id('image_count').value,1),
+    imageDelayDs:Math.round((parseFloat(id('image_delay_ds').value)||0.1)*10),
+    captureVideo:id('capture_video').checked?1:0,
+    videoDurationSec:asInt(id('video_duration_sec').value,5),
+    detectionIntervalSec:asInt(id('detection_interval_sec').value,0)
+  };
+  setStatus('Saving...',false);
+  fetch('/motion/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:Object.keys(payload).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(payload[k]);}).join('&')})
+    .then(function(r){return r.text().then(function(t){setStatus(t||'Saved',!r.ok);if(r.ok){loadConfig();}});})
+    .catch(function(e){setStatus(e.message,true);});
+});
+loadConfig();
+</script>
+</body>
+</html>)html";
+
+  sendHtmlWithToken(MOTION_HTML);
+}
+
+static void handleMotionGraphPage() {
+  if (!checkAuth()) return;
+
+  static const char MOTION_GRAPH_HTML[] PROGMEM = R"html(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32-CAM - Motion Graph</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;min-height:100vh}
+nav{background:#16213e;padding:8px 20px;display:flex;gap:12px;flex-wrap:wrap}
+nav a{color:#eee;text-decoration:none;padding:8px 12px;border-radius:4px;border:1px solid #234573;cursor:pointer}
+nav a:hover{background:#234573}
+header{background:#16213e;padding:12px 20px}
+header h1{color:#e94560;font-size:1.2em}
+.wrap{max-width:920px;margin:0 auto;padding:14px}
+.panel{background:#16213e;border-radius:8px;padding:14px}
+#graph{width:100%;height:260px;border:1px solid #234573;border-radius:6px;background:#0e1b3a}
+.meta{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-top:10px;font-size:.88em;color:#b9c7dd}
+.status{min-height:20px;margin-top:8px;color:#7dd3fc;font-size:.9em}
+.status.error{color:#ff8a8a}
+</style>
+</head>
+<body>
+<nav>
+  <a href="/">📷 Camera</a>
+  <a href="/motion" style="color:#e94560">🚶 Motion</a>
+  <a href="/sd">💾 SD Browser</a>
+  <a href="/admin">⚙️ Admin</a>
+</nav>
+<header><h1>🚶 Motion Graph (Live PIR Readings)</h1></header>
+<div class="wrap">
+  <div class="panel">
+    <canvas id="graph"></canvas>
+    <div class="meta">
+      <div>Raw: <span id="raw">-</span></div>
+      <div>Latched: <span id="latched">-</span></div>
+      <div>Edge Count: <span id="edgecount">-</span></div>
+      <div>Signal: <span id="signal">-</span></div>
+      <div>High(ms): <span id="highms">-</span></div>
+      <div>Last Trigger Ago(ms): <span id="lastms">-</span></div>
+    </div>
+    <div class="status" id="status"></div>
+  </div>
+</div>
+<script>
+var points=[];
+var maxPoints=180;
+var lastFetchOk=true;
+var lastEdgeCount=0;
+var edgePulseFrames=0;
+function id(n){return document.getElementById(n);} 
+function setStatus(msg,err){var e=id('status');e.textContent=msg||'';e.className=err?'status error':'status';}
+function draw(){
+  var c=id('graph');
+  var ctx=c.getContext('2d');
+  var w=c.clientWidth,h=c.clientHeight;
+  if(c.width!==w||c.height!==h){c.width=w;c.height=h;}
+  ctx.clearRect(0,0,w,h);
+  ctx.strokeStyle='#234573';
+  for(var i=0;i<=5;i++){var y=(h/5)*i;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();}
+  if(points.length<2){return;}
+  ctx.strokeStyle='#7dd3fc';
+  ctx.lineWidth=2;
+  ctx.beginPath();
+  for(var j=0;j<points.length;j++){
+    var x=(j/(maxPoints-1))*w;
+    var y=h-(points[j]/100)*h;
+    if(j===0)ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  }
+  ctx.stroke();
+}
+function poll(){
+  fetch('/motion/readings').then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}).then(function(m){
+    id('raw').textContent=m.rawHigh?'HIGH':'LOW';
+    id('latched').textContent=m.latched?'YES':'NO';
+    id('edgecount').textContent=String(m.edgeCount||0);
+    id('signal').textContent=String(m.signal);
+    id('highms').textContent=String(m.highDurationMs);
+    id('lastms').textContent=String(m.sinceLastDetectedMs);
+    var edgeCount=Number(m.edgeCount||0);
+    if(edgeCount>lastEdgeCount){
+      edgePulseFrames=4;
+    }
+    lastEdgeCount=edgeCount;
+    var plottedSignal=Math.max(0,Math.min(100,m.signal||0));
+    if(edgePulseFrames>0){
+      plottedSignal=Math.max(plottedSignal,95);
+      edgePulseFrames--;
+    }
+    points.push(plottedSignal);
+    if(points.length>maxPoints)points.shift();
+    draw();
+    if(!lastFetchOk){setStatus('Connection restored',false);} else {setStatus('',false);} 
+    lastFetchOk=true;
+  }).catch(function(err){
+    lastFetchOk=false;
+    setStatus('Failed to fetch motion readings: '+(err.message||'network error'),true);
+  });
+}
+setInterval(poll,250);
+window.addEventListener('resize',draw);
+poll();
+</script>
+</body>
+</html>)html";
+
+  sendHtmlWithToken(MOTION_GRAPH_HTML);
+}
+
+static void handleMotionReadings() {
+  if (!checkAuth()) return;
+
+  unsigned long now = millis();
+  unsigned long highDurationMs = 0;
+  if (motionRawHigh && motionHighSinceAt != 0) {
+    highDurationMs = now - motionHighSinceAt;
+  }
+
+  int signal = motionRawHigh ? 100 : 0;
+
+  unsigned long sinceLast = motionLastDetectedAt == 0 ? 0 : (now - motionLastDetectedAt);
+  uint32_t edgeCountSnapshot = 0;
+  noInterrupts();
+  edgeCountSnapshot = motionEdgeCount;
+  interrupts();
+
+  String json = "{";
+  json += "\"enabled\":" + String(runtimeConfig.motionSettings.enabled ? "true" : "false") + ",";
+  json += "\"rawHigh\":" + String(motionRawHigh ? "true" : "false") + ",";
+  json += "\"latched\":" + String(motionLatched ? "true" : "false") + ",";
+  json += "\"edgeCount\":" + String(edgeCountSnapshot) + ",";
+  json += "\"signal\":" + String(signal) + ",";
+  json += "\"highDurationMs\":" + String(highDurationMs) + ",";
+  json += "\"sinceLastDetectedMs\":" + String(sinceLast);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+static void handleMotionConfigGet() {
+  if (!checkAuth()) return;
+
+  clampMotionSettings(runtimeConfig.motionSettings);
+  const MotionSettings &m = runtimeConfig.motionSettings;
+  String json = "{";
+  json += "\"enabled\":" + String(m.enabled ? "true" : "false") + ",";
+  json += "\"captureImage\":" + String(m.captureImage ? "true" : "false") + ",";
+  json += "\"imageCount\":" + String((int)m.imageCount) + ",";
+  json += "\"imageDelayDs\":" + String((int)m.imageDelayDs) + ",";
+  json += "\"captureVideo\":" + String(m.captureVideo ? "true" : "false") + ",";
+  json += "\"videoDurationSec\":" + String((int)m.videoDurationSec) + ",";
+  json += "\"wakeOnMotion\":" + String(m.wakeOnMotion ? "true" : "false") + ",";
+  json += "\"autoStandby\":" + String(m.autoStandby ? "true" : "false") + ",";
+  json += "\"standbyAfterSec\":" + String((int)m.standbyAfterSec) + ",";
+  json += "\"detectionIntervalSec\":" + String((int)m.detectionIntervalSec);
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+static void handleMotionConfigSet() {
+  if (!checkAuth()) return;
+
+  MotionSettings updated = runtimeConfig.motionSettings;
+  if (server.hasArg("enabled")) updated.enabled = server.arg("enabled") == "1" || server.arg("enabled") == "true";
+  if (server.hasArg("captureImage")) updated.captureImage = server.arg("captureImage") == "1" || server.arg("captureImage") == "true";
+  if (server.hasArg("imageCount")) updated.imageCount = (uint8_t)server.arg("imageCount").toInt();
+  if (server.hasArg("imageDelayDs")) updated.imageDelayDs = (uint8_t)server.arg("imageDelayDs").toInt();
+  if (server.hasArg("captureVideo")) updated.captureVideo = server.arg("captureVideo") == "1" || server.arg("captureVideo") == "true";
+  if (server.hasArg("videoDurationSec")) updated.videoDurationSec = (uint8_t)server.arg("videoDurationSec").toInt();
+  if (server.hasArg("wakeOnMotion")) updated.wakeOnMotion = server.arg("wakeOnMotion") == "1" || server.arg("wakeOnMotion") == "true";
+  if (server.hasArg("autoStandby")) updated.autoStandby = server.arg("autoStandby") == "1" || server.arg("autoStandby") == "true";
+  if (server.hasArg("standbyAfterSec")) updated.standbyAfterSec = (uint16_t)server.arg("standbyAfterSec").toInt();
+  if (server.hasArg("detectionIntervalSec")) updated.detectionIntervalSec = (uint16_t)server.arg("detectionIntervalSec").toInt();
+
+  clampMotionSettings(updated);
+  bool wakeDisabledForPin = false;
+  if (updated.wakeOnMotion && !pirSupportsRtcWakeup()) {
+    updated.wakeOnMotion = false;
+    wakeDisabledForPin = true;
+  }
+  runtimeConfig.motionSettings = updated;
+
+  if (!persistRuntimeConfig(runtimeConfig)) {
+    server.send(500, "text/plain", "Failed to save motion configuration");
+    return;
+  }
+
+  configureMotionWakeup(runtimeConfig.motionSettings.wakeOnMotion);
+  applyPirInputMode();
+  if (wakeDisabledForPin) {
+    server.send(200, "text/plain", "Motion configuration saved; wake on motion is unavailable on the selected PIR pin");
+    return;
+  }
+  server.send(200, "text/plain", "Motion configuration saved");
 }
 
 static void handleSDPage() {
@@ -5349,47 +5872,57 @@ static void handleFirmwareUploadMain() {
   server.send(307, "text/plain", "Redirecting to transfer server");
 }
 
-static void handleCaptureSD() {
-  if (!checkAuth()) return;
-
+static bool captureImageToSD(String &savedPath) {
   if (!initSDCard()) {
-    server.send(500, "text/plain", "SD card not available");
-    return;
+    return false;
   }
 
-  if (!SD_MMC.exists("/capture")) {
-    SD_MMC.mkdir("/capture");
+  if (!ensureCaptureDirectory()) {
+    return false;
   }
 
   uint32_t sequence = 0;
   if (!nextCaptureSequence(sequence)) {
-    server.send(500, "text/plain", "Failed to update capture sequence");
-    return;
+    return false;
   }
 
-  String photoPath = buildCapturePath(sequence, "jpg");
+  savedPath = buildCapturePath(sequence, "jpg");
 
   if (!ensureCameraReady()) {
-    server.send(503, "text/plain", "Camera unavailable");
-    return;
+    return false;
   }
 
   camera_fb_t *fb = lockAndCaptureFrame(pdMS_TO_TICKS(1000));
   if (!fb) {
-    server.send(503, "text/plain", "Camera capture failed");
+    return false;
+  }
+
+  File file = SD_MMC.open(savedPath, FILE_WRITE);
+  if (!file) {
+    unlockCameraFrame(fb);
+    return false;
+  }
+
+  bool ok = file.write(fb->buf, fb->len) == fb->len;
+  file.close();
+  unlockCameraFrame(fb);
+
+  if (!ok) {
+    SD_MMC.remove(savedPath);
+  }
+  return ok;
+}
+
+static void handleCaptureSD() {
+  if (!checkAuth()) return;
+
+  String photoPath;
+  if (!captureImageToSD(photoPath)) {
+    server.send(500, "text/plain", "Failed to capture to SD");
     return;
   }
 
-  File file = SD_MMC.open(photoPath, FILE_WRITE);
-  if (file) {
-    file.write(fb->buf, fb->len);
-    file.close();
-    server.send(200, "text/plain", String("Saved: ") + photoPath);
-  } else {
-    server.send(500, "text/plain", "Failed to save image to SD");
-  }
-
-  unlockCameraFrame(fb);
+  server.send(200, "text/plain", String("Saved: ") + photoPath);
 }
 
 static bool writeAviHeader(File &file, uint32_t riffSize, uint32_t durationMs, uint32_t frameCount, uint32_t maxFrameSize, uint16_t width, uint16_t height, uint32_t moviListSize) {
@@ -5641,68 +6174,54 @@ static void serviceRecording() {
   unlockCameraFrame(fb);
 }
 
-static void handleRecordStart() {
-  if (!checkAuth()) return;
-
+static bool startRecordingSessionInternal(String &message) {
   if (!initSDCard()) {
-    server.send(500, "text/plain", "SD card not available");
-    return;
+    message = "SD card not available";
+    return false;
   }
 
   if (!ensureCameraReady()) {
-    server.send(503, "text/plain", "Camera unavailable");
-    return;
+    message = "Camera unavailable";
+    return false;
   }
-
-  int statusCode = 200;
-  String message;
 
   if (!recordingMutex || xSemaphoreTake(recordingMutex, portMAX_DELAY) != pdTRUE) {
-    server.send(500, "text/plain", "Recording lock unavailable");
-    return;
+    message = "Recording lock unavailable";
+    return false;
   }
 
+  bool ok = false;
   if (recordingActive) {
-    statusCode = 400;
     message = "Recording already in progress";
+  } else if (!ensureCaptureDirectory()) {
+    message = "Failed to create capture directory";
   } else {
-    if (!ensureCaptureDirectory()) {
-      statusCode = 500;
-      message = "Failed to create capture directory";
+    uint32_t sequence = 0;
+    if (!nextCaptureSequence(sequence)) {
+      message = "Failed to update capture sequence";
     } else {
-      uint32_t sequence = 0;
-      if (!nextCaptureSequence(sequence)) {
-        statusCode = 500;
-        message = "Failed to update capture sequence";
+      String path = buildCapturePath(sequence, "avi");
+      if (!beginRecordingFile(path)) {
+        message = "Failed to initialize AVI recording file";
       } else {
-        String path = buildCapturePath(sequence, "avi");
-        if (!beginRecordingFile(path)) {
-          statusCode = 500;
-          message = "Failed to initialize AVI recording file";
-        } else {
-          message = String("Recording started: ") + recordingPath;
-        }
+        message = String("Recording started: ") + recordingPath;
+        ok = true;
       }
     }
   }
 
   xSemaphoreGive(recordingMutex);
-  server.send(statusCode, "text/plain", message);
+  return ok;
 }
 
-static void handleRecordStop() {
-  if (!checkAuth()) return;
-
-  int statusCode = 200;
-  String message;
-
+static bool stopRecordingSessionInternal(String &message) {
   if (!recordingMutex || xSemaphoreTake(recordingMutex, portMAX_DELAY) != pdTRUE) {
-    server.send(500, "text/plain", "Recording lock unavailable");
-    return;
+    message = "Recording lock unavailable";
+    return false;
   }
 
+  bool ok = false;
   if (!recordingActive) {
-    statusCode = 400;
     message = "No recording in progress";
   } else {
     unsigned long duration = millis() - recordingStartTime;
@@ -5722,10 +6241,27 @@ static void handleRecordStop() {
     } else {
       message += ". No frames captured.";
     }
+    ok = true;
   }
 
   xSemaphoreGive(recordingMutex);
-  server.send(statusCode, "text/plain", message);
+  return ok;
+}
+
+static void handleRecordStart() {
+  if (!checkAuth()) return;
+
+  String message;
+  bool ok = startRecordingSessionInternal(message);
+  server.send(ok ? 200 : 400, "text/plain", message);
+}
+
+static void handleRecordStop() {
+  if (!checkAuth()) return;
+
+  String message;
+  bool ok = stopRecordingSessionInternal(message);
+  server.send(ok ? 200 : 400, "text/plain", message);
 }
 
 static void streamServerTask(void *arg) {
@@ -5791,6 +6327,11 @@ static void registerCameraRoutes() {
   server.on("/",              HTTP_GET,  handleCameraRoot);
   server.on("/stream",        HTTP_GET,  handleStreamMain);
   server.on("/stream/close",  HTTP_POST, handleStreamClose);
+  server.on("/motion",        HTTP_GET,  handleMotionPage);
+  server.on("/motion/graph",  HTTP_GET,  handleMotionGraphPage);
+  server.on("/motion/config", HTTP_GET,  handleMotionConfigGet);
+  server.on("/motion/config", HTTP_POST, handleMotionConfigSet);
+  server.on("/motion/readings", HTTP_GET, handleMotionReadings);
   server.on("/admin",         HTTP_GET,  handleAdminPage);
   server.on("/sd",            HTTP_GET,  handleSDPage);
   server.on("/capture",       HTTP_GET,  handleCaptureSD);
@@ -5980,15 +6521,46 @@ static void configureButtonWakeup() {
 
   rtc_gpio_pullup_en((gpio_num_t)BUTTON_GPIO);
   rtc_gpio_pulldown_dis((gpio_num_t)BUTTON_GPIO);
-  Serial.printf("[SLEEP] Wakeup source configured: GPIO%d LOW\n", BUTTON_GPIO);
+  Serial.printf("[SLEEP] Wakeup source configured: button GPIO%d LOW\n", BUTTON_GPIO);
+}
+
+static void configureMotionWakeup(bool enabled) {
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
+  if (!enabled) {
+    Serial.println("[SLEEP] Motion wakeup disabled");
+    return;
+  }
+
+  if (!pirSupportsRtcWakeup()) {
+    Serial.printf("[SLEEP] Motion wakeup unavailable on GPIO%d; an RTC-capable GPIO is required\n", PIR_GPIO);
+    return;
+  }
+
+  uint64_t mask = (1ULL << PIR_GPIO);
+  esp_err_t err = esp_sleep_enable_ext1_wakeup(mask, ESP_EXT1_WAKEUP_ANY_HIGH);
+  if (err != ESP_OK) {
+    Serial.printf("[SLEEP] Failed to enable EXT1 wakeup on GPIO%d (err=0x%x)\n", PIR_GPIO, err);
+    return;
+  }
+
+  rtc_gpio_pullup_dis((gpio_num_t)PIR_GPIO);
+  rtc_gpio_pulldown_en((gpio_num_t)PIR_GPIO);
+  Serial.printf("[SLEEP] Wakeup source configured: motion GPIO%d HIGH\n", PIR_GPIO);
 }
 
 static void handleWakeupIndicator() {
-  esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-  if (cause == ESP_SLEEP_WAKEUP_EXT0) {
+  if (bootWakeCause == ESP_SLEEP_WAKEUP_EXT0) {
     Serial.printf("[BOOT] Wakeup from deep sleep via button GPIO%d\n", BUTTON_GPIO);
     ledBlinkCount(2, BUTTON_BLINK_ON_MS, BUTTON_BLINK_OFF_MS);
     return;
+  }
+
+  if (bootWakeCause == ESP_SLEEP_WAKEUP_EXT1) {
+    uint64_t mask = esp_sleep_get_ext1_wakeup_status();
+    if ((mask & (1ULL << PIR_GPIO)) != 0ULL) {
+      Serial.printf("[BOOT] Wakeup from deep sleep via motion GPIO%d\n", PIR_GPIO);
+      motionBootEventPending = true;
+    }
   }
 
   ledBootSequence();
@@ -6027,16 +6599,73 @@ static void prepareDeviceForDeepSleep() {
   WiFi.mode(WIFI_OFF);
 }
 
-[[noreturn]] static void enterDeepSleepFromButton() {
-  Serial.printf("[SLEEP] Button long-action detected on GPIO%d\n", BUTTON_GPIO);
+[[noreturn]] static void enterDeepSleepNow(const char *reason, int blinkCount, bool allowMotionWake) {
+  Serial.printf("[SLEEP] %s\n", reason ? reason : "Entering deep sleep");
   prepareDeviceForDeepSleep();
-  ledBlinkCount(3, BUTTON_BLINK_ON_MS, BUTTON_BLINK_OFF_MS);
-  Serial.println("[SLEEP] Entering deep sleep");
+
+  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
+  configureButtonWakeup();
+  if (allowMotionWake && runtimeConfig.motionSettings.wakeOnMotion) {
+    configureMotionWakeup(true);
+  }
+
+  if (blinkCount > 0) {
+    ledBlinkCount(blinkCount, BUTTON_BLINK_ON_MS, BUTTON_BLINK_OFF_MS);
+  }
   delay(20);
   esp_deep_sleep_start();
 
   for (;;) {
     delay(1000);
+  }
+}
+
+[[noreturn]] static void enterDeepSleepFromButton() {
+  // Manual button sleep can also wake on motion when enabled in settings.
+  enterDeepSleepNow("Button requested deep sleep", 3, true);
+}
+
+static void closeMotionActionWindow() {
+  motionActionWindowActive = false;
+  motionIgnoreUntilAt = millis() + ((unsigned long)runtimeConfig.motionSettings.detectionIntervalSec * 1000UL);
+}
+
+static void triggerMotionEvent(const char *source) {
+  if (!runtimeConfig.motionSettings.enabled) {
+    return;
+  }
+
+  unsigned long now = millis();
+  motionActionWindowActive = true;
+  motionLastDetectedAt = now;
+  motionLastActivityAt = now;
+  motionPendingImages = 0;
+  motionVideoManagedRecording = false;
+  motionRecordingStopAt = 0;
+  Serial.printf("[MOTION] Triggered (%s)\n", source ? source : "runtime");
+
+  if (runtimeConfig.motionSettings.captureImage) {
+    motionPendingImages = runtimeConfig.motionSettings.imageCount;
+    motionNextImageAt = now;
+  }
+
+  if (runtimeConfig.motionSettings.captureVideo) {
+    String message;
+    if (recordingActive) {
+      motionVideoManagedRecording = true;
+      motionRecordingStopAt = now + ((unsigned long)runtimeConfig.motionSettings.videoDurationSec * 1000UL);
+      Serial.printf("[MOTION] Extended recording stop deadline by motion to %lus\n", (unsigned long)runtimeConfig.motionSettings.videoDurationSec);
+    } else if (startRecordingSessionInternal(message)) {
+      motionVideoManagedRecording = true;
+      motionRecordingStopAt = now + ((unsigned long)runtimeConfig.motionSettings.videoDurationSec * 1000UL);
+      Serial.printf("[MOTION] %s\n", message.c_str());
+    } else {
+      Serial.printf("[MOTION] Failed to start recording: %s\n", message.c_str());
+    }
+  }
+
+  if (motionPendingImages == 0 && !motionVideoManagedRecording) {
+    closeMotionActionWindow();
   }
 }
 
@@ -6071,11 +6700,125 @@ static void serviceButtonSleepRequest() {
   }
 }
 
+static void serviceMotionDetection() {
+  if (!runtimeConfig.motionSettings.enabled) {
+    unsigned long now = millis();
+    motionRawHigh = (digitalRead(PIR_GPIO) == HIGH);
+    motionLatched = false;
+    if (motionRawHigh) {
+      if (motionHighSinceAt == 0) {
+        motionHighSinceAt = now;
+      }
+    } else {
+      motionHighSinceAt = 0;
+    }
+    motionActionWindowActive = false;
+    motionIgnoreUntilAt = 0;
+    noInterrupts();
+    motionEdgePending = false;
+    interrupts();
+    return;
+  }
+
+  unsigned long now = millis();
+  if (motionIgnoreUntilAt != 0 && (long)(now - motionIgnoreUntilAt) >= 0) {
+    motionIgnoreUntilAt = 0;
+  }
+
+  bool edgeTriggered = false;
+  noInterrupts();
+  if (motionEdgePending) {
+    motionEdgePending = false;
+    edgeTriggered = true;
+  }
+  interrupts();
+
+  if (edgeTriggered && !motionActionWindowActive && motionIgnoreUntilAt == 0) {
+    motionLatched = true;
+    motionHighSinceAt = now;
+    triggerMotionEvent("pir-edge");
+    return;
+  }
+
+  bool rawHigh = (digitalRead(PIR_GPIO) == HIGH);
+  motionRawHigh = rawHigh;
+
+  if (rawHigh) {
+    if (motionHighSinceAt == 0) {
+      motionHighSinceAt = now;
+    }
+
+    // Ignore further detections while actions are running and during post-action cooldown.
+    if (motionActionWindowActive || motionIgnoreUntilAt != 0) {
+      return;
+    }
+
+    if (!motionLatched) {
+      motionLatched = true;
+      triggerMotionEvent("pir");
+    }
+  } else {
+    motionHighSinceAt = 0;
+    motionLatched = false;
+  }
+}
+
+static void serviceMotionActions() {
+  unsigned long now = millis();
+
+  if (motionBootEventPending) {
+    motionBootEventPending = false;
+    triggerMotionEvent("wake");
+  }
+
+  if (motionPendingImages > 0 && now >= motionNextImageAt) {
+    String path;
+    if (captureImageToSD(path)) {
+      Serial.printf("[MOTION] Image captured: %s\n", path.c_str());
+    } else {
+      Serial.println("[MOTION] Failed to capture image");
+    }
+
+    --motionPendingImages;
+    motionNextImageAt = now + ((unsigned long)runtimeConfig.motionSettings.imageDelayDs * 100UL);
+  }
+
+  if (motionVideoManagedRecording && motionRecordingStopAt != 0 && now >= motionRecordingStopAt) {
+    String message;
+    if (stopRecordingSessionInternal(message)) {
+      Serial.printf("[MOTION] %s\n", message.c_str());
+    }
+    motionVideoManagedRecording = false;
+    motionRecordingStopAt = 0;
+  }
+
+  if (motionActionWindowActive && motionPendingImages == 0 && !motionVideoManagedRecording) {
+    closeMotionActionWindow();
+  }
+}
+
+static void serviceMotionAutoStandby() {
+  if (!runtimeConfig.motionSettings.enabled || !runtimeConfig.motionSettings.autoStandby) {
+    return;
+  }
+
+  if (recordingActive || motionPendingImages > 0 || motionVideoManagedRecording) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if ((now - motionLastActivityAt) >= ((unsigned long)runtimeConfig.motionSettings.standbyAfterSec * 1000UL)) {
+    enterDeepSleepNow("Auto stand-by timeout", 0, true);
+  }
+}
+
 // ─── Arduino entry points ─────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
   Serial.println("\n[BOOT] ESP32-CAM starting");
   WiFi.onEvent(onWifiEvent);
+
+  bootWakeCause = esp_sleep_get_wakeup_cause();
 
   // Initialize LED and provide boot feedback
   initLED();
@@ -6092,6 +6835,7 @@ void setup() {
 
   pinMode(BUTTON_GPIO, INPUT_PULLUP);
   pinMode(PIR_GPIO, INPUT);
+  attachInterrupt(digitalPinToInterrupt(PIR_GPIO), onPirEdgeInterrupt, CHANGE);
   pinMode(LED_FLASH_GPIO_NUM, OUTPUT);
   digitalWrite(LED_FLASH_GPIO_NUM, LOW);
   powerDownCameraHardware();
@@ -6105,6 +6849,16 @@ void setup() {
 
   Serial.printf("[GPIO] Button: GPIO%d (to GND, active LOW), PIR DATA: GPIO%d\n", BUTTON_GPIO, PIR_GPIO);
   Serial.println("[GPIO] PIR power: VCC -> 5V (or compatible rail), GND -> GND");
+  logSharedPinCaveats();
+
+  motionLastActivityAt = millis();
+  motionLastDetectedAt = 0;
+  motionPendingImages = 0;
+  motionRecordingStopAt = 0;
+  motionVideoManagedRecording = false;
+  motionActionWindowActive = false;
+  motionIgnoreUntilAt = 0;
+  motionBootEventPending = false;
 
   // Load stored encrypted configuration from SD card.
   StoredConfig cfg;
@@ -6124,6 +6878,20 @@ void setup() {
     gLoggingEnabled = true;
     isConfigured = false;
   }
+
+    clampMotionSettings(runtimeConfig.motionSettings);
+    if (runtimeConfig.motionSettings.wakeOnMotion && !pirSupportsRtcWakeup()) {
+      runtimeConfig.motionSettings.wakeOnMotion = false;
+      Serial.printf("[CFG] Disabled wake on motion because GPIO%d is not RTC-capable\n", PIR_GPIO);
+    }
+    applyPirInputMode();
+    configureMotionWakeup(runtimeConfig.motionSettings.wakeOnMotion);
+    updateSdLoggingState();
+    if (bootWakeCause == ESP_SLEEP_WAKEUP_EXT1) {
+      uint64_t mask = esp_sleep_get_ext1_wakeup_status();
+      motionBootEventPending = ((mask & (1ULL << PIR_GPIO)) != 0ULL);
+    }
+
     routeAccessToken = String((uint32_t)esp_random(), HEX) + String((uint32_t)esp_random(), HEX);
     Serial.printf("[HTTP] Shared route token initialized (%u chars)\n", (unsigned int)routeAccessToken.length());
     Serial.printf("[CFG] Configured: %s\n", isConfigured ? "yes" : "no");
@@ -6142,7 +6910,10 @@ void loop() {
   serviceNtpSync();
   serviceStaReconnect();
   serviceRecording();
+  serviceMotionDetection();
+  serviceMotionActions();
   serviceCameraIdleTimeout();
+  serviceMotionAutoStandby();
   serviceButtonSleepRequest();
   servicePendingFirmwareRestart();
   servicePendingAdminRestart();
