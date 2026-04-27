@@ -416,6 +416,7 @@ static void serviceMotionDetection();
 static void serviceMotionActions();
 static void serviceMotionAutoStandby();
 static void triggerMotionEvent(const char *source);
+static void noteAuthenticatedWebActivity();
 static void closeMotionActionWindow();
 static bool captureImageToSD(String &savedPath);
 static bool startRecordingSessionInternal(String &message);
@@ -1810,7 +1811,7 @@ static bool loadConfigFromSD(StoredConfig &cfg) {
   ivHex.trim();
   cipherHex.trim();
 
-  if (magic == "ESP32CAMCFG6" || magic == "ESP32CAMCFG5") {
+  if (magic == "ESP32CAMCFG6") {
     if (!decryptConfigV6(ivHex, cipherHex, cfg)) {
       Serial.println("[CFG] Failed to decrypt config");
       return false;
@@ -3223,6 +3224,14 @@ static bool hasSharedAccessToken(WebServer &srv) {
   return srv.arg("t") == routeAccessToken;
 }
 
+static void noteAuthenticatedWebActivity() {
+  if (!runtimeConfig.motionSettings.enabled || !runtimeConfig.motionSettings.autoStandby) {
+    return;
+  }
+
+  motionLastActivityAt = millis();
+}
+
 static bool checkAuth(WebServer &srv, bool allowSharedToken) {
   // LED feedback for URL access blink (if enabled)
   if (ledAccessBlinkEnabled) {
@@ -3238,6 +3247,7 @@ static bool checkAuth(WebServer &srv, bool allowSharedToken) {
   }
 
   if (allowSharedToken && hasSharedAccessToken(srv)) {
+    noteAuthenticatedWebActivity();
     return true;
   }
 
@@ -3246,6 +3256,7 @@ static bool checkAuth(WebServer &srv, bool allowSharedToken) {
     return false;
   }
 
+  noteAuthenticatedWebActivity();
   return true;
 }
 
@@ -5514,9 +5525,12 @@ static void handleSDUploadData() {
     return;
   }
 
-  if (!cfgAccessPass.isEmpty() && !server.authenticate("admin", cfgAccessPass.c_str())) {
-    sdUploadFailed = true;
-    return;
+  if (!cfgAccessPass.isEmpty()) {
+    if (!server.authenticate("admin", cfgAccessPass.c_str())) {
+      sdUploadFailed = true;
+      return;
+    }
+    noteAuthenticatedWebActivity();
   }
 
   HTTPUpload &upload = server.upload();
@@ -5622,10 +5636,14 @@ static void handleSDUploadDataWorker() {
     return;
   }
 
-  if (!cfgAccessPass.isEmpty() && !hasSharedAccessToken(transferServer)
-      && !transferServer.authenticate("admin", cfgAccessPass.c_str())) {
-    sdUploadFailed = true;
-    return;
+  if (!cfgAccessPass.isEmpty()) {
+    bool authorized = hasSharedAccessToken(transferServer)
+      || transferServer.authenticate("admin", cfgAccessPass.c_str());
+    if (!authorized) {
+      sdUploadFailed = true;
+      return;
+    }
+    noteAuthenticatedWebActivity();
   }
 
   HTTPUpload &upload = transferServer.upload();
@@ -5776,10 +5794,14 @@ static void handleSDUploadMain() {
 }
 
 static void handleFirmwareUploadDataWorker() {
-  if (!cfgAccessPass.isEmpty() && !hasSharedAccessToken(transferServer)
-      && !transferServer.authenticate("admin", cfgAccessPass.c_str())) {
-    firmwareUploadFailed = true;
-    return;
+  if (!cfgAccessPass.isEmpty()) {
+    bool authorized = hasSharedAccessToken(transferServer)
+      || transferServer.authenticate("admin", cfgAccessPass.c_str());
+    if (!authorized) {
+      firmwareUploadFailed = true;
+      return;
+    }
+    noteAuthenticatedWebActivity();
   }
 
   HTTPUpload &upload = transferServer.upload();
