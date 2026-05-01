@@ -27,6 +27,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <WiFi.h>
+#include <HTTPClient.h>
 #include <WebServer.h>
 #include <FS.h>
 #include <SD_MMC.h>
@@ -131,6 +132,7 @@ static volatile uint32_t motionEdgeCount = 0;
 static uint8_t motionPendingImages = 0;
 static bool   motionVideoManagedRecording = false;
 static bool   motionActionWindowActive = false;
+static bool   deferredNetworkStartupPending = false;
 static volatile bool staLinkUp = false;
 static unsigned long lastUrlAccessBlink = 0;
 static unsigned long lastCameraActivityAt = 0;
@@ -344,6 +346,7 @@ struct MotionSettings {
   bool autoStandby = false;
   uint16_t standbyAfterSec = 30;     // 5..120
   uint16_t detectionIntervalSec = 0; // 0,5,10,30,60,600
+  String notifyUrl;
 };
 
 struct StoredConfig {
@@ -415,6 +418,7 @@ static void serviceButtonSleepRequest();
 static void serviceMotionDetection();
 static void serviceMotionActions();
 static void serviceMotionAutoStandby();
+static void serviceDeferredNetworkStartup();
 static void triggerMotionEvent(const char *source);
 static void noteAuthenticatedWebActivity();
 static void closeMotionActionWindow();
@@ -428,6 +432,8 @@ static void clampMotionSettings(MotionSettings &settings);
 static void handleMotionPage();
 static void handleMotionConfigGet();
 static void handleMotionConfigSet();
+static void handleMotionStandby();
+static void sendMotionNotifyRequest(const String &url);
 static void prepareDeviceForDeepSleep();
 [[noreturn]] static void enterDeepSleepFromButton();
 [[noreturn]] static void enterDeepSleepNow(const char *reason, int blinkCount, bool allowMotionWake);
@@ -1591,7 +1597,7 @@ static bool decryptPayload(const String &ivHex, const String &cipherHex, std::ve
 
 static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipherHex) {
   std::vector<uint8_t> plain;
-  plain.reserve(cfg.adminPass.length() + cfg.deviceName.length() + cfg.wifiList.size() * 32 + 64);
+  plain.reserve(cfg.adminPass.length() + cfg.deviceName.length() + cfg.wifiList.size() * 32 + cfg.motionSettings.notifyUrl.length() + 66);
 
   uint16_t wifiCount = (uint16_t)cfg.wifiList.size();
   plain.push_back((uint8_t)(wifiCount & 0xFF));
@@ -1621,6 +1627,7 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
   appendU8(plain, cfg.motionSettings.autoStandby ? 1 : 0);
   appendU16(plain, cfg.motionSettings.standbyAfterSec);
   appendU16(plain, cfg.motionSettings.detectionIntervalSec);
+  appendField(plain, cfg.motionSettings.notifyUrl);
 
   return encryptPayload(plain, ivHex, cipherHex);
 }
@@ -1743,15 +1750,18 @@ static bool decryptConfigV6(const String &ivHex, const String &cipherHex, Stored
     if (offset + 2 <= plain.size()) {
       if (!readU16(plain, offset, cfg.motionSettings.detectionIntervalSec)) return false;
     }
-    // Backward compatibility: older configs may include a trailing sensitivity byte.
-    if (offset < plain.size()) {
+    // Backward compatibility: very old configs may include trailing legacy bytes.
+    size_t remaining = plain.size() - offset;
+    if (remaining == 1) {
       uint8_t legacySensitivity = 0;
       if (!readU8(plain, offset, legacySensitivity)) return false;
-    }
-    // Backward compatibility: older configs may include a trailing PIR input mode byte.
-    if (offset < plain.size()) {
+    } else if (remaining == 2) {
+      uint8_t legacySensitivity = 0;
+      if (!readU8(plain, offset, legacySensitivity)) return false;
       uint8_t legacyPirInputMode = 0;
       if (!readU8(plain, offset, legacyPirInputMode)) return false;
+    } else if (remaining >= 2) {
+      if (!readField(plain, offset, cfg.motionSettings.notifyUrl)) return false;
     }
   }
 
@@ -1853,6 +1863,12 @@ static void clampMotionSettings(MotionSettings &settings) {
   if (settings.standbyAfterSec > 120) settings.standbyAfterSec = 120;
   if (!isValidMotionIntervalSec(settings.detectionIntervalSec)) {
     settings.detectionIntervalSec = 0;
+  }
+
+  settings.notifyUrl.trim();
+  if (settings.notifyUrl.length() > 255) {
+    settings.notifyUrl = settings.notifyUrl.substring(0, 255);
+    settings.notifyUrl.trim();
   }
 }
 
@@ -4498,7 +4514,15 @@ select,input{background:#0f3460;color:#eee;border:1px solid #234573;border-radiu
       </select>
     </div>
 
-    <button class="btn" id="save_btn">Save Motion Settings</button>
+    <div class="cg row">
+      <label for="notify_url">Notify URL (GET on motion detect)</label>
+      <input id="notify_url" type="url" placeholder="http://example.local/motion">
+    </div>
+
+    <div class="small">Changes are saved automatically when you modify a setting.</div>
+    <div style="margin-top:10px">
+      <button class="btn" id="standby_btn" type="button">Go To Standby</button>
+    </div>
     <div class="status" id="status"></div>
   </div>
 </div>
@@ -4506,6 +4530,72 @@ select,input{background:#0f3460;color:#eee;border:1px solid #234573;border-radiu
 function id(n){return document.getElementById(n);}
 function setStatus(msg,err){var e=id('status');e.textContent=msg||'';e.className=err?'status error':'status';}
 function asInt(v,d){var n=parseInt(v,10);return isNaN(n)?d:n;}
+function formData(obj){return Object.keys(obj).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(obj[k]);}).join('&');}
+var saveTimer=0;
+var savePending=false;
+var saveInFlight=false;
+
+function buildPayload(){
+  return {
+    enabled:id('enabled').checked?1:0,
+    wakeOnMotion:id('wake_on_motion').checked?1:0,
+    autoStandby:id('auto_standby').checked?1:0,
+    standbyAfterSec:asInt(id('standby_after_sec').value,30),
+    captureImage:id('capture_image').checked?1:0,
+    imageCount:asInt(id('image_count').value,1),
+    imageDelayDs:Math.round((parseFloat(id('image_delay_ds').value)||0.1)*10),
+    captureVideo:id('capture_video').checked?1:0,
+    videoDurationSec:asInt(id('video_duration_sec').value,5),
+    detectionIntervalSec:asInt(id('detection_interval_sec').value,0),
+    notifyUrl:id('notify_url').value||''
+  };
+}
+
+function saveConfig(){
+  if(saveInFlight){
+    savePending=true;
+    return;
+  }
+  saveInFlight=true;
+  setStatus('Saving...',false);
+  fetch('/motion/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData(buildPayload())})
+    .then(function(r){
+      return r.text().then(function(t){
+        setStatus(t||'Saved',!r.ok);
+        if(r.ok){loadConfig();}
+      });
+    })
+    .catch(function(e){setStatus(e.message,true);})
+    .finally(function(){
+      saveInFlight=false;
+      if(savePending){
+        savePending=false;
+        saveConfig();
+      }
+    });
+}
+
+function scheduleSave(){
+  if(saveTimer){clearTimeout(saveTimer);}
+  saveTimer=setTimeout(function(){
+    saveTimer=0;
+    saveConfig();
+  },180);
+}
+
+function bindAutoSave(controlId){
+  var el=id(controlId);
+  el.addEventListener('change',scheduleSave);
+}
+
+function wakeSourcesForDialog(){
+  var events=['Button press'];
+  if(id('wake_on_motion').checked){
+    events.push('Motion (PIR sensor)');
+  }
+  return events;
+}
+
 function loadConfig(){
   fetch('/motion/config').then(function(r){
     if(!r.ok){throw new Error('Failed to load motion config');}
@@ -4521,26 +4611,34 @@ function loadConfig(){
     id('capture_video').checked=!!c.captureVideo;
     id('video_duration_sec').value=c.videoDurationSec;
     id('detection_interval_sec').value=String(c.detectionIntervalSec||0);
+    id('notify_url').value=c.notifyUrl||'';
   }).catch(function(e){setStatus(e.message,true);});
 }
-id('save_btn').addEventListener('click',function(){
-  var payload={
-    enabled:id('enabled').checked?1:0,
-    wakeOnMotion:id('wake_on_motion').checked?1:0,
-    autoStandby:id('auto_standby').checked?1:0,
-    standbyAfterSec:asInt(id('standby_after_sec').value,30),
-    captureImage:id('capture_image').checked?1:0,
-    imageCount:asInt(id('image_count').value,1),
-    imageDelayDs:Math.round((parseFloat(id('image_delay_ds').value)||0.1)*10),
-    captureVideo:id('capture_video').checked?1:0,
-    videoDurationSec:asInt(id('video_duration_sec').value,5),
-    detectionIntervalSec:asInt(id('detection_interval_sec').value,0)
-  };
-  setStatus('Saving...',false);
-  fetch('/motion/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:Object.keys(payload).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(payload[k]);}).join('&')})
-    .then(function(r){return r.text().then(function(t){setStatus(t||'Saved',!r.ok);if(r.ok){loadConfig();}});})
-    .catch(function(e){setStatus(e.message,true);});
+id('standby_btn').addEventListener('click',function(){
+  var events=wakeSourcesForDialog();
+  var msg='Put device in standby now?\\n\\nActive wake-up events:\\n- '+events.join('\\n- ');
+  if(!confirm(msg)){return;}
+  setStatus('Entering standby...',false);
+  fetch('/motion/standby',{method:'POST'})
+    .then(function(r){
+      return r.text().then(function(t){
+        setStatus(t||'Standby requested',!r.ok);
+      });
+    })
+    .catch(function(e){setStatus(e.message||'Failed to enter standby',true);});
 });
+
+bindAutoSave('enabled');
+bindAutoSave('wake_on_motion');
+bindAutoSave('auto_standby');
+bindAutoSave('standby_after_sec');
+bindAutoSave('capture_image');
+bindAutoSave('image_count');
+bindAutoSave('image_delay_ds');
+bindAutoSave('capture_video');
+bindAutoSave('video_duration_sec');
+bindAutoSave('detection_interval_sec');
+bindAutoSave('notify_url');
 loadConfig();
 </script>
 </body>
@@ -4696,6 +4794,9 @@ static void handleMotionConfigGet() {
   clampMotionSettings(runtimeConfig.motionSettings);
   const MotionSettings &m = runtimeConfig.motionSettings;
   String json = "{";
+  String notifyUrlEscaped = m.notifyUrl;
+  notifyUrlEscaped.replace("\\", "\\\\");
+  notifyUrlEscaped.replace("\"", "\\\"");
   json += "\"enabled\":" + String(m.enabled ? "true" : "false") + ",";
   json += "\"captureImage\":" + String(m.captureImage ? "true" : "false") + ",";
   json += "\"imageCount\":" + String((int)m.imageCount) + ",";
@@ -4705,7 +4806,8 @@ static void handleMotionConfigGet() {
   json += "\"wakeOnMotion\":" + String(m.wakeOnMotion ? "true" : "false") + ",";
   json += "\"autoStandby\":" + String(m.autoStandby ? "true" : "false") + ",";
   json += "\"standbyAfterSec\":" + String((int)m.standbyAfterSec) + ",";
-  json += "\"detectionIntervalSec\":" + String((int)m.detectionIntervalSec);
+  json += "\"detectionIntervalSec\":" + String((int)m.detectionIntervalSec) + ",";
+  json += "\"notifyUrl\":\"" + notifyUrlEscaped + "\"";
   json += "}";
   server.send(200, "application/json", json);
 }
@@ -4724,6 +4826,7 @@ static void handleMotionConfigSet() {
   if (server.hasArg("autoStandby")) updated.autoStandby = server.arg("autoStandby") == "1" || server.arg("autoStandby") == "true";
   if (server.hasArg("standbyAfterSec")) updated.standbyAfterSec = (uint16_t)server.arg("standbyAfterSec").toInt();
   if (server.hasArg("detectionIntervalSec")) updated.detectionIntervalSec = (uint16_t)server.arg("detectionIntervalSec").toInt();
+  if (server.hasArg("notifyUrl")) updated.notifyUrl = server.arg("notifyUrl");
 
   clampMotionSettings(updated);
   bool wakeDisabledForPin = false;
@@ -4745,6 +4848,14 @@ static void handleMotionConfigSet() {
     return;
   }
   server.send(200, "text/plain", "Motion configuration saved");
+}
+
+static void handleMotionStandby() {
+  if (!checkAuth()) return;
+
+  server.send(200, "text/plain", "Standby requested. Going to deep sleep now...");
+  delay(120);
+  enterDeepSleepNow("Standby requested from motion page", 0, true);
 }
 
 static void handleSDPage() {
@@ -6353,6 +6464,7 @@ static void registerCameraRoutes() {
   server.on("/motion/graph",  HTTP_GET,  handleMotionGraphPage);
   server.on("/motion/config", HTTP_GET,  handleMotionConfigGet);
   server.on("/motion/config", HTTP_POST, handleMotionConfigSet);
+  server.on("/motion/standby", HTTP_POST, handleMotionStandby);
   server.on("/motion/readings", HTTP_GET, handleMotionReadings);
   server.on("/admin",         HTTP_GET,  handleAdminPage);
   server.on("/sd",            HTTP_GET,  handleSDPage);
@@ -6582,6 +6694,8 @@ static void handleWakeupIndicator() {
     if ((mask & (1ULL << PIR_GPIO)) != 0ULL) {
       Serial.printf("[BOOT] Wakeup from deep sleep via motion GPIO%d\n", PIR_GPIO);
       motionBootEventPending = true;
+      ledQuickBlink();
+      return;
     }
   }
 
@@ -6652,6 +6766,33 @@ static void closeMotionActionWindow() {
   motionIgnoreUntilAt = millis() + ((unsigned long)runtimeConfig.motionSettings.detectionIntervalSec * 1000UL);
 }
 
+static void sendMotionNotifyRequest(const String &url) {
+  if (url.isEmpty()) {
+    return;
+  }
+
+  if (!url.startsWith("http://") && !url.startsWith("https://")) {
+    Serial.printf("[MOTION] Notify URL ignored (must start with http:// or https://): %s\n", url.c_str());
+    return;
+  }
+
+  HTTPClient http;
+  http.setConnectTimeout(1500);
+  http.setTimeout(2500);
+  if (!http.begin(url)) {
+    Serial.printf("[MOTION] Notify request failed to begin: %s\n", url.c_str());
+    return;
+  }
+
+  int status = http.GET();
+  if (status > 0) {
+    Serial.printf("[MOTION] Notify GET status %d for %s\n", status, url.c_str());
+  } else {
+    Serial.printf("[MOTION] Notify GET error %d for %s\n", status, url.c_str());
+  }
+  http.end();
+}
+
 static void triggerMotionEvent(const char *source) {
   if (!runtimeConfig.motionSettings.enabled) {
     return;
@@ -6665,6 +6806,7 @@ static void triggerMotionEvent(const char *source) {
   motionVideoManagedRecording = false;
   motionRecordingStopAt = 0;
   Serial.printf("[MOTION] Triggered (%s)\n", source ? source : "runtime");
+  sendMotionNotifyRequest(runtimeConfig.motionSettings.notifyUrl);
 
   if (runtimeConfig.motionSettings.captureImage) {
     motionPendingImages = runtimeConfig.motionSettings.imageCount;
@@ -6834,6 +6976,25 @@ static void serviceMotionAutoStandby() {
   }
 }
 
+static void serviceDeferredNetworkStartup() {
+  if (!deferredNetworkStartupPending) {
+    return;
+  }
+
+  if (motionActionWindowActive || motionPendingImages > 0 || motionVideoManagedRecording || recordingActive) {
+    return;
+  }
+
+  deferredNetworkStartupPending = false;
+  Serial.println("[BOOT] Starting deferred network services after motion wake actions");
+
+  if (isConfigured) {
+    startSTAMode();
+  } else {
+    startSetupAPMode();
+  }
+}
+
 // ─── Arduino entry points ─────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
@@ -6881,6 +7042,7 @@ void setup() {
   motionActionWindowActive = false;
   motionIgnoreUntilAt = 0;
   motionBootEventPending = false;
+  deferredNetworkStartupPending = false;
 
   // Load stored encrypted configuration from SD card.
   StoredConfig cfg;
@@ -6920,8 +7082,12 @@ void setup() {
 
     Serial.printf("[CAM] Lazy init enabled with idle timeout %lu ms\n", cameraIdleTimeoutMs);
 
-    if (isConfigured) {
-        startSTAMode();
+    bool motionWakeBoot = motionBootEventPending && bootWakeCause == ESP_SLEEP_WAKEUP_EXT1;
+    if (motionWakeBoot) {
+      deferredNetworkStartupPending = true;
+      Serial.println("[BOOT] Deferring network startup until motion capture completes");
+    } else if (isConfigured) {
+      startSTAMode();
     } else {
       startSetupAPMode();
     }
@@ -6934,6 +7100,7 @@ void loop() {
   serviceRecording();
   serviceMotionDetection();
   serviceMotionActions();
+  serviceDeferredNetworkStartup();
   serviceCameraIdleTimeout();
   serviceMotionAutoStandby();
   serviceButtonSleepRequest();
