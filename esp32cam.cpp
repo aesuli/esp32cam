@@ -34,6 +34,7 @@
 #include <Update.h>
 #include <esp_bt.h>
 #include <esp_err.h>
+#include <esp_heap_caps.h>
 #include <esp_sleep.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
@@ -158,6 +159,7 @@ static uint32_t recordingMaxFrameSize = 0;
 static uint16_t recordingWidth = 0;
 static uint16_t recordingHeight = 0;
 static uint32_t recordingMoviListSize = 4;
+static bool recordingIndexEnabled = true;
 static File   recordingFile;
 static String recordingPath;
 static File   sdUploadFile;
@@ -178,6 +180,10 @@ static TaskHandle_t transferServerTaskHandle = nullptr;
 static constexpr unsigned long STREAM_FRAME_INTERVAL_MS = 100;
 static constexpr unsigned long RECORDING_FRAME_INTERVAL_MS = 100;
 static constexpr unsigned long FIRMWARE_RESTART_DELAY_MS = 1500;
+// Keep short recordings seekable, but do not let manual-recording metadata
+// consume internal heap indefinitely.
+static constexpr size_t AVI_INDEX_MEMORY_BUDGET_BYTES = 48U * 1024U;
+static constexpr size_t AVI_INDEX_LOW_HEAP_GUARD_BYTES = 32U * 1024U;
 static constexpr uint32_t AVI_HAS_INDEX_FLAG = 0x00000010UL;
 static constexpr uint32_t AVI_KEYFRAME_FLAG = 0x00000010UL;
 static constexpr size_t AVI_HEADER_SIZE = 224;
@@ -314,6 +320,33 @@ struct AviIndexEntry {
 
 static std::vector<AviIndexEntry> recordingIndex;
 
+struct OwnedJpegFrame {
+  uint8_t *data = nullptr;
+  size_t capacity = 0;
+  size_t len = 0;
+  uint16_t width = 0;
+  uint16_t height = 0;
+
+  ~OwnedJpegFrame() {
+    release();
+  }
+
+  OwnedJpegFrame() = default;
+  OwnedJpegFrame(const OwnedJpegFrame &) = delete;
+  OwnedJpegFrame &operator=(const OwnedJpegFrame &) = delete;
+
+  void release() {
+    if (data) {
+      heap_caps_free(data);
+      data = nullptr;
+    }
+    capacity = 0;
+    len = 0;
+    width = 0;
+    height = 0;
+  }
+};
+
 struct WifiCredential {
   String ssid;
   String wifiPass;
@@ -394,11 +427,12 @@ static StoredConfig runtimeConfig;
 static bool syncClockWithNtp();
 static camera_fb_t *lockAndCaptureFrame(TickType_t timeoutTicks = pdMS_TO_TICKS(1000));
 static void unlockCameraFrame(camera_fb_t *fb);
+static bool copyCameraFrame(camera_fb_t *fb, OwnedJpegFrame &frame);
 static bool ensureCameraReady(TickType_t timeoutTicks = pdMS_TO_TICKS(5000));
 static void serviceCameraIdleTimeout();
 static bool isRecordingFrameDue(unsigned long now);
-static bool recordFrameIfDue(camera_fb_t *fb, unsigned long now);
-static bool appendRecordingFrame(camera_fb_t *fb);
+static bool recordFrameIfDue(const OwnedJpegFrame &frame, unsigned long now);
+static bool appendRecordingFrame(const OwnedJpegFrame &frame);
 static void stopRecordingSession(bool keepFile);
 static bool loadRuntimeConfigWithRetries(StoredConfig &cfg);
 static bool initCameraWithRetries();
@@ -692,6 +726,47 @@ static void unlockCameraFrame(camera_fb_t *fb) {
   if (cameraMutex) {
     xSemaphoreGive(cameraMutex);
   }
+}
+
+static uint8_t *allocateFrameCopyBuffer(size_t len) {
+  if (len == 0U) {
+    return nullptr;
+  }
+
+  uint8_t *buffer = nullptr;
+  if (psramFound()) {
+    buffer = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
+  if (!buffer) {
+    buffer = (uint8_t *)heap_caps_malloc(len, MALLOC_CAP_8BIT);
+  }
+
+  return buffer;
+}
+
+static bool copyCameraFrame(camera_fb_t *fb, OwnedJpegFrame &frame) {
+  frame.len = 0;
+  frame.width = 0;
+  frame.height = 0;
+  if (!fb || fb->format != PIXFORMAT_JPEG || !fb->buf || fb->len == 0U) {
+    return false;
+  }
+
+  if (!frame.data || frame.capacity < fb->len) {
+    uint8_t *copy = allocateFrameCopyBuffer(fb->len);
+    if (!copy) {
+      return false;
+    }
+    frame.release();
+    frame.data = copy;
+    frame.capacity = fb->len;
+  }
+
+  memcpy(frame.data, fb->buf, fb->len);
+  frame.len = fb->len;
+  frame.width = fb->width;
+  frame.height = fb->height;
+  return true;
 }
 
 static bool ensureCameraReady(TickType_t timeoutTicks) {
@@ -1190,8 +1265,42 @@ static void resetRecordingState() {
   recordingWidth = 0;
   recordingHeight = 0;
   recordingMoviListSize = AVI_MOVI_LIST_HEADER_SIZE;
+  recordingIndexEnabled = true;
   recordingPath = "";
-  recordingIndex.clear();
+  std::vector<AviIndexEntry>().swap(recordingIndex);
+}
+
+static void disableRecordingIndex(const char *reason) {
+  if (!recordingIndexEnabled) {
+    return;
+  }
+
+  recordingIndexEnabled = false;
+  std::vector<AviIndexEntry>().swap(recordingIndex);
+  if (reason && reason[0] != '\0') {
+    Serial.printf("[REC] AVI seek index disabled for this recording (%s)\n", reason);
+  } else {
+    Serial.println("[REC] AVI seek index disabled for this recording");
+  }
+}
+
+static bool canStoreRecordingIndexEntry() {
+  if (!recordingIndexEnabled) {
+    return false;
+  }
+
+  size_t nextIndexBytes = (recordingIndex.size() + 1U) * sizeof(AviIndexEntry);
+  if (nextIndexBytes > AVI_INDEX_MEMORY_BUDGET_BYTES) {
+    disableRecordingIndex("index memory budget reached");
+    return false;
+  }
+
+  if (ESP.getFreeHeap() < AVI_INDEX_LOW_HEAP_GUARD_BYTES) {
+    disableRecordingIndex("low heap");
+    return false;
+  }
+
+  return true;
 }
 
 static bool ensureCaptureDirectory() {
@@ -1513,6 +1622,68 @@ static void sendHtmlWithToken(String page) {
 
 static void sendHtmlWithToken(const char *html) {
   sendHtmlWithToken(String(html));
+}
+
+enum class AppPage {
+  Camera,
+  Motion,
+  Sd,
+  Admin
+};
+
+static String buildAppNavLink(const char *href, const char *label, AppPage page, AppPage activePage) {
+  String html;
+  html.reserve(80);
+  html += "<a href=\"";
+  html += href;
+  html += "\"";
+  if (page == activePage) {
+    html += " style=\"color:#e94560\"";
+  }
+  html += ">";
+  html += label;
+  html += "</a>";
+  return html;
+}
+
+static String buildAppNav(AppPage activePage) {
+  String html;
+  html.reserve(360);
+  html += "<nav>\n";
+  html += "  ";
+  html += buildAppNavLink("/", "📷 Camera", AppPage::Camera, activePage);
+  html += "\n  ";
+  html += buildAppNavLink("/motion", "🚶 Motion", AppPage::Motion, activePage);
+  html += "\n  ";
+  html += buildAppNavLink("/sd", "💾 SD Browser", AppPage::Sd, activePage);
+  html += "\n  ";
+  html += buildAppNavLink("/admin", "⚙️ Admin", AppPage::Admin, activePage);
+  html += "\n</nav>";
+  return html;
+}
+
+static String buildAppFooter() {
+  String html;
+  html.reserve(180);
+  html += "<footer style=\"padding:14px 20px;color:#7c8aa6;font-size:.82em;text-align:center\">";
+  html += "ESP32-CAM &middot; Firmware ";
+  html += FIRMWARE_VERSION_TEXT;
+  html += "</footer>";
+  return html;
+}
+
+static void applyAppChrome(String &page, AppPage activePage) {
+  page.replace("__APP_NAV__", buildAppNav(activePage));
+  page.replace("__APP_FOOTER__", buildAppFooter());
+}
+
+static void sendAppHtmlWithToken(String page, AppPage activePage) {
+  applyAppChrome(page, activePage);
+  sendHtmlWithToken(page);
+}
+
+static void sendAppHtmlWithToken(const char *html, AppPage activePage) {
+  sendAppHtmlWithToken(String(html), activePage);
 }
 
 static bool encryptPayload(const std::vector<uint8_t> &plain, String &ivHex, String &cipherHex) {
@@ -1912,16 +2083,6 @@ static void IRAM_ATTR onPirEdgeInterrupt() {
 
 // ─── HTML pages (stored in flash) ─────────────────────────────────────────────
 
-// Navigation bar HTML (reused across pages)
-static const char NAV_HTML[] PROGMEM = R"html(
-<nav style="background:#16213e;padding:8px 20px;display:flex;gap:12px;flex-wrap:wrap">
-  <a href="/" style="color:#e94560;text-decoration:none;padding:8px 12px;border-radius:4px;border:1px solid #234573">📷 Camera</a>
-  <a href="/motion" style="color:#eee;text-decoration:none;padding:8px 12px;border-radius:4px;border:1px solid #234573">🚶 Motion</a>
-  <a href="/sd" style="color:#eee;text-decoration:none;padding:8px 12px;border-radius:4px;border:1px solid #234573;hover:background:#234573">💾 SD Browser</a>
-  <a href="/admin" style="color:#eee;text-decoration:none;padding:8px 12px;border-radius:4px;border:1px solid #234573">⚙️ Admin</a>
-</nav>
-)html";
-
 static const char SETUP_HTML[] PROGMEM = R"html(<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -2081,12 +2242,7 @@ header span{font-size:.85em;color:#888}
 </style>
 </head>
 <body>
-<nav>
-  <a href="/" style="color:#e94560">📷 Camera</a>
-  <a href="/motion">🚶 Motion</a>
-  <a href="/sd">💾 SD Browser</a>
-  <a href="/admin">⚙️ Admin</a>
-</nav>
+__APP_NAV__
 <header>
   <h1>📷 ESP32-CAM</h1>
   <span id="ip_label"></span>
@@ -2163,6 +2319,7 @@ header span{font-size:.85em;color:#888}
     </div>
   </div>
 </div>
+__APP_FOOTER__
 <script>
 var recordingMode=false;
 var streamVisible=true;
@@ -2357,12 +2514,7 @@ header h1{color:#e94560;font-size:1.3em}
 </style>
 </head>
 <body>
-<nav>
-  <a href="/">📷 Camera</a>
-  <a href="/motion">🚶 Motion</a>
-  <a href="/sd">💾 SD Browser</a>
-  <a href="/admin" style="color:#e94560">⚙️ Admin</a>
-</nav>
+__APP_NAV__
 <header>
   <h1>⚙️ Administration</h1>
 </header>
@@ -2522,6 +2674,7 @@ header h1{color:#e94560;font-size:1.3em}
     <div id="factory_reset_status" class="status"></div>
   </div>
 </div>
+__APP_FOOTER__
 <script>
 function id(n){return document.getElementById(n);}
 var transferBase='http://'+window.location.hostname+':82';
@@ -2753,12 +2906,7 @@ header h1{color:#e94560;font-size:1.3em}
 </style>
 </head>
 <body>
-<nav>
-  <a href="/">📷 Camera</a>
-  <a href="/motion">🚶 Motion</a>
-  <a href="/sd" style="color:#e94560">💾 SD Browser</a>
-  <a href="/admin">⚙️ Admin</a>
-</nav>
+__APP_NAV__
 <header>
   <h1>💾 SD Card Browser</h1>
 </header>
@@ -2792,6 +2940,7 @@ header h1{color:#e94560;font-size:1.3em}
   <div id="status" class="status"></div>
   <div id="file_list" class="file-list"></div>
 </div>
+__APP_FOOTER__
 <script>
 var allItems=[];
 var currentDir='/';
@@ -3117,6 +3266,8 @@ static bool initCamera(uint32_t xclkFreqHz) {
     if (psramFound()) {
         config.fb_location  = CAMERA_FB_IN_PSRAM;
         config.jpeg_quality = 10;
+        config.fb_count     = 2;
+        config.grab_mode    = CAMERA_GRAB_LATEST;
     } else {
         config.frame_size = FRAMESIZE_CIF;
     }
@@ -3314,10 +3465,11 @@ static void handleStreamWorker() {
     streamClientAbortRequested = false;
     streamClientConnected = true;
     unsigned long lastFrameAt = 0;
+    OwnedJpegFrame frame;
 
     client.print(
         "HTTP/1.1 200 OK\r\n"
-        "Content-Type: multipart/x-mixed-replace; boundary=--jpgbound\r\n"
+        "Content-Type: multipart/x-mixed-replace; boundary=jpgbound\r\n"
         "Cache-Control: no-cache, no-store, must-revalidate\r\n"
         "Pragma: no-cache\r\n"
         "Connection: close\r\n"
@@ -3344,14 +3496,15 @@ static void handleStreamWorker() {
             continue;
         }
 
-        if (fb->format != PIXFORMAT_JPEG) {
-            unlockCameraFrame(fb);
+        bool copied = copyCameraFrame(fb, frame);
+        unlockCameraFrame(fb);
+        if (!copied) {
             delay(10);
             continue;
         }
 
         now = millis();
-        recordFrameIfDue(fb, now);
+        recordFrameIfDue(frame, now);
 
         char partHeader[128];
         int hlen = snprintf(partHeader, sizeof(partHeader),
@@ -3359,13 +3512,12 @@ static void handleStreamWorker() {
             "Content-Type: image/jpeg\r\n"
             "Content-Length: %u\r\n"
             "\r\n",
-            (unsigned int)fb->len);
+            (unsigned int)frame.len);
 
         bool ok = (client.write((const uint8_t *)partHeader, (size_t)hlen) == (size_t)hlen);
-        if (ok) ok = (client.write(fb->buf, fb->len) == fb->len);
+        if (ok) ok = (client.write(frame.data, frame.len) == frame.len);
         if (ok) ok = (client.print("\r\n") > 0);
 
-        unlockCameraFrame(fb);
         lastFrameAt = now;
 
         if (!ok) break;
@@ -3481,7 +3633,7 @@ static void handleCameraRoot() {
 
     String page(MAIN_HTML);
     page.replace("__FRAME_SIZE_OPTIONS__", buildFrameSizeOptionsHtml(selected));
-    sendHtmlWithToken(page);
+    sendAppHtmlWithToken(page, AppPage::Camera);
 }
 
 static String wifiEncryptionLabel(wifi_auth_mode_t authMode) {
@@ -3744,6 +3896,14 @@ static void handleCapture() {
         return;
     }
 
+    OwnedJpegFrame frame;
+    bool copied = copyCameraFrame(fb, frame);
+    unlockCameraFrame(fb);
+    if (!copied) {
+        server.send(503, "text/plain", "Camera frame copy failed");
+        return;
+    }
+
     // Send binary JPEG directly via the underlying TCP client
     WiFiClient client = server.client();
     client.printf(
@@ -3753,11 +3913,9 @@ static void handleCapture() {
         "Content-Length: %u\r\n"
         "Cache-Control: no-cache\r\n"
         "\r\n",
-        (unsigned int)fb->len
+        (unsigned int)frame.len
     );
-    client.write(fb->buf, fb->len);
-
-    unlockCameraFrame(fb);
+    client.write(frame.data, frame.len);
 }
 
 static void handleControl() {
@@ -4430,7 +4588,7 @@ static void handleAdminPage() {
   String page(ADMIN_HTML);
   page.replace("__FIRMWARE_VERSION__", FIRMWARE_VERSION_TEXT);
   page.replace("__FIRMWARE_BUILD__", FIRMWARE_BUILD_TEXT);
-  sendHtmlWithToken(page);
+  sendAppHtmlWithToken(page, AppPage::Admin);
 }
 
 static void handleMotionPage() {
@@ -4466,12 +4624,7 @@ select,input{background:#0f3460;color:#eee;border:1px solid #234573;border-radiu
 </style>
 </head>
 <body>
-<nav>
-  <a href="/">📷 Camera</a>
-  <a href="/motion" style="color:#e94560">🚶 Motion</a>
-  <a href="/sd">💾 SD Browser</a>
-  <a href="/admin">⚙️ Admin</a>
-</nav>
+__APP_NAV__
 <header><h1>🚶 Motion Detection</h1></header>
 <div class="wrap">
   <div class="panel">
@@ -4526,6 +4679,7 @@ select,input{background:#0f3460;color:#eee;border:1px solid #234573;border-radiu
     <div class="status" id="status"></div>
   </div>
 </div>
+__APP_FOOTER__
 <script>
 function id(n){return document.getElementById(n);}
 function setStatus(msg,err){var e=id('status');e.textContent=msg||'';e.className=err?'status error':'status';}
@@ -4644,7 +4798,7 @@ loadConfig();
 </body>
 </html>)html";
 
-  sendHtmlWithToken(MOTION_HTML);
+  sendAppHtmlWithToken(MOTION_HTML, AppPage::Motion);
 }
 
 static void handleMotionGraphPage() {
@@ -4673,12 +4827,7 @@ header h1{color:#e94560;font-size:1.2em}
 </style>
 </head>
 <body>
-<nav>
-  <a href="/">📷 Camera</a>
-  <a href="/motion" style="color:#e94560">🚶 Motion</a>
-  <a href="/sd">💾 SD Browser</a>
-  <a href="/admin">⚙️ Admin</a>
-</nav>
+__APP_NAV__
 <header><h1>🚶 Motion Graph (Live PIR Readings)</h1></header>
 <div class="wrap">
   <div class="panel">
@@ -4694,6 +4843,7 @@ header h1{color:#e94560;font-size:1.2em}
     <div class="status" id="status"></div>
   </div>
 </div>
+__APP_FOOTER__
 <script>
 var points=[];
 var maxPoints=180;
@@ -4756,7 +4906,7 @@ poll();
 </body>
 </html>)html";
 
-  sendHtmlWithToken(MOTION_GRAPH_HTML);
+  sendAppHtmlWithToken(MOTION_GRAPH_HTML, AppPage::Motion);
 }
 
 static void handleMotionReadings() {
@@ -4860,7 +5010,7 @@ static void handleMotionStandby() {
 
 static void handleSDPage() {
   if (!checkAuth()) return;
-  sendHtmlWithToken(SD_HTML);
+  sendAppHtmlWithToken(SD_HTML, AppPage::Sd);
 }
 
 static void handleSDList() {
@@ -5172,7 +5322,7 @@ static void handleSDPlaybackWorker() {
   transferServer.sendHeader("Access-Control-Allow-Origin", "*");
   client.print(
       "HTTP/1.1 200 OK\r\n"
-      "Content-Type: multipart/x-mixed-replace; boundary=--jpgbound\r\n"
+      "Content-Type: multipart/x-mixed-replace; boundary=jpgbound\r\n"
       "Cache-Control: no-cache, no-store, must-revalidate\r\n"
       "Pragma: no-cache\r\n"
       "Connection: close\r\n"
@@ -5311,6 +5461,8 @@ body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;min-height:100vh
 nav{background:#16213e;padding:8px 20px;display:flex;gap:12px;flex-wrap:wrap}
 nav a{color:#eee;text-decoration:none;padding:8px 12px;border-radius:4px;border:1px solid #234573}
 nav a:hover{background:#234573}
+header{background:#16213e;padding:12px 20px}
+header h1{color:#e94560;font-size:1.3em}
 .wrap{max-width:1080px;margin:0 auto;padding:16px}
 .panel{background:#16213e;border:1px solid #234573;border-radius:10px;padding:14px}
 .title{color:#e94560;margin-bottom:10px}
@@ -5323,14 +5475,11 @@ video,img{width:100%;max-height:75vh;background:#000;border:1px solid #234573;bo
 </style>
 </head>
 <body>
-<nav>
-  <a href="/">📷 Camera</a>
-  <a href="/sd">💾 SD Browser</a>
-  <a href="/admin">⚙️ Admin</a>
-</nav>
+__APP_NAV__
+<header><h1>💾 SD Video Viewer</h1></header>
 <div class="wrap">
   <div class="panel">
-    <h2 class="title">SD Video Viewer</h2>
+    <h2 class="title">__FILENAME__</h2>
     <div class="meta">File: __FILENAME__</div>
     __PLAYER_MEDIA__
     <div class="actions">
@@ -5340,6 +5489,7 @@ video,img{width:100%;max-height:75vh;background:#000;border:1px solid #234573;bo
     <div class="hint">__PLAYER_HINT__</div>
   </div>
 </div>
+__APP_FOOTER__
 </body>
 </html>)html";
 
@@ -5353,6 +5503,7 @@ video,img{width:100%;max-height:75vh;background:#000;border:1px solid #234573;bo
     page.replace("__PLAYER_MEDIA__", "<video controls playsinline preload=\"metadata\" src=\"" + mediaUrl + "\" type=\"" + mime + "\"></video>");
     page.replace("__PLAYER_HINT__", "If playback does not start, your browser likely does not support this container/codec and may require download instead.");
   }
+  applyAppChrome(page, AppPage::Sd);
   server.send(200, "text/html", page);
 }
 
@@ -6030,15 +6181,20 @@ static bool captureImageToSD(String &savedPath) {
     return false;
   }
 
-  File file = SD_MMC.open(savedPath, FILE_WRITE);
-  if (!file) {
-    unlockCameraFrame(fb);
+  OwnedJpegFrame frame;
+  bool copied = copyCameraFrame(fb, frame);
+  unlockCameraFrame(fb);
+  if (!copied) {
     return false;
   }
 
-  bool ok = file.write(fb->buf, fb->len) == fb->len;
+  File file = SD_MMC.open(savedPath, FILE_WRITE);
+  if (!file) {
+    return false;
+  }
+
+  bool ok = file.write(frame.data, frame.len) == frame.len;
   file.close();
-  unlockCameraFrame(fb);
 
   if (!ok) {
     SD_MMC.remove(savedPath);
@@ -6058,7 +6214,7 @@ static void handleCaptureSD() {
   server.send(200, "text/plain", String("Saved: ") + photoPath);
 }
 
-static bool writeAviHeader(File &file, uint32_t riffSize, uint32_t durationMs, uint32_t frameCount, uint32_t maxFrameSize, uint16_t width, uint16_t height, uint32_t moviListSize) {
+static bool writeAviHeader(File &file, uint32_t riffSize, uint32_t durationMs, uint32_t frameCount, uint32_t maxFrameSize, uint16_t width, uint16_t height, uint32_t moviListSize, bool hasIndex) {
   // ESP32-CAM can emit JPEG frames directly, so we keep recordings as MJPG in
   // an AVI container. This is the simplest standards-compliant output we can
   // generate here, but Android's documented native video support favors MP4/
@@ -6111,7 +6267,7 @@ static bool writeAviHeader(File &file, uint32_t riffSize, uint32_t durationMs, u
     writeU32LE(file, microsecondsPerFrame) &&
     writeU32LE(file, bytesPerSecond) &&
     writeU32LE(file, 0) &&
-    writeU32LE(file, AVI_HAS_INDEX_FLAG) &&
+    writeU32LE(file, hasIndex ? AVI_HAS_INDEX_FLAG : 0U) &&
     writeU32LE(file, frameCount) &&
     writeU32LE(file, 0) &&
     writeU32LE(file, 1) &&
@@ -6173,28 +6329,33 @@ static bool finalizeRecordingFile() {
     durationMs = elapsedMs == 0UL ? 1U : (uint32_t)elapsedMs;
   }
 
-  uint32_t indexSize = (uint32_t)recordingIndex.size() * 16UL;
-  if (!recordingFile.seek(recordingFile.size())) {
-    return false;
-  }
-
-  if (!writeAviChunkHeader(recordingFile, "idx1", indexSize)) {
-    return false;
-  }
-
-  for (size_t i = 0; i < recordingIndex.size(); ++i) {
-    if (!writeFourCC(recordingFile, AVI_VIDEO_CHUNK_ID) ||
-        !writeU32LE(recordingFile, AVI_KEYFRAME_FLAG) ||
-        !writeU32LE(recordingFile, recordingIndex[i].offset) ||
-        !writeU32LE(recordingFile, recordingIndex[i].size)) {
+  bool writeIndex = recordingIndexEnabled && recordingIndex.size() == recordingFrameCount;
+  if (writeIndex) {
+    uint32_t indexSize = (uint32_t)recordingIndex.size() * 16UL;
+    if (!recordingFile.seek(recordingFile.size())) {
       return false;
     }
+
+    if (!writeAviChunkHeader(recordingFile, "idx1", indexSize)) {
+      return false;
+    }
+
+    for (size_t i = 0; i < recordingIndex.size(); ++i) {
+      if (!writeFourCC(recordingFile, AVI_VIDEO_CHUNK_ID) ||
+          !writeU32LE(recordingFile, AVI_KEYFRAME_FLAG) ||
+          !writeU32LE(recordingFile, recordingIndex[i].offset) ||
+          !writeU32LE(recordingFile, recordingIndex[i].size)) {
+        return false;
+      }
+    }
+  } else if (recordingIndexEnabled) {
+    disableRecordingIndex("index/frame mismatch");
   }
 
   recordingFile.flush();
 
   uint32_t riffSize = (uint32_t)recordingFile.size() - 8UL;
-  if (!writeAviHeader(recordingFile, riffSize, durationMs, recordingFrameCount, recordingMaxFrameSize, recordingWidth, recordingHeight, recordingMoviListSize)) {
+  if (!writeAviHeader(recordingFile, riffSize, durationMs, recordingFrameCount, recordingMaxFrameSize, recordingWidth, recordingHeight, recordingMoviListSize, writeIndex)) {
     return false;
   }
 
@@ -6219,31 +6380,40 @@ static void stopRecordingSession(bool keepFile) {
   resetRecordingState();
 }
 
-static bool appendRecordingFrame(camera_fb_t *fb) {
-  if (!recordingFile || !fb || fb->format != PIXFORMAT_JPEG) {
+static bool appendRecordingFrame(const OwnedJpegFrame &frame) {
+  if (!recordingFile || !frame.data || frame.len == 0U) {
     return false;
   }
 
   if (recordingWidth == 0 || recordingHeight == 0) {
-    recordingWidth = fb->width;
-    recordingHeight = fb->height;
+    recordingWidth = frame.width;
+    recordingHeight = frame.height;
   }
-  recordingMaxFrameSize = std::max(recordingMaxFrameSize, (uint32_t)fb->len);
+  if (frame.len > 0xFFFFFFFFUL) {
+    return false;
+  }
+  recordingMaxFrameSize = std::max(recordingMaxFrameSize, (uint32_t)frame.len);
 
   AviIndexEntry entry;
   // idx1 offsets are relative to the start of the movi list payload, whose
   // first four bytes are the literal "movi" tag.
   entry.offset = recordingMoviListSize;
-  entry.size = (uint32_t)fb->len;
+  entry.size = (uint32_t)frame.len;
+
+  size_t padding = frame.len & 1U;
+  uint32_t chunkSpan = 8U + (uint32_t)frame.len + (uint32_t)padding;
+  if (0xFFFFFFFFUL - recordingMoviListSize < chunkSpan) {
+    Serial.println("[REC] AVI size limit reached; stopping recording");
+    return false;
+  }
 
   if (!writeAviChunkHeader(recordingFile, AVI_VIDEO_CHUNK_ID, entry.size)) {
     return false;
   }
-  if (!writeMjpegFramePayload(recordingFile, fb->buf, fb->len)) {
+  if (!writeMjpegFramePayload(recordingFile, frame.data, frame.len)) {
     return false;
   }
 
-  size_t padding = fb->len & 1U;
   if (padding != 0U) {
     uint8_t zero = 0;
     if (recordingFile.write(&zero, 1) != 1) {
@@ -6251,14 +6421,16 @@ static bool appendRecordingFrame(camera_fb_t *fb) {
     }
   }
 
-  recordingIndex.push_back(entry);
-  recordingMoviListSize += 8U + (uint32_t)fb->len + (uint32_t)padding;
+  if (canStoreRecordingIndexEntry()) {
+    recordingIndex.push_back(entry);
+  }
+  recordingMoviListSize += chunkSpan;
 
   return true;
 }
 
-static bool recordFrameIfDue(camera_fb_t *fb, unsigned long now) {
-  if (!fb || !recordingMutex) {
+static bool recordFrameIfDue(const OwnedJpegFrame &frame, unsigned long now) {
+  if (!frame.data || frame.len == 0U || !recordingMutex) {
     return false;
   }
 
@@ -6266,7 +6438,7 @@ static bool recordFrameIfDue(camera_fb_t *fb, unsigned long now) {
   if (xSemaphoreTake(recordingMutex, portMAX_DELAY) == pdTRUE) {
     if (recordingActive &&
         (recordingLastFrameAt == 0 || (now - recordingLastFrameAt) >= RECORDING_FRAME_INTERVAL_MS)) {
-      ok = appendRecordingFrame(fb);
+      ok = appendRecordingFrame(frame);
       if (ok) {
         recordingLastFrameAt = now;
         ++recordingFrameCount;
@@ -6303,8 +6475,14 @@ static void serviceRecording() {
     return;
   }
 
-  recordFrameIfDue(fb, now);
+  OwnedJpegFrame frame;
+  bool copied = copyCameraFrame(fb, frame);
   unlockCameraFrame(fb);
+  if (!copied) {
+    return;
+  }
+
+  recordFrameIfDue(frame, now);
 }
 
 static bool startRecordingSessionInternal(String &message) {
