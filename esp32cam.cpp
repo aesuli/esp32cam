@@ -52,6 +52,19 @@
 #define FIRMWARE_VERSION "dev"
 #endif
 
+// ─── Semaphore helpers ────────────────────────────────────────────────────────
+// Safely acquire semaphore with timeout and auto-release guard
+#define ACQUIRE_SEMAPHORE(mutex, timeout_ms, acquired_var) \
+  bool acquired_var = false; \
+  if ((mutex) && xSemaphoreTake((mutex), pdMS_TO_TICKS(timeout_ms)) == pdTRUE) { \
+    acquired_var = true; \
+  }
+
+#define RELEASE_SEMAPHORE(mutex) \
+  if ((mutex) && acquired_var) { \
+    xSemaphoreGive((mutex)); \
+  }
+
 // ─── Pin definitions ──────────────────────────────────────────────────────────
 // Button wiring: one side to GPIO13, other side to GND (INPUT_PULLUP, active LOW).
 // PIR wiring: VCC -> 5V (or module-supported rail), DATA -> GPIO12, GND -> GND.
@@ -98,6 +111,30 @@ static constexpr uint32_t CAMERA_XCLK_FREQS_HZ[] = {
 #define CAPTURE_COUNTER_FILE_PATH "/capture_counter.txt"
 #define SD_SORT_FILE_PATH "/.sort"
 
+// ─── HTTP status codes ────────────────────────────────────────────────────────
+static constexpr int HTTP_OK = 200;
+static constexpr int HTTP_BAD_REQUEST = 400;
+static constexpr int HTTP_UNAUTHORIZED = 401;
+static constexpr int HTTP_FORBIDDEN = 403;
+static constexpr int HTTP_NOT_FOUND = 404;
+static constexpr int HTTP_INTERNAL_ERROR = 500;
+
+// ─── HTTP parameter names ────────────────────────────────────────────────────
+static constexpr const char* PARAM_SSID = "ssid";
+static constexpr const char* PARAM_WPASS = "wpass";
+static constexpr const char* PARAM_APASS = "apass";
+static constexpr const char* PARAM_FILE = "file";
+static constexpr const char* PARAM_INDEX = "index";
+static constexpr const char* PARAM_CURRENT = "current";
+static constexpr const char* PARAM_NEXT = "next";
+static constexpr const char* PARAM_CONFIRM = "confirm";
+
+// ─── HTTP error messages ──────────────────────────────────────────────────────
+static constexpr const char* ERR_FILE_REQUIRED = "file parameter required";
+static constexpr const char* ERR_INVALID_PATH = "Invalid file path";
+static constexpr const char* ERR_ACCESS_DENIED = "Access denied";
+static constexpr const char* ERR_UNAUTHORIZED = "Unauthorized";
+
 // ─── Globals ──────────────────────────────────────────────────────────────────
 static constexpr uint16_t HTTP_MAIN_PORT = 80;
 static constexpr uint16_t HTTP_STREAM_PORT = 81;
@@ -133,6 +170,8 @@ static volatile uint32_t motionEdgeCount = 0;
 static uint8_t motionPendingImages = 0;
 static bool   motionVideoManagedRecording = false;
 static bool   motionActionWindowActive = false;
+static bool   motionNotifyPending = false;
+static unsigned long motionNotifyLastAttemptAt = 0;
 static bool   deferredNetworkStartupPending = false;
 static volatile bool staLinkUp = false;
 static unsigned long lastUrlAccessBlink = 0;
@@ -150,6 +189,7 @@ static esp_sleep_wakeup_cause_t bootWakeCause = ESP_SLEEP_WAKEUP_UNDEFINED;
 static constexpr unsigned long LED_ACCESS_BLINK_INTERVAL_MS = 100;  // Minimum interval between access blinks
 static constexpr unsigned long STA_RECONNECT_INTERVAL_MS = 30000;
 static constexpr unsigned long STA_CONNECT_TIMEOUT_MS = 20000;
+static constexpr unsigned long MOTION_NOTIFY_RETRY_INTERVAL_MS = 5000;
 static unsigned long cameraIdleTimeoutMs = 3000;
 static unsigned long recordingStartTime = 0;
 static uint32_t recordingDurationMs = 0;
@@ -175,6 +215,7 @@ static uint32_t captureSequence = 0;
 static bool captureSequenceLoaded = false;
 static SemaphoreHandle_t cameraMutex = nullptr;
 static SemaphoreHandle_t recordingMutex = nullptr;
+static SemaphoreHandle_t sdMutex = nullptr;
 static TaskHandle_t streamServerTaskHandle = nullptr;
 static TaskHandle_t transferServerTaskHandle = nullptr;
 static constexpr unsigned long STREAM_FRAME_INTERVAL_MS = 100;
@@ -205,7 +246,11 @@ static bool gLogSdMirrorEnabled = false;
 static bool gSdCardMounted = false;
 
 static bool appendSerialLogChunk(const uint8_t *data, size_t len) {
-  if (!gLoggingEnabled || !gLogSdMirrorEnabled || !data || len == 0 || gLogWriteInProgress) {
+  if (!gLoggingEnabled || !gLogSdMirrorEnabled || motionActionWindowActive || !data || len == 0 || gLogWriteInProgress) {
+    return false;
+  }
+
+  if (!sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
     return false;
   }
 
@@ -216,24 +261,16 @@ static bool appendSerialLogChunk(const uint8_t *data, size_t len) {
     if (!gLogSdReady) {
       gLogSdFailureReported = true;
       gLogWriteInProgress = false;
+      xSemaphoreGive(sdMutex);
       return false;
     }
-  }
-
-  if (!SD_MMC.exists(SERIAL_LOG_FILE_PATH)) {
-    File createFile = SD_MMC.open(SERIAL_LOG_FILE_PATH, FILE_WRITE);
-    if (!createFile) {
-      gLogFileFailureReported = true;
-      gLogWriteInProgress = false;
-      return false;
-    }
-    createFile.close();
   }
 
   File file = SD_MMC.open(SERIAL_LOG_FILE_PATH, FILE_APPEND);
   if (!file) {
     gLogFileFailureReported = true;
     gLogWriteInProgress = false;
+    xSemaphoreGive(sdMutex);
     return false;
   }
 
@@ -246,6 +283,7 @@ static bool appendSerialLogChunk(const uint8_t *data, size_t len) {
   }
 
   gLogWriteInProgress = false;
+  xSemaphoreGive(sdMutex);
   return written == len;
 }
 
@@ -431,6 +469,7 @@ static bool copyCameraFrame(camera_fb_t *fb, OwnedJpegFrame &frame);
 static bool ensureCameraReady(TickType_t timeoutTicks = pdMS_TO_TICKS(5000));
 static void serviceCameraIdleTimeout();
 static bool isRecordingFrameDue(unsigned long now);
+static bool isDeviceBusy();
 static bool recordFrameIfDue(const OwnedJpegFrame &frame, unsigned long now);
 static bool appendRecordingFrame(const OwnedJpegFrame &frame);
 static void stopRecordingSession(bool keepFile);
@@ -451,6 +490,7 @@ static void handleWakeupIndicator();
 static void serviceButtonSleepRequest();
 static void serviceMotionDetection();
 static void serviceMotionActions();
+static void serviceMotionNotifyRetry();
 static void serviceMotionAutoStandby();
 static void serviceDeferredNetworkStartup();
 static void triggerMotionEvent(const char *source);
@@ -467,7 +507,7 @@ static void handleMotionPage();
 static void handleMotionConfigGet();
 static void handleMotionConfigSet();
 static void handleMotionStandby();
-static void sendMotionNotifyRequest(const String &url);
+static bool sendMotionNotifyRequest(const String &url);
 static void prepareDeviceForDeepSleep();
 [[noreturn]] static void enterDeepSleepFromButton();
 [[noreturn]] static void enterDeepSleepNow(const char *reason, int blinkCount, bool allowMotionWake);
@@ -843,7 +883,6 @@ static bool isRecordingFrameDue(unsigned long now) {
 }
 
 static bool saveCaptureSequence(uint32_t value) {
-  SD_MMC.remove(CAPTURE_COUNTER_FILE_PATH);
   File file = SD_MMC.open(CAPTURE_COUNTER_FILE_PATH, FILE_WRITE);
   if (!file) {
     Serial.println("[SEQ] Failed to open capture counter file for write");
@@ -1952,7 +1991,6 @@ static bool saveConfigToSD(const StoredConfig &cfg) {
     return false;
   }
 
-  SD_MMC.remove(CONFIG_FILE_PATH);
   File file = SD_MMC.open(CONFIG_FILE_PATH, FILE_WRITE);
   if (!file) {
     Serial.println("[CFG] Failed to open config file for write");
@@ -2589,7 +2627,6 @@ __APP_NAV__
         <label for="led_access_blink" style="margin:0">Blink on URL access</label>
         <input id="led_access_blink" type="checkbox" style="width:auto">
       </div>
-      <button type="submit">Save</button>
     </form>
     <div id="led_status" class="status"></div>
     <div style="font-size:.85em;color:#bbb;margin-top:10px">When enabled, LED blinks briefly on each URL request. Boot sequences are unaffected.</div>
@@ -2601,7 +2638,6 @@ __APP_NAV__
         <label for="logging_enabled" style="margin:0">Enable serial + file logging</label>
         <input id="logging_enabled" type="checkbox" style="width:auto">
       </div>
-      <button type="submit">Save</button>
     </form>
     <div id="logging_status" class="status"></div>
     <div style="font-size:.85em;color:#bbb;margin-top:10px">Disables all firmware logs globally, including serial output and /log.txt writes.</div>
@@ -2643,7 +2679,6 @@ __APP_NAV__
           <option value="78">19.5 dBm (max)</option>
         </select>
       </div>
-      <button type="submit">Save</button>
     </form>
     <div id="txpower_status" class="status"></div>
     <div style="font-size:.85em;color:#bbb;margin-top:10px">Lower TX power reduces consumption. AP fallback clients are nearby so 8.5 dBm is a reasonable default. Changes apply immediately.</div>
@@ -2775,10 +2810,15 @@ function refreshLedStatus(){
     id('led_access_blink').checked=d.ledAccessBlink||false;
   }).catch(function(){});
 }
+function saveLedSettings(){
+  setLedStatus('Saving...',false);
+  fetch('/admin/led',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({ledAccessBlink:id('led_access_blink').checked?'1':'0'})}).then(function(r){r.text().then(function(msg){setLedStatus(msg||'Saved',!r.ok);refreshLedStatus();});}).catch(function(err){setLedStatus(err.message||'Failed to save LED settings',true);});
+}
 id('led_form').addEventListener('submit',function(e){
   e.preventDefault();
-  fetch('/admin/led',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({ledAccessBlink:id('led_access_blink').checked?'1':'0'})}).then(function(r){r.text().then(function(msg){setLedStatus(msg||'Saved',!r.ok);refreshLedStatus();});});
+  saveLedSettings();
 });
+id('led_access_blink').addEventListener('change',saveLedSettings);
 function refreshLoggingStatus(){
   fetch('/admin/logging').then(function(r){
     if(!r.ok){throw new Error('Failed to load logging settings');}
@@ -2787,10 +2827,15 @@ function refreshLoggingStatus(){
     id('logging_enabled').checked=d.loggingEnabled!==false;
   }).catch(function(){});
 }
+function saveLoggingSettings(){
+  setLoggingStatus('Saving...',false);
+  fetch('/admin/logging',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({loggingEnabled:id('logging_enabled').checked?'1':'0'})}).then(function(r){r.text().then(function(msg){setLoggingStatus(msg||'Saved',!r.ok);refreshLoggingStatus();});}).catch(function(err){setLoggingStatus(err.message||'Failed to save logging settings',true);});
+}
 id('logging_form').addEventListener('submit',function(e){
   e.preventDefault();
-  fetch('/admin/logging',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({loggingEnabled:id('logging_enabled').checked?'1':'0'})}).then(function(r){r.text().then(function(msg){setLoggingStatus(msg||'Saved',!r.ok);refreshLoggingStatus();});});
+  saveLoggingSettings();
 });
+id('logging_enabled').addEventListener('change',saveLoggingSettings);
 function refreshTxPower(){
   fetch('/admin/txpower').then(function(r){
     if(!r.ok){throw new Error('Failed to load TX power settings');}
@@ -2801,10 +2846,16 @@ function refreshTxPower(){
     for(var i=0;i<aSel.options.length;i++){if(parseInt(aSel.options[i].value)===d.txPowerAp){aSel.selectedIndex=i;break;}}
   }).catch(function(){});
 }
+function saveTxPowerSettings(){
+  setTxPowerStatus('Saving...',false);
+  fetch('/admin/txpower',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({txPowerSta:id('txpower_sta').value,txPowerAp:id('txpower_ap').value})}).then(function(r){r.text().then(function(msg){setTxPowerStatus(msg||'Saved',!r.ok);});}).catch(function(err){setTxPowerStatus(err.message||'Failed to save TX power settings',true);});
+}
 id('txpower_form').addEventListener('submit',function(e){
   e.preventDefault();
-  fetch('/admin/txpower',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({txPowerSta:id('txpower_sta').value,txPowerAp:id('txpower_ap').value})}).then(function(r){r.text().then(function(msg){setTxPowerStatus(msg||'Saved',!r.ok);});});
+  saveTxPowerSettings();
 });
+id('txpower_sta').addEventListener('change',saveTxPowerSettings);
+id('txpower_ap').addEventListener('change',saveTxPowerSettings);
 id('firmware_form').addEventListener('submit',function(e){
   e.preventDefault();
   var input=id('firmware_file');
@@ -2870,6 +2921,7 @@ header h1{color:#e94560;font-size:1.3em}
 .actions{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap}
 .actions label,.actions button{background:#16213e;color:#fff;border:1px solid #234573;padding:8px 12px;border-radius:4px;cursor:pointer;font-size:.9em}
 .actions button:hover{background:#234573}
+.actions button:disabled{opacity:.55;cursor:not-allowed}
 .actions input[type=file]{display:none}
 .folder-create{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
 .folder-create input{background:#16213e;color:#fff;border:1px solid #234573;padding:8px 10px;border-radius:4px;min-width:200px}
@@ -2892,13 +2944,18 @@ header h1{color:#e94560;font-size:1.3em}
 .file-list{display:flex;flex-direction:column;gap:12px}
 .group{background:#16213e;border:1px solid #234573;border-radius:8px;padding:10px}
 .group h3{color:#7dd3fc;font-size:.95em;margin-bottom:8px}
-.file-item{display:flex;justify-content:space-between;align-items:center;gap:10px;background:#0f3460;padding:10px;border-radius:6px;border:1px solid #234573;margin-bottom:8px}
-.file-left{display:flex;align-items:center;gap:10px;min-width:0}
+.selection-summary{font-size:.82em;color:#bbb;margin:-2px 0 10px}
+.file-item{display:flex;align-items:center;gap:8px;background:#0f3460;padding:10px;border-radius:6px;border:1px solid #234573;margin-bottom:8px}
+.file-item.selected{border-color:#7dd3fc;box-shadow:0 0 0 1px rgba(125,211,252,.35)}
+.item-select{display:flex;align-items:center;justify-content:center;flex:0 0 auto;margin-right:2px}
+.item-select input{width:18px;height:18px;cursor:pointer}
+.file-left{display:flex;align-items:center;gap:10px;min-width:0;flex:1 1 auto}
 .thumb{width:72px;height:54px;border-radius:4px;object-fit:cover;background:#111;border:1px solid #234573;display:block}
 .meta{display:flex;flex-direction:column;min-width:0}
 .meta strong{color:#eee;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:360px}
 .meta span{font-size:.82em;color:#bbb}
 .file-actions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+.file-actions{margin-left:auto}
 .file-actions a,.file-actions button{background:#e94560;color:#fff;border:none;border-radius:4px;padding:6px 10px;cursor:pointer;text-decoration:none;font-size:.8em}
 .file-actions button:hover,.file-actions a:hover{background:#c73652}
 .empty{text-align:center;padding:40px;color:#bbb}
@@ -2913,6 +2970,9 @@ __APP_NAV__
 <div class="container">
   <div class="actions">
     <button onclick="loadFiles()">Refresh</button>
+    <button id="select_all" onclick="toggleSelectAllFiles()" disabled>Select All</button>
+    <button id="download_selected" onclick="downloadSelectedFiles()" disabled>Download Selected</button>
+    <button id="delete_selected" onclick="deleteSelectedFiles()" disabled>Delete Selected</button>
     <label>Upload: <input id="upload_file" type="file" onchange="uploadFile(this)"></label>
   </div>
   <div class="folder-create">
@@ -2946,6 +3006,9 @@ var allItems=[];
 var currentDir='/';
 var transferBase='http://'+window.location.hostname+':82';
 var transferToken=encodeURIComponent('__ROUTE_TOKEN__');
+var selectedFiles={};
+var visibleFileOrder=[];
+var lastSelectionAnchor='';
 function esc(s){return String(s).replace(/[&<>\"']/g,function(ch){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[ch];});}
 function setStatus(msg,isError){
   var el=document.getElementById('status');
@@ -2979,6 +3042,138 @@ function formatSize(bytes){
   if(n<1024)return n+' B';
   if(n<1024*1024)return (n/1024).toFixed(1)+' KB';
   return (n/(1024*1024)).toFixed(2)+' MB';
+}
+function quotedName(path){
+  return '"'+baseName(path)+'"';
+}
+function getSelectedFiles(){
+  return Object.keys(selectedFiles).filter(function(path){return !!selectedFiles[path];});
+}
+function getVisibleFilePaths(){
+  return visibleFileOrder.slice();
+}
+function syncSelectedFiles(){
+  var valid={};
+  allItems.forEach(function(item){
+    if(!item.isDir && selectedFiles[item.path]){
+      valid[item.path]=true;
+    }
+  });
+  selectedFiles=valid;
+}
+function updateBulkDeleteButton(){
+  var count=getSelectedFiles().length;
+  var visiblePaths=getVisibleFilePaths();
+  var visibleCount=visiblePaths.length;
+  var selectedVisibleCount=visiblePaths.filter(function(path){return !!selectedFiles[path];}).length;
+  var allVisibleSelected=visibleCount>0&&selectedVisibleCount===visibleCount;
+  var deleteButton=document.getElementById('delete_selected');
+  var downloadButton=document.getElementById('download_selected');
+  var selectAllButton=document.getElementById('select_all');
+  var hasSelection=count>0;
+  deleteButton.disabled=!hasSelection;
+  downloadButton.disabled=!hasSelection;
+  selectAllButton.disabled=visibleCount===0;
+  selectAllButton.textContent=allVisibleSelected?'Clear All':'Select All';
+  deleteButton.textContent=hasSelection?'Delete Selected ('+count+')':'Delete Selected';
+  downloadButton.textContent=hasSelection?'Download Selected ('+count+')':'Download Selected';
+}
+function toggleFileSelection(path,checked){
+  var normalized=String(path||'');
+  if(!normalized)return;
+  if(checked) selectedFiles[normalized]=true;
+  else delete selectedFiles[normalized];
+  lastSelectionAnchor=normalized;
+  applySortAndRender();
+}
+function applyRangeSelection(anchorPath,targetPath,checked){
+  var paths=getVisibleFilePaths();
+  var start=paths.indexOf(anchorPath);
+  var end=paths.indexOf(targetPath);
+  if(start<0||end<0){
+    toggleFileSelection(targetPath,checked);
+    return;
+  }
+  var low=Math.min(start,end);
+  var high=Math.max(start,end);
+  for(var i=low;i<=high;i++){
+    if(checked) selectedFiles[paths[i]]=true;
+    else delete selectedFiles[paths[i]];
+  }
+  lastSelectionAnchor=targetPath;
+  applySortAndRender();
+}
+function onFileCheckboxClick(path,input,event){
+  var checked=!!(input&&input.checked);
+  var useRange=!!(event&&event.shiftKey&&lastSelectionAnchor);
+  if(useRange){
+    applyRangeSelection(lastSelectionAnchor,path,checked);
+    return;
+  }
+  toggleFileSelection(path,checked);
+}
+function toggleSelectAllFiles(){
+  var paths=getVisibleFilePaths();
+  if(!paths.length){
+    setStatus('No files to select in this folder.',true);
+    return;
+  }
+  var allSelected=paths.every(function(path){return !!selectedFiles[path];});
+  if(allSelected){
+    paths.forEach(function(path){delete selectedFiles[path];});
+    setStatus('Selection cleared.',false);
+  }else{
+    paths.forEach(function(path){selectedFiles[path]=true;});
+    setStatus(paths.length+' file(s) selected.',false);
+  }
+  lastSelectionAnchor='';
+  applySortAndRender();
+}
+function buildDeleteBody(paths){
+  return paths.map(function(path){return 'file='+encodeURIComponent(path);}).join('&');
+}
+function deleteFiles(paths){
+  var items=(paths||[]).filter(function(path){return !!path;});
+  if(!items.length){
+    setStatus('Select at least one file to delete.',true);
+    return Promise.resolve(false);
+  }
+  var label=items.length===1?quotedName(items[0]):String(items.length)+' files';
+  setStatus('Deleting '+label+'...',false);
+  return fetch('/sd/delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:buildDeleteBody(items)}).then(function(r){
+    return r.text().then(function(t){
+      if(!r.ok){throw new Error(t||'Delete failed');}
+      items.forEach(function(path){delete selectedFiles[path];});
+      setStatus(t||'File deleted',false);
+      loadFiles();
+      return true;
+    });
+  }).catch(function(e){
+    setStatus(e.message||'Delete failed',true);
+    return false;
+  });
+}
+function downloadFile(path){
+  var anchor=document.createElement('a');
+  anchor.href=transferBase+'/sd/download?file='+encodeURIComponent(path)+'&t='+transferToken;
+  anchor.download=baseName(path);
+  anchor.style.display='none';
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+}
+function downloadSelectedFiles(){
+  var files=getSelectedFiles();
+  if(!files.length){
+    setStatus('Select at least one file to download.',true);
+    return;
+  }
+  for(var i=0;i<files.length;i++){
+    (function(path,delayMs){
+      setTimeout(function(){downloadFile(path);},delayMs);
+    })(files[i],i*120);
+  }
+  setStatus('Started '+files.length+' download(s). Your browser may ask for permission.',false);
 }
 function renderCrumbs(){
   var el=document.getElementById('crumbs');
@@ -3036,6 +3231,12 @@ function sortItems(items){
 }
 function renderItems(items){
   var list=document.getElementById('file_list');
+  syncSelectedFiles();
+  visibleFileOrder=items.filter(function(item){return !item.isDir;}).map(function(item){return item.path;});
+  if(lastSelectionAnchor&&visibleFileOrder.indexOf(lastSelectionAnchor)<0){
+    lastSelectionAnchor='';
+  }
+  updateBulkDeleteButton();
   if(!items.length){
     list.innerHTML='<div class="empty">This folder is empty</div>';
     setStatus('Folder '+currentDir+' is empty.',false);
@@ -3046,8 +3247,14 @@ function renderItems(items){
   items.forEach(function(f){if(!f.isDir)totalSize+=Number(f.size)||0;});
 
   var rows=items.map(function(item){
+    var isSelected=!!selectedFiles[item.path];
+    var selectionClass=isSelected?' selected':'';
+    var selectionCell=item.isDir
+      ?'<div class="item-select"></div>'
+      :'<label class="item-select" aria-label="Select '+esc(item.name)+'"><input type="checkbox" '+(isSelected?'checked ':'')+'onclick="onFileCheckboxClick(\''+item.path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\',this,event)"></label>';
     if(item.isDir){
-      return '<div class="file-item">'
+      return '<div class="file-item'+selectionClass+'">'
+        +selectionCell
         +'<div class="file-left" ondblclick="openDir(\''+item.path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\')"><div class="thumb"></div><div class="meta"><strong>'+esc(item.name)+'</strong><span>Folder • '+esc(item.path)+'</span></div></div>'
         +'<div class="file-actions"><button onclick="openDir(\''+item.path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\')">Open</button><button onclick="deleteFolder(\''+item.path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\')">Delete</button></div>'
         +'</div>';
@@ -3056,13 +3263,16 @@ function renderItems(items){
     var preview=isImage(item.path)
       ?'<img class="thumb" loading="lazy" src="'+transferBase+'/sd/view?file='+encodeURIComponent(item.path)+'&t='+transferToken+'" alt="preview">'
       :'<div class="thumb"></div>';
-    return '<div class="file-item">'
+    return '<div class="file-item'+selectionClass+'">'
+      +selectionCell
       +'<div class="file-left" ondblclick="openFile(\''+item.path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\')">'+preview+'<div class="meta"><strong>'+esc(item.name)+'</strong><span>'+formatSize(item.size)+' • '+esc(item.path)+'</span></div></div>'
       +'<div class="file-actions"><a href="'+transferBase+'/sd/download?file='+encodeURIComponent(item.path)+'&t='+transferToken+'">Download</a><a href="#" onclick="openFile(\''+item.path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\');return false;">Open</a><button onclick="deleteFile(\''+item.path.replace(/\\/g,'\\\\').replace(/'/g,"\\'")+'\')">Delete</button></div>'
       +'</div>';
   }).join('');
 
-  list.innerHTML='<section class="group"><h3>'+esc(currentDir)+'</h3>'+rows+'</section>';
+  var selectedCount=getSelectedFiles().length;
+  var summary=selectedCount>0?'<div class="selection-summary">'+selectedCount+' file(s) selected</div>':'';
+  list.innerHTML='<section class="group"><h3>'+esc(currentDir)+'</h3>'+summary+rows+'</section>';
   var fileCount=items.filter(function(i){return !i.isDir;}).length;
   var dirCount=items.filter(function(i){return i.isDir;}).length;
   setStatus(dirCount+' folder(s), '+fileCount+' file(s), '+formatSize(totalSize),false);
@@ -3100,22 +3310,28 @@ function loadFiles(){
   }).then(function(d){
     currentDir=normalizePath(d.dir||currentDir);
     allItems=d.items||[];
+    syncSelectedFiles();
     applySortAndRender();
   }).catch(function(e){
     document.getElementById('file_list').innerHTML='<div class="empty">Error loading files</div>';
+    visibleFileOrder=[];
+    lastSelectionAnchor='';
+    updateBulkDeleteButton();
     setStatus(e.message||'Failed to load files',true);
   });
 }
 function deleteFile(name){
-  if(!confirm('Delete '+name+'?'))return;
-  setStatus('Deleting '+name+'...',false);
-  fetch('/sd/delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'file='+encodeURIComponent(name)}).then(function(r){
-    return r.text().then(function(t){
-      if(!r.ok){throw new Error(t||'Delete failed');}
-      setStatus(t||'File deleted',false);
-      loadFiles();
-    });
-  }).catch(function(e){setStatus(e.message||'Delete failed',true);});
+  if(!confirm('Delete '+quotedName(name)+'?'))return;
+  deleteFiles([name]);
+}
+function deleteSelectedFiles(){
+  var files=getSelectedFiles();
+  if(!files.length){
+    setStatus('Select at least one file to delete.',true);
+    return;
+  }
+  if(!confirm('Delete '+files.length+' selected file(s)?'))return;
+  deleteFiles(files);
 }
 function createFolder(){
   var input=document.getElementById('new_folder_name');
@@ -3366,6 +3582,7 @@ static bool checkAuth();
 static bool checkAuth(WebServer &srv, bool allowSharedToken = false);
 static bool hasSharedAccessToken(WebServer &srv);
 static String buildLocalUrl(uint16_t port, const String &path, bool withToken = false);
+static void sendTransferError(WebServer &srv, int statusCode, const char *message);
 static void handleStreamMain();
 static void handleStreamClose();
 static void handleStreamWorker();
@@ -3525,6 +3742,7 @@ static void handleStreamWorker() {
 
     streamClientAbortRequested = false;
     streamClientConnected = false;
+    noteAuthenticatedWebActivity();
     client.stop();
     setWifiModemSleep(true, "idle");
     Serial.println("[STREAM] Client disconnected");
@@ -4178,7 +4396,6 @@ static void loadSDSortPreferences(String &sortBy, String &sortDir) {
 }
 
 static bool saveSDSortPreferences(const String &sortBy, const String &sortDir) {
-  SD_MMC.remove(SD_SORT_FILE_PATH);
   File file = SD_MMC.open(SD_SORT_FILE_PATH, FILE_WRITE);
   if (!file) {
     return false;
@@ -4633,6 +4850,7 @@ __APP_NAV__
     <div class="cg"><label><input id="enabled" type="checkbox"> Enable motion detection</label></div>
     <div class="cg"><label><input id="wake_on_motion" type="checkbox"> Wake up on motion</label></div>
     <div class="cg"><label><input id="auto_standby" type="checkbox"> Automatic stand-by</label></div>
+    <div class="small">When the device enters stand-by, the next motion wake is handled immediately.</div>
 
     <div class="cg row">
       <label for="standby_after_sec">No activity before stand-by (seconds)</label>
@@ -4666,6 +4884,7 @@ __APP_NAV__
         <option value="600">+10 minutes</option>
       </select>
     </div>
+    <div class="small">This cooldown applies only while the device is awake. A motion wake from stand-by ignores the cooldown once, then the cooldown resumes after that event completes.</div>
 
     <div class="cg row">
       <label for="notify_url">Notify URL (GET on motion detect)</label>
@@ -5086,10 +5305,14 @@ static void handleSDList() {
   server.send(200, "application/json", json);
 }
 
+static void sendTransferError(WebServer &srv, int statusCode, const char *message) {
+  srv.sendHeader("Access-Control-Allow-Origin", "*");
+  srv.send(statusCode, "text/plain", message);
+}
+
 static void handleSDDownloadWorker() {
   if (!checkAuth(transferServer, true)) {
-    transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(401, "text/plain", "Unauthorized");
+    sendTransferError(transferServer, HTTP_UNAUTHORIZED, ERR_UNAUTHORIZED);
     return;
   }
 
@@ -5592,21 +5815,45 @@ static void handleSDDelete() {
     return;
   }
 
-  String filePath;
-  if (!normalizeAndValidateSDPath(server.arg("file"), filePath)) {
-    server.send(400, "text/plain", "Invalid file path");
+  std::vector<String> filePaths;
+  filePaths.reserve(server.args());
+  for (int index = 0; index < server.args(); ++index) {
+    if (server.argName(index) != "file") {
+      continue;
+    }
+
+    String filePath;
+    if (!normalizeAndValidateSDPath(server.arg(index), filePath)) {
+      server.send(400, "text/plain", "Invalid file path");
+      return;
+    }
+
+    if (isProtectedSDPath(filePath)) {
+      server.send(403, "text/plain", "Access denied");
+      return;
+    }
+
+    if (std::find(filePaths.begin(), filePaths.end(), filePath) == filePaths.end()) {
+      filePaths.push_back(filePath);
+    }
+  }
+
+  if (filePaths.empty()) {
+    server.send(400, "text/plain", "file parameter required");
     return;
   }
 
-  if (isProtectedSDPath(filePath)) {
-    server.send(403, "text/plain", "Access denied");
-    return;
+  for (const String &filePath : filePaths) {
+    if (!SD_MMC.remove(filePath)) {
+      server.send(500, "text/plain", filePaths.size() > 1 ? "Failed to delete one or more files" : "Failed to delete file");
+      return;
+    }
   }
 
-  if (SD_MMC.remove(filePath)) {
+  if (filePaths.size() == 1) {
     server.send(200, "text/plain", "File deleted");
   } else {
-    server.send(500, "text/plain", "Failed to delete file");
+    server.send(200, "text/plain", String(filePaths.size()) + " files deleted");
   }
 }
 
@@ -6157,48 +6404,44 @@ static void handleFirmwareUploadMain() {
 }
 
 static bool captureImageToSD(String &savedPath) {
-  if (!initSDCard()) {
+  if (!sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(500)) != pdTRUE) {
     return false;
   }
 
-  if (!ensureCaptureDirectory()) {
-    return false;
-  }
-
+  bool ok = false;
   uint32_t sequence = 0;
-  if (!nextCaptureSequence(sequence)) {
-    return false;
-  }
+  camera_fb_t *fb = nullptr;
+
+  if (!initSDCard()) goto cleanup;
+  if (!ensureCaptureDirectory()) goto cleanup;
+  if (!nextCaptureSequence(sequence)) goto cleanup;
 
   savedPath = buildCapturePath(sequence, "jpg");
 
-  if (!ensureCameraReady()) {
-    return false;
+  if (!ensureCameraReady()) goto cleanup;
+
+  fb = lockAndCaptureFrame(pdMS_TO_TICKS(1000));
+  if (!fb) goto cleanup;
+
+  {
+    OwnedJpegFrame frame;
+    bool copied = copyCameraFrame(fb, frame);
+    unlockCameraFrame(fb);
+    if (!copied) goto cleanup;
+
+    File file = SD_MMC.open(savedPath, FILE_WRITE);
+    if (!file) goto cleanup;
+
+    ok = file.write(frame.data, frame.len) == frame.len;
+    file.close();
+
+    if (!ok) {
+      SD_MMC.remove(savedPath);
+    }
   }
 
-  camera_fb_t *fb = lockAndCaptureFrame(pdMS_TO_TICKS(1000));
-  if (!fb) {
-    return false;
-  }
-
-  OwnedJpegFrame frame;
-  bool copied = copyCameraFrame(fb, frame);
-  unlockCameraFrame(fb);
-  if (!copied) {
-    return false;
-  }
-
-  File file = SD_MMC.open(savedPath, FILE_WRITE);
-  if (!file) {
-    return false;
-  }
-
-  bool ok = file.write(frame.data, frame.len) == frame.len;
-  file.close();
-
-  if (!ok) {
-    SD_MMC.remove(savedPath);
-  }
+cleanup:
+  xSemaphoreGive(sdMutex);
   return ok;
 }
 
@@ -6429,15 +6672,23 @@ static bool appendRecordingFrame(const OwnedJpegFrame &frame) {
   return true;
 }
 
+static bool isDeviceBusy() {
+  return recordingActive || motionPendingImages > 0 || motionVideoManagedRecording || streamClientConnected;
+}
+
 static bool recordFrameIfDue(const OwnedJpegFrame &frame, unsigned long now) {
-  if (!frame.data || frame.len == 0U || !recordingMutex) {
+  if (!frame.data || frame.len == 0U || !recordingMutex || !sdMutex) {
     return false;
   }
 
-  bool ok = true;
-  if (xSemaphoreTake(recordingMutex, portMAX_DELAY) == pdTRUE) {
-    if (recordingActive &&
-        (recordingLastFrameAt == 0 || (now - recordingLastFrameAt) >= RECORDING_FRAME_INTERVAL_MS)) {
+  bool ok = false;
+  if (xSemaphoreTake(recordingMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
+    return false;
+  }
+
+  if (recordingActive &&
+      (recordingLastFrameAt == 0 || (now - recordingLastFrameAt) >= RECORDING_FRAME_INTERVAL_MS)) {
+    if (xSemaphoreTake(sdMutex, pdMS_TO_TICKS(100)) == pdTRUE) {
       ok = appendRecordingFrame(frame);
       if (ok) {
         recordingLastFrameAt = now;
@@ -6449,9 +6700,10 @@ static bool recordFrameIfDue(const OwnedJpegFrame &frame, unsigned long now) {
         Serial.println("[REC] Failed to write frame; aborting recording");
         stopRecordingSession(false);
       }
+      xSemaphoreGive(sdMutex);
     }
-    xSemaphoreGive(recordingMutex);
   }
+  xSemaphoreGive(recordingMutex);
 
   return ok;
 }
@@ -6942,16 +7194,30 @@ static void prepareDeviceForDeepSleep() {
 static void closeMotionActionWindow() {
   motionActionWindowActive = false;
   motionIgnoreUntilAt = millis() + ((unsigned long)runtimeConfig.motionSettings.detectionIntervalSec * 1000UL);
+
+  if (motionNotifyPending) {
+    if (sendMotionNotifyRequest(runtimeConfig.motionSettings.notifyUrl)) {
+      motionNotifyPending = false;
+      motionNotifyLastAttemptAt = 0;
+    } else {
+      motionNotifyLastAttemptAt = millis();
+    }
+  }
 }
 
-static void sendMotionNotifyRequest(const String &url) {
+static bool sendMotionNotifyRequest(const String &url) {
   if (url.isEmpty()) {
-    return;
+    return true;
+  }
+
+  if (!staLinkUp || WiFi.status() != WL_CONNECTED) {
+    Serial.println("[MOTION] Notify deferred (WiFi not connected)");
+    return false;
   }
 
   if (!url.startsWith("http://") && !url.startsWith("https://")) {
     Serial.printf("[MOTION] Notify URL ignored (must start with http:// or https://): %s\n", url.c_str());
-    return;
+    return true;
   }
 
   HTTPClient http;
@@ -6959,7 +7225,7 @@ static void sendMotionNotifyRequest(const String &url) {
   http.setTimeout(2500);
   if (!http.begin(url)) {
     Serial.printf("[MOTION] Notify request failed to begin: %s\n", url.c_str());
-    return;
+    return false;
   }
 
   int status = http.GET();
@@ -6969,6 +7235,7 @@ static void sendMotionNotifyRequest(const String &url) {
     Serial.printf("[MOTION] Notify GET error %d for %s\n", status, url.c_str());
   }
   http.end();
+  return status > 0;
 }
 
 static void triggerMotionEvent(const char *source) {
@@ -6983,8 +7250,9 @@ static void triggerMotionEvent(const char *source) {
   motionPendingImages = 0;
   motionVideoManagedRecording = false;
   motionRecordingStopAt = 0;
+  motionNotifyPending = !runtimeConfig.motionSettings.notifyUrl.isEmpty();
+  motionNotifyLastAttemptAt = 0;
   Serial.printf("[MOTION] Triggered (%s)\n", source ? source : "runtime");
-  sendMotionNotifyRequest(runtimeConfig.motionSettings.notifyUrl);
 
   if (runtimeConfig.motionSettings.captureImage) {
     motionPendingImages = runtimeConfig.motionSettings.imageCount;
@@ -7054,8 +7322,7 @@ static void serviceMotionDetection() {
     } else {
       motionHighSinceAt = 0;
     }
-    motionActionWindowActive = false;
-    motionIgnoreUntilAt = 0;
+    closeMotionActionWindow();
     noInterrupts();
     motionEdgePending = false;
     interrupts();
@@ -7144,7 +7411,7 @@ static void serviceMotionAutoStandby() {
     return;
   }
 
-  if (recordingActive || motionPendingImages > 0 || motionVideoManagedRecording) {
+  if (isDeviceBusy()) {
     return;
   }
 
@@ -7173,6 +7440,39 @@ static void serviceDeferredNetworkStartup() {
   }
 }
 
+static void serviceMotionNotifyRetry() {
+  if (!motionNotifyPending) {
+    return;
+  }
+
+  if (motionActionWindowActive || motionPendingImages > 0 || motionVideoManagedRecording) {
+    return;
+  }
+
+  if (runtimeConfig.motionSettings.notifyUrl.isEmpty()) {
+    motionNotifyPending = false;
+    motionNotifyLastAttemptAt = 0;
+    return;
+  }
+
+  if (!staLinkUp || WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if (motionNotifyLastAttemptAt != 0
+      && (now - motionNotifyLastAttemptAt) < MOTION_NOTIFY_RETRY_INTERVAL_MS) {
+    return;
+  }
+
+  motionNotifyLastAttemptAt = now;
+  if (sendMotionNotifyRequest(runtimeConfig.motionSettings.notifyUrl)) {
+    motionNotifyPending = false;
+    motionNotifyLastAttemptAt = 0;
+    Serial.println("[MOTION] Deferred notify delivered");
+  }
+}
+
 // ─── Arduino entry points ─────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
@@ -7187,7 +7487,8 @@ void setup() {
 
   cameraMutex = xSemaphoreCreateMutex();
   recordingMutex = xSemaphoreCreateMutex();
-  if (!cameraMutex || !recordingMutex) {
+  sdMutex = xSemaphoreCreateMutex();
+  if (!cameraMutex || !recordingMutex || !sdMutex) {
     Serial.println("[BOOT] Failed to create runtime mutexes — halting");
     for (;;) {
       delay(1000);
@@ -7218,6 +7519,8 @@ void setup() {
   motionRecordingStopAt = 0;
   motionVideoManagedRecording = false;
   motionActionWindowActive = false;
+  motionNotifyPending = false;
+  motionNotifyLastAttemptAt = 0;
   motionIgnoreUntilAt = 0;
   motionBootEventPending = false;
   deferredNetworkStartupPending = false;
@@ -7279,6 +7582,7 @@ void loop() {
   serviceMotionDetection();
   serviceMotionActions();
   serviceDeferredNetworkStartup();
+  serviceMotionNotifyRetry();
   serviceCameraIdleTimeout();
   serviceMotionAutoStandby();
   serviceButtonSleepRequest();

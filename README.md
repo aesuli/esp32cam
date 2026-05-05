@@ -61,9 +61,9 @@ The web interface is composed of four main pages:
 - Optional wake on motion (when supported by the selected pin)
 - Optional capture of images on motion (count + interval)
 - Optional video recording on motion (duration)
-- Detection interval (cooldown) between motion events
+- Detection interval (cooldown) between motion events while the device is awake
 - Optional Notify URL (HTTP GET sent when motion is detected)
-- Optional auto-standby after inactivity
+- Optional auto-standby after inactivity; the first motion wake from stand-by triggers immediately and starts a new cooldown only after that wake event finishes
 - Manual standby button
 - Live motion graph page with current PIR readings
 
