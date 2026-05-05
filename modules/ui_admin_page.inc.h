@@ -1,0 +1,386 @@
+#pragma once
+
+// Admin page template.
+
+static const char ADMIN_HTML[] PROGMEM = R"html(<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32-CAM - Admin</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;min-height:100vh}
+nav{background:#16213e;padding:8px 20px;display:flex;gap:12px;flex-wrap:wrap}
+nav a{color:#eee;text-decoration:none;padding:8px 12px;border-radius:4px;border:1px solid #234573;cursor:pointer}
+nav a:hover{background:#234573}
+header{background:#16213e;padding:12px 20px;display:flex;align-items:center;justify-content:space-between}
+header h1{color:#e94560;font-size:1.3em}
+.panel{flex:1 1 100%;background:#16213e;border-radius:8px;padding:14px;margin:12px;max-width:600px}
+.panel h3{color:#e94560;margin-bottom:12px;font-size:1em}
+.form{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;align-items:end}
+.form label{display:block;font-size:.82em;margin-bottom:3px;color:#bbb}
+.form input,.form select{width:100%;padding:10px;box-sizing:border-box;background:#0f3460;color:#eee;border:1px solid #234573;border-radius:4px}
+.form button{background:#e94560;color:#fff;border:none;border-radius:4px;padding:8px 12px;cursor:pointer}
+.form button:hover{background:#c73652}
+.status{min-height:20px;font-size:.85em;margin-top:10px;color:#7dd3fc}
+.status.error{color:#ff8a8a}
+.list{display:flex;flex-direction:column;gap:10px;margin-top:12px}
+.item{display:flex;justify-content:space-between;align-items:center;gap:10px;background:#0f3460;border-radius:6px;padding:10px 12px}
+.item button{background:#e94560;color:#fff;border:none;border-radius:4px;padding:6px 10px;cursor:pointer;font-size:.8em}
+.item button:hover{background:#c73652}
+.empty{font-size:.85em;color:#bbb}
+@media (max-width:640px){.panel{margin:12px 0}.item{flex-direction:column;align-items:flex-start}}
+</style>
+</head>
+<body>
+__APP_NAV__
+<header>
+  <h1>⚙️ Administration</h1>
+</header>
+<div style="padding:12px;display:flex;flex-wrap:wrap">
+  <div class="panel">
+    <h3>WiFi Priority</h3>
+    <form class="form" id="wifi_form">
+      <div>
+        <label>WiFi SSID</label>
+        <input id="wifi_ssid" type="text" maxlength="32" required>
+      </div>
+      <div>
+        <label>WiFi Password</label>
+        <input id="wifi_wpass" type="password" maxlength="64" placeholder="Leave blank if open">
+      </div>
+      <button type="submit">Add / Update</button>
+    </form>
+    <div style="display:grid;grid-template-columns:1fr auto;gap:8px;margin:10px 0 12px">
+      <select id="wifi_scan_list"><option value="">Scan & select</option></select>
+      <button onclick="scanWiFi()">Scan</button>
+    </div>
+    <div id="wifi_status" class="status"></div>
+    <div class="list" id="wifi_list"></div>
+  </div>
+  <div class="panel">
+    <h3>Admin Password</h3>
+    <form class="form" id="admin_form">
+      <div>
+        <label>Current Password</label>
+        <input id="admin_current" type="password" maxlength="32" required>
+      </div>
+      <div>
+        <label>New Password</label>
+        <input id="admin_new" type="password" minlength="8" maxlength="32" required>
+      </div>
+      <div>
+        <label>Confirm New Password</label>
+        <input id="admin_confirm" type="password" minlength="8" maxlength="32" required>
+      </div>
+      <button type="submit">Change Password</button>
+    </form>
+    <div id="admin_status" class="status"></div>
+  </div>
+  <div class="panel">
+    <h3>Device Name</h3>
+    <form class="form" id="name_form">
+      <div>
+        <label>New Device Name</label>
+        <input id="device_name" type="text" maxlength="32" required>
+      </div>
+      <button type="submit">Change Name</button>
+    </form>
+    <div id="name_status" class="status"></div>
+  </div>
+  <div class="panel">
+    <h3>Time</h3>
+    <div class="status" id="time_now"></div>
+    <form class="form" id="time_form">
+      <div>
+        <label>Manual Local Time</label>
+        <input id="manual_time" type="datetime-local" step="1" required>
+      </div>
+      <button type="submit">Set Time</button>
+      <button type="button" id="ntp_sync_btn">Sync NTP</button>
+    </form>
+    <div id="time_status" class="status"></div>
+  </div>
+  <div class="panel">
+    <h3>LED Control</h3>
+    <form class="form" id="led_form">
+      <div style="display:flex;align-items:center;gap:10px">
+        <label for="led_access_blink" style="margin:0">Blink on URL access</label>
+        <input id="led_access_blink" type="checkbox" style="width:auto">
+      </div>
+    </form>
+    <div id="led_status" class="status"></div>
+    <div style="font-size:.85em;color:#bbb;margin-top:10px">When enabled, LED blinks briefly on each URL request. Boot sequences are unaffected.</div>
+  </div>
+  <div class="panel">
+    <h3>Logging</h3>
+    <form class="form" id="logging_form">
+      <div style="display:flex;align-items:center;gap:10px">
+        <label for="logging_enabled" style="margin:0">Enable serial + file logging</label>
+        <input id="logging_enabled" type="checkbox" style="width:auto">
+      </div>
+    </form>
+    <div id="logging_status" class="status"></div>
+    <div style="font-size:.85em;color:#bbb;margin-top:10px">Disables all firmware logs globally, including serial output and /log.txt writes.</div>
+  </div>
+  <div class="panel">
+    <h3>TX Power</h3>
+    <form class="form" id="txpower_form">
+      <div>
+        <label>STA Mode (dBm)</label>
+        <select id="txpower_sta">
+          <option value="-4">-1 dBm</option>
+          <option value="8">2 dBm</option>
+          <option value="20">5 dBm</option>
+          <option value="28">7 dBm</option>
+          <option value="34">8.5 dBm</option>
+          <option value="44">11 dBm</option>
+          <option value="52">13 dBm</option>
+          <option value="60">15 dBm</option>
+          <option value="68">17 dBm</option>
+          <option value="72">18 dBm</option>
+          <option value="76">19 dBm</option>
+          <option value="78">19.5 dBm (max)</option>
+        </select>
+      </div>
+      <div>
+        <label>AP Fallback Mode (dBm)</label>
+        <select id="txpower_ap">
+          <option value="-4">-1 dBm</option>
+          <option value="8">2 dBm</option>
+          <option value="20">5 dBm</option>
+          <option value="28">7 dBm</option>
+          <option value="34">8.5 dBm</option>
+          <option value="44">11 dBm</option>
+          <option value="52">13 dBm</option>
+          <option value="60">15 dBm</option>
+          <option value="68">17 dBm</option>
+          <option value="72">18 dBm</option>
+          <option value="76">19 dBm</option>
+          <option value="78">19.5 dBm (max)</option>
+        </select>
+      </div>
+    </form>
+    <div id="txpower_status" class="status"></div>
+    <div style="font-size:.85em;color:#bbb;margin-top:10px">Lower TX power reduces consumption. AP fallback clients are nearby so 8.5 dBm is a reasonable default. Changes apply immediately.</div>
+  </div>
+  <div class="panel">
+    <h3>Firmware Update</h3>
+    <div class="status" style="color:#bbb;margin-bottom:10px">Current version: <strong style="color:#eee">__FIRMWARE_VERSION__</strong><br>Build: __FIRMWARE_BUILD__</div>
+    <form class="form" id="firmware_form">
+      <div>
+        <label>Firmware Binary (.bin)</label>
+        <input id="firmware_file" type="file" accept=".bin,application/octet-stream" required>
+      </div>
+      <button type="submit">Upload Firmware</button>
+    </form>
+    <div id="firmware_status" class="status"></div>
+    <div style="font-size:.85em;color:#bbb;margin-top:10px">Upload the compiled firmware binary. The device will reboot automatically after a successful update.</div>
+  </div>
+  <div class="panel">
+    <h3>System Reset</h3>
+    <form class="form" id="reset_form">
+      <button type="submit">Restart Device</button>
+    </form>
+    <div id="reset_status" class="status"></div>
+    <div style="font-size:.85em;color:#bbb;margin-top:10px">Restarts the ESP32-CAM without changing saved settings.</div>
+    <form class="form" id="factory_reset_form" style="margin-top:10px">
+      <button type="submit">Factory Reset (Delete Config)</button>
+    </form>
+    <div id="factory_reset_status" class="status"></div>
+  </div>
+</div>
+__APP_FOOTER__
+<script>
+function id(n){return document.getElementById(n);}
+var transferBase='http://'+window.location.hostname+':82';
+var transferToken=encodeURIComponent('__ROUTE_TOKEN__');
+function setWiFiStatus(msg,err){var e=id('wifi_status');e.textContent=msg;e.className=err?'status error':'status';}
+function setAdminStatus(msg,err){var e=id('admin_status');e.textContent=msg;e.className=err?'status error':'status';}
+function setNameStatus(msg,err){var e=id('name_status');e.textContent=msg;e.className=err?'status error':'status';}
+function setTimeStatus(msg,err){var e=id('time_status');e.textContent=msg;e.className=err?'status error':'status';}
+function setLedStatus(msg,err){var e=id('led_status');e.textContent=msg;e.className=err?'status error':'status';}
+function setLoggingStatus(msg,err){var e=id('logging_status');e.textContent=msg;e.className=err?'status error':'status';}
+function setTxPowerStatus(msg,err){var e=id('txpower_status');e.textContent=msg;e.className=err?'status error':'status';}
+function setFirmwareStatus(msg,err){var e=id('firmware_status');e.textContent=msg;e.className=err?'status error':'status';}
+function setResetStatus(msg,err){var e=id('reset_status');e.textContent=msg;e.className=err?'status error':'status';}
+function setFactoryResetStatus(msg,err){var e=id('factory_reset_status');e.textContent=msg;e.className=err?'status error':'status';}
+function formData(obj){return Object.keys(obj).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(obj[k]);}).join('&');}
+function toDateTimeLocalValue(epoch){
+  var d=new Date((Number(epoch)||0)*1000);
+  if(isNaN(d.getTime())) return '';
+  var pad=function(n){return n<10?'0'+n:String(n);};
+  return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'T'+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());
+}
+function refreshTimeStatus(){
+  fetch('/admin/time').then(function(r){
+    if(!r.ok){throw new Error('Failed to load time status');}
+    return r.json();
+  }).then(function(d){
+    id('time_now').textContent='Current: '+(d.local||'unknown')+' • '+(d.sane?'Clock synced':'Clock not synced')+' • '+(d.wifiConnected?'WiFi connected':'WiFi offline');
+    if(d.epoch){id('manual_time').value=toDateTimeLocalValue(d.epoch);}
+  }).catch(function(e){
+    id('time_now').textContent='Current: unavailable';
+    setTimeStatus(e.message,true);
+  });
+}
+function syncNtpTime(){
+  setTimeStatus('Syncing NTP...',false);
+  fetch('/admin/time/sync',{method:'POST'}).then(function(r){
+    return r.text().then(function(msg){
+      setTimeStatus(msg||'NTP sync request finished',!r.ok);
+      refreshTimeStatus();
+    });
+  }).catch(function(e){setTimeStatus(e.message,true);});
+}
+function refreshDeviceName(){
+  var input=id('device_name');
+  fetch('/admin/name').then(function(r){
+    if(!r.ok){throw new Error('Failed to load device name');}
+    return r.json();
+  }).then(function(d){
+    if(d && typeof d.deviceName==='string' && d.deviceName.length){input.value=d.deviceName;}
+  }).catch(function(){});
+}
+function scanWiFi(){
+  setWiFiStatus('Scanning...',false);
+  fetch('/wifi/scan').then(function(r){return r.json();}).then(function(data){
+    var sel=id('wifi_scan_list');sel.innerHTML='<option value="">Select a network</option>';
+    (data.networks||[]).forEach(function(n){var opt=document.createElement('option');opt.value=n.ssid;opt.textContent=n.ssid+' ('+n.rssi+' dBm)';sel.appendChild(opt);});
+    setWiFiStatus(data.networks.length+' networks found',false);
+  }).catch(function(e){setWiFiStatus(e.message,true);});
+}
+function renderWiFiList(items){
+  var list=id('wifi_list');
+  if(!items.length){list.innerHTML='<div class="empty">No networks saved.</div>';return;}
+  list.innerHTML=items.map(function(item,i){
+    return '<div class="item"><div><strong>'+(i+1)+'. '+item.ssid+'</strong><span style="font-size:.8em;color:#bbb">'+(item.hasPassword?'Protected':'Open')+'</span></div><div style="display:flex;gap:6px"><button onclick="moveWiFi('+i+',\'up\')"'+(i===0?' disabled':'')+'>↑</button><button onclick="moveWiFi('+i+',\'down\')"'+(i===items.length-1?' disabled':'')+'>↓</button><button onclick="deleteWiFi('+i+')">✕</button></div></div>';
+  }).join('');
+}
+function moveWiFi(i,dir){
+  fetch('/wifi/move',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({index:i,dir:dir})}).then(function(r){if(r.ok)refreshWiFiList();setWiFiStatus(r.ok?'Updated':'Failed',!r.ok);});
+}
+function deleteWiFi(i){
+  fetch('/wifi/delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({index:i})}).then(function(r){if(r.ok)refreshWiFiList();setWiFiStatus(r.ok?'Deleted':'Failed',!r.ok);});
+}
+function refreshWiFiList(){fetch('/wifi/list').then(function(r){return r.json();}).then(function(d){renderWiFiList(d.networks||[]);});}
+id('wifi_form').addEventListener('submit',function(e){e.preventDefault();fetch('/wifi/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({ssid:id('wifi_ssid').value,wpass:id('wifi_wpass').value})}).then(function(r){r.text().then(function(msg){setWiFiStatus(msg,!r.ok);if(r.ok){id('wifi_form').reset();refreshWiFiList();id('wifi_scan_list').value='';}});});});
+id('admin_form').addEventListener('submit',function(e){e.preventDefault();fetch('/admin/password',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({current:id('admin_current').value,next:id('admin_new').value,confirm:id('admin_confirm').value})}).then(function(r){r.text().then(function(msg){setAdminStatus(msg,!r.ok);if(r.ok)id('admin_form').reset();});});});
+id('name_form').addEventListener('submit',function(e){e.preventDefault();fetch('/admin/rename',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({name:id('device_name').value})}).then(function(r){r.text().then(function(msg){setNameStatus(msg,!r.ok);if(r.ok)refreshDeviceName();});});});
+id('time_form').addEventListener('submit',function(e){
+  e.preventDefault();
+  var raw=id('manual_time').value;
+  if(!raw){setTimeStatus('Choose a date and time first',true);return;}
+  var dt=new Date(raw);
+  if(isNaN(dt.getTime())){setTimeStatus('Invalid date/time value',true);return;}
+  var epoch=Math.floor(dt.getTime()/1000);
+  fetch('/admin/time/set',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({epoch:epoch})}).then(function(r){
+    return r.text().then(function(msg){
+      setTimeStatus(msg||'Time updated',!r.ok);
+      refreshTimeStatus();
+    });
+  }).catch(function(err){setTimeStatus(err.message,true);});
+});
+id('ntp_sync_btn').addEventListener('click',syncNtpTime);
+id('wifi_scan_list').addEventListener('change',function(){if(this.value)id('wifi_ssid').value=this.value;});
+function refreshLedStatus(){
+  fetch('/admin/led').then(function(r){
+    if(!r.ok){throw new Error('Failed to load LED settings');}
+    return r.json();
+  }).then(function(d){
+    id('led_access_blink').checked=d.ledAccessBlink||false;
+  }).catch(function(){});
+}
+function saveLedSettings(){
+  setLedStatus('Saving...',false);
+  fetch('/admin/led',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({ledAccessBlink:id('led_access_blink').checked?'1':'0'})}).then(function(r){r.text().then(function(msg){setLedStatus(msg||'Saved',!r.ok);refreshLedStatus();});}).catch(function(err){setLedStatus(err.message||'Failed to save LED settings',true);});
+}
+id('led_form').addEventListener('submit',function(e){
+  e.preventDefault();
+  saveLedSettings();
+});
+id('led_access_blink').addEventListener('change',saveLedSettings);
+function refreshLoggingStatus(){
+  fetch('/admin/logging').then(function(r){
+    if(!r.ok){throw new Error('Failed to load logging settings');}
+    return r.json();
+  }).then(function(d){
+    id('logging_enabled').checked=d.loggingEnabled!==false;
+  }).catch(function(){});
+}
+function saveLoggingSettings(){
+  setLoggingStatus('Saving...',false);
+  fetch('/admin/logging',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({loggingEnabled:id('logging_enabled').checked?'1':'0'})}).then(function(r){r.text().then(function(msg){setLoggingStatus(msg||'Saved',!r.ok);refreshLoggingStatus();});}).catch(function(err){setLoggingStatus(err.message||'Failed to save logging settings',true);});
+}
+id('logging_form').addEventListener('submit',function(e){
+  e.preventDefault();
+  saveLoggingSettings();
+});
+id('logging_enabled').addEventListener('change',saveLoggingSettings);
+function refreshTxPower(){
+  fetch('/admin/txpower').then(function(r){
+    if(!r.ok){throw new Error('Failed to load TX power settings');}
+    return r.json();
+  }).then(function(d){
+    var sSel=id('txpower_sta');var aSel=id('txpower_ap');
+    for(var i=0;i<sSel.options.length;i++){if(parseInt(sSel.options[i].value)===d.txPowerSta){sSel.selectedIndex=i;break;}}
+    for(var i=0;i<aSel.options.length;i++){if(parseInt(aSel.options[i].value)===d.txPowerAp){aSel.selectedIndex=i;break;}}
+  }).catch(function(){});
+}
+function saveTxPowerSettings(){
+  setTxPowerStatus('Saving...',false);
+  fetch('/admin/txpower',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({txPowerSta:id('txpower_sta').value,txPowerAp:id('txpower_ap').value})}).then(function(r){r.text().then(function(msg){setTxPowerStatus(msg||'Saved',!r.ok);});}).catch(function(err){setTxPowerStatus(err.message||'Failed to save TX power settings',true);});
+}
+id('txpower_form').addEventListener('submit',function(e){
+  e.preventDefault();
+  saveTxPowerSettings();
+});
+id('txpower_sta').addEventListener('change',saveTxPowerSettings);
+id('txpower_ap').addEventListener('change',saveTxPowerSettings);
+id('firmware_form').addEventListener('submit',function(e){
+  e.preventDefault();
+  var input=id('firmware_file');
+  if(!input.files.length){setFirmwareStatus('Choose a firmware .bin file first',true);return;}
+  var file=input.files[0];
+  setFirmwareStatus('Uploading '+file.name+'...',false);
+  var fd=new FormData();
+  fd.append('firmware',file);
+  fetch(transferBase+'/admin/update?t='+transferToken,{method:'POST',body:fd}).then(function(r){
+    return r.text().then(function(msg){
+      setFirmwareStatus(msg||'Firmware upload finished',!r.ok);
+      if(r.ok){input.value='';}
+    });
+  }).catch(function(err){setFirmwareStatus(err.message||'Firmware upload failed',true);});
+});
+id('reset_form').addEventListener('submit',function(e){
+  e.preventDefault();
+  if(!confirm('Restart device now?')){return;}
+  setResetStatus('Scheduling restart...',false);
+  fetch('/admin/reset',{method:'POST'}).then(function(r){
+    return r.text().then(function(msg){
+      setResetStatus(msg||'Restart requested',!r.ok);
+    });
+  }).catch(function(err){setResetStatus(err.message||'Restart failed',true);});
+});
+id('factory_reset_form').addEventListener('submit',function(e){
+  e.preventDefault();
+  if(!confirm('Delete stored configuration and restart to setup mode?')){return;}
+  setFactoryResetStatus('Deleting configuration and scheduling restart...',false);
+  fetch('/admin/factory-reset',{method:'POST'}).then(function(r){
+    return r.text().then(function(msg){
+      setFactoryResetStatus(msg||'Factory reset requested',!r.ok);
+    });
+  }).catch(function(err){setFactoryResetStatus(err.message||'Factory reset failed',true);});
+});
+refreshWiFiList();
+refreshDeviceName();
+refreshTimeStatus();
+refreshLedStatus();
+refreshLoggingStatus();
+refreshTxPower();
+</script>
+</body>
+</html>)html";
+
+// ──────────────────────────────────────────────────────────────────────────────
