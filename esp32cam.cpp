@@ -1754,12 +1754,35 @@ static String buildAppNav(AppPage activePage) {
   return html;
 }
 
+static const char kFooterLicenseText[] = R"LICENSE(Copyright 2026 Andrea Esuli <andrea@esuli.it>
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS “AS IS” AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.)LICENSE";
+
 static String buildAppFooter() {
   String html;
-  html.reserve(180);
+  html.reserve(3600);
   html += "<footer style=\"padding:14px 20px;color:#7c8aa6;font-size:.82em;text-align:center\">";
   html += "ESP32-CAM &middot; Firmware ";
   html += FIRMWARE_VERSION_TEXT;
+  html += " &middot; &copy; 2026 <a href=\"https://esuli.it\" target=\"_blank\" rel=\"noopener noreferrer\" style=\"color:#93c5fd\">Andrea Esuli</a> &middot; ";
+  html += "<a href=\"#\" onclick=\"return toggleLicenseBox(true)\" style=\"color:#93c5fd\">License</a>";
+  html += "<div id=\"license-modal\" style=\"display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);align-items:center;justify-content:center;padding:16px;z-index:9999\" onclick=\"return toggleLicenseBox(false)\">";
+  html += "<div style=\"width:min(760px,100%);max-height:85vh;overflow:auto;background:#0f172a;color:#cbd5e1;border:1px solid #334155;border-radius:12px;padding:14px;box-shadow:0 20px 50px rgba(0,0,0,.4);text-align:left\" onclick=\"event.stopPropagation()\">";
+  html += "<div style=\"display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px\"><strong style=\"font-size:1rem;color:#e2e8f0\">License</strong><button type=\"button\" onclick=\"return toggleLicenseBox(false)\" style=\"background:#1e293b;color:#e2e8f0;border:1px solid #475569;border-radius:6px;padding:4px 9px;cursor:pointer\">Close</button></div>";
+  html += "<pre style=\"white-space:pre-wrap;word-break:break-word;margin:0;padding:10px;border-radius:8px;border:1px solid #334155;background:#020617;color:#dbeafe;font-size:.86rem;line-height:1.45\">";
+  html += kFooterLicenseText;
+  html += "</pre>";
+  html += "<div style=\"margin-top:10px;color:#94a3b8\">Website: <a href=\"https://esuli.it\" target=\"_blank\" rel=\"noopener noreferrer\" style=\"color:#93c5fd\">https://esuli.it</a></div>";
+  html += "</div></div>";
+  html += "<script>(function(){if(window.__licenseBoxReady){return;}window.__licenseBoxReady=true;window.toggleLicenseBox=function(open){var m=document.getElementById('license-modal');if(!m){return false;}m.style.display=open?'flex':'none';return false;};document.addEventListener('keydown',function(e){if(e.key==='Escape'){window.toggleLicenseBox(false);}});}());</script>";
   html += "</footer>";
   return html;
 }

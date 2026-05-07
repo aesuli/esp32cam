@@ -87,3 +87,9 @@ The web interface is composed of four main pages:
 - Upload firmware binary for OTA update
 - Restart device
 - Factory reset (delete config and return to setup mode)
+
+## License
+
+© 2026 Andrea Esuli
+
+[BSD 3-Clause License](LICENSE).
