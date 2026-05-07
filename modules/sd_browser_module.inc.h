@@ -156,42 +156,6 @@ static bool removeSDDirectoryRecursive(const String &dirPath, bool &blockedProte
   return true;
 }
 
-static bool appendSDFilesRecursive(const String &dirPath, String &json, bool &first, uint8_t depth) {
-  File dir = SD_MMC.open(dirPath, FILE_READ);
-  if (!dir || !dir.isDirectory()) {
-    return false;
-  }
-
-  File entry = dir.openNextFile();
-  while (entry) {
-    String entryPathRaw = String(entry.name());
-    String entryPath;
-    if (!normalizeAndValidateSDPath(entryPathRaw, entryPath)) {
-      entry.close();
-      entry = dir.openNextFile();
-      continue;
-    }
-
-    if (entry.isDirectory()) {
-      if (depth < 6) {
-        appendSDFilesRecursive(entryPath, json, first, depth + 1);
-      }
-    } else {
-      if (!first) {
-        json += ",";
-      }
-      json += "{\"name\":\"" + jsonEscape(entryPath) + "\",\"size\":" + String((unsigned int)entry.size()) + "}";
-      first = false;
-    }
-
-    entry.close();
-    entry = dir.openNextFile();
-  }
-
-  dir.close();
-  return true;
-}
-
 static void handleSDPage() {
   if (!checkAuth()) return;
   sendAppHtmlWithToken(SD_HTML, AppPage::Sd);
@@ -199,32 +163,32 @@ static void handleSDPage() {
 
 static void handleSDList() {
   if (!checkAuth()) {
-    server.send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+    server.send(HTTP_UNAUTHORIZED, "application/json", "{\"error\":\"Unauthorized\"}");
     return;
   }
 
   String dirPath = "/";
   if (server.hasArg("dir")) {
     if (!normalizeAndValidateSDPath(server.arg("dir"), dirPath)) {
-      server.send(400, "application/json", "{\"error\":\"Invalid directory path\"}");
+      server.send(HTTP_BAD_REQUEST, "application/json", "{\"error\":\"Invalid directory path\"}");
       return;
     }
   }
 
   ScopedSdLock sdLock(pdMS_TO_TICKS(SD_LONG_LOCK_TIMEOUT_MS));
   if (!sdLock.locked()) {
-    server.send(503, "application/json", "{\"error\":\"SD card busy\"}");
+    server.send(HTTP_SERVICE_UNAVAILABLE, "application/json", String("{\"error\":\"") + ERR_SD_CARD_BUSY + "\"}");
     return;
   }
 
   if (!initSDCard()) {
-    server.send(500, "application/json", "{\"error\":\"SD card not available\"}");
+    server.send(HTTP_INTERNAL_ERROR, "application/json", String("{\"error\":\"") + ERR_SD_CARD_NOT_AVAILABLE + "\"}");
     return;
   }
 
   File dir = SD_MMC.open(dirPath, FILE_READ);
   if (!dir || !dir.isDirectory()) {
-    server.send(404, "application/json", "{\"error\":\"Directory not found\"}");
+    server.send(HTTP_NOT_FOUND, "application/json", "{\"error\":\"Directory not found\"}");
     return;
   }
 
@@ -274,7 +238,7 @@ static void handleSDList() {
   dir.close();
   json += "]}";
   sdLock.release();
-  server.send(200, "application/json", json);
+  server.send(HTTP_OK, "application/json", json);
 }
 
 static void sendTransferError(WebServer &srv, int statusCode, const char *message) {
@@ -288,35 +252,35 @@ static void handleSDDownloadWorker() {
     return;
   }
 
-  if (!transferServer.hasArg("file")) {
+  if (!transferServer.hasArg(PARAM_FILE)) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(400, "text/plain", "file parameter required");
+    transferServer.send(HTTP_BAD_REQUEST, "text/plain", ERR_FILE_REQUIRED);
     return;
   }
 
   if (!initSDCard()) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(500, "text/plain", "SD card not available");
+    transferServer.send(HTTP_INTERNAL_ERROR, "text/plain", ERR_SD_CARD_NOT_AVAILABLE);
     return;
   }
 
   String filePath;
-  if (!normalizeAndValidateSDPath(transferServer.arg("file"), filePath)) {
+  if (!normalizeAndValidateSDPath(transferServer.arg(PARAM_FILE), filePath)) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(400, "text/plain", "Invalid file path");
+    transferServer.send(HTTP_BAD_REQUEST, "text/plain", ERR_INVALID_PATH);
     return;
   }
 
   if (isProtectedSDPath(filePath)) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(403, "text/plain", "Access denied");
+    transferServer.send(HTTP_FORBIDDEN, "text/plain", ERR_ACCESS_DENIED);
     return;
   }
 
   File file = SD_MMC.open(filePath, FILE_READ);
   if (!file || file.isDirectory()) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(404, "text/plain", "File not found");
+    transferServer.send(HTTP_NOT_FOUND, "text/plain", ERR_FILE_NOT_FOUND);
     return;
   }
 
@@ -337,24 +301,24 @@ static void handleSDDownloadMain() {
     return;
   }
 
-  if (!server.hasArg("file")) {
-    server.send(400, "text/plain", "file parameter required");
+  if (!server.hasArg(PARAM_FILE)) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", ERR_FILE_REQUIRED);
     return;
   }
 
   String filePath;
-  if (!normalizeAndValidateSDPath(server.arg("file"), filePath)) {
-    server.send(400, "text/plain", "Invalid file path");
+  if (!normalizeAndValidateSDPath(server.arg(PARAM_FILE), filePath)) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", ERR_INVALID_PATH);
     return;
   }
 
   if (isProtectedSDPath(filePath)) {
-    server.send(403, "text/plain", "Access denied");
+    server.send(HTTP_FORBIDDEN, "text/plain", ERR_ACCESS_DENIED);
     return;
   }
 
   server.sendHeader("Location", buildLocalUrl(HTTP_TRANSFER_PORT, String("/sd/download?file=") + urlEncode(filePath), true));
-  server.send(302, "text/plain", "Redirecting to transfer server");
+  server.send(HTTP_FOUND, "text/plain", "Redirecting to transfer server");
 }
 
 static String sdMimeTypeForPath(const String &filePath) {
@@ -406,32 +370,32 @@ static bool skipChunkData(File &file, uint32_t chunkSize) {
 static void handleSDPlaybackWorker() {
   if (!checkAuth(transferServer, true)) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(401, "text/plain", "Unauthorized");
+    transferServer.send(HTTP_UNAUTHORIZED, "text/plain", ERR_UNAUTHORIZED);
     return;
   }
 
-  if (!transferServer.hasArg("file")) {
+  if (!transferServer.hasArg(PARAM_FILE)) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(400, "text/plain", "file parameter required");
+    transferServer.send(HTTP_BAD_REQUEST, "text/plain", ERR_FILE_REQUIRED);
     return;
   }
 
   if (!initSDCard()) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(500, "text/plain", "SD card not available");
+    transferServer.send(HTTP_INTERNAL_ERROR, "text/plain", ERR_SD_CARD_NOT_AVAILABLE);
     return;
   }
 
   String filePath;
-  if (!normalizeAndValidateSDPath(transferServer.arg("file"), filePath)) {
+  if (!normalizeAndValidateSDPath(transferServer.arg(PARAM_FILE), filePath)) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(400, "text/plain", "Invalid file path");
+    transferServer.send(HTTP_BAD_REQUEST, "text/plain", ERR_INVALID_PATH);
     return;
   }
 
   if (isProtectedSDPath(filePath)) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(403, "text/plain", "Access denied");
+    transferServer.send(HTTP_FORBIDDEN, "text/plain", ERR_ACCESS_DENIED);
     return;
   }
 
@@ -439,14 +403,14 @@ static void handleSDPlaybackWorker() {
   lower.toLowerCase();
   if (!lower.endsWith(".avi")) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(415, "text/plain", "Playback stream currently supports AVI MJPEG files only");
+    transferServer.send(HTTP_UNSUPPORTED_MEDIA_TYPE, "text/plain", "Playback stream currently supports AVI MJPEG files only");
     return;
   }
 
   File file = SD_MMC.open(filePath, FILE_READ);
   if (!file || file.isDirectory()) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(404, "text/plain", "File not found");
+    transferServer.send(HTTP_NOT_FOUND, "text/plain", ERR_FILE_NOT_FOUND);
     return;
   }
 
@@ -454,7 +418,7 @@ static void handleSDPlaybackWorker() {
   if (fileSize < 16U || !file.seek(12U)) {
     file.close();
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(400, "text/plain", "Invalid AVI file");
+    transferServer.send(HTTP_BAD_REQUEST, "text/plain", "Invalid AVI file");
     return;
   }
 
@@ -509,7 +473,7 @@ static void handleSDPlaybackWorker() {
   if (!moviFound || moviStart >= moviEnd || !file.seek(moviStart)) {
     file.close();
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(400, "text/plain", "Could not locate AVI movi data");
+    transferServer.send(HTTP_BAD_REQUEST, "text/plain", "Could not locate AVI movi data");
     return;
   }
 
@@ -596,37 +560,37 @@ static void handleSDPlayerMain() {
     return;
   }
 
-  if (!server.hasArg("file")) {
-    server.send(400, "text/plain", "file parameter required");
+  if (!server.hasArg(PARAM_FILE)) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", ERR_FILE_REQUIRED);
     return;
   }
 
   if (!initSDCard()) {
-    server.send(500, "text/plain", "SD card not available");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", ERR_SD_CARD_NOT_AVAILABLE);
     return;
   }
 
   String filePath;
-  if (!normalizeAndValidateSDPath(server.arg("file"), filePath)) {
-    server.send(400, "text/plain", "Invalid file path");
+  if (!normalizeAndValidateSDPath(server.arg(PARAM_FILE), filePath)) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", ERR_INVALID_PATH);
     return;
   }
 
   if (isProtectedSDPath(filePath)) {
-    server.send(403, "text/plain", "Access denied");
+    server.send(HTTP_FORBIDDEN, "text/plain", ERR_ACCESS_DENIED);
     return;
   }
 
   File file = SD_MMC.open(filePath, FILE_READ);
   if (!file || file.isDirectory()) {
-    server.send(404, "text/plain", "File not found");
+    server.send(HTTP_NOT_FOUND, "text/plain", ERR_FILE_NOT_FOUND);
     return;
   }
   file.close();
 
   if (!sdIsVideoPath(filePath)) {
     server.sendHeader("Location", String("/sd/view?file=") + urlEncode(filePath));
-    server.send(302, "text/plain", "Redirecting to file view");
+    server.send(HTTP_FOUND, "text/plain", "Redirecting to file view");
     return;
   }
 
@@ -699,45 +663,45 @@ __APP_FOOTER__
     page.replace("__PLAYER_HINT__", "If playback does not start, your browser likely does not support this container/codec and may require download instead.");
   }
   applyAppChrome(page, AppPage::Sd);
-  server.send(200, "text/html", page);
+  server.send(HTTP_OK, "text/html", page);
 }
 
 static void handleSDViewWorker() {
   if (!checkAuth(transferServer, true)) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(401, "text/plain", "Unauthorized");
+    transferServer.send(HTTP_UNAUTHORIZED, "text/plain", ERR_UNAUTHORIZED);
     return;
   }
 
-  if (!transferServer.hasArg("file")) {
+  if (!transferServer.hasArg(PARAM_FILE)) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(400, "text/plain", "file parameter required");
+    transferServer.send(HTTP_BAD_REQUEST, "text/plain", ERR_FILE_REQUIRED);
     return;
   }
 
   if (!initSDCard()) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(500, "text/plain", "SD card not available");
+    transferServer.send(HTTP_INTERNAL_ERROR, "text/plain", ERR_SD_CARD_NOT_AVAILABLE);
     return;
   }
 
   String filePath;
-  if (!normalizeAndValidateSDPath(transferServer.arg("file"), filePath)) {
+  if (!normalizeAndValidateSDPath(transferServer.arg(PARAM_FILE), filePath)) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(400, "text/plain", "Invalid file path");
+    transferServer.send(HTTP_BAD_REQUEST, "text/plain", ERR_INVALID_PATH);
     return;
   }
 
   if (isProtectedSDPath(filePath)) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(403, "text/plain", "Access denied");
+    transferServer.send(HTTP_FORBIDDEN, "text/plain", ERR_ACCESS_DENIED);
     return;
   }
 
   File file = SD_MMC.open(filePath, FILE_READ);
   if (!file || file.isDirectory()) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(404, "text/plain", "File not found");
+    transferServer.send(HTTP_NOT_FOUND, "text/plain", ERR_FILE_NOT_FOUND);
     return;
   }
 
@@ -751,52 +715,52 @@ static void handleSDViewMain() {
     return;
   }
 
-  if (!server.hasArg("file")) {
-    server.send(400, "text/plain", "file parameter required");
+  if (!server.hasArg(PARAM_FILE)) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", ERR_FILE_REQUIRED);
     return;
   }
 
   String filePath;
-  if (!normalizeAndValidateSDPath(server.arg("file"), filePath)) {
-    server.send(400, "text/plain", "Invalid file path");
+  if (!normalizeAndValidateSDPath(server.arg(PARAM_FILE), filePath)) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", ERR_INVALID_PATH);
     return;
   }
 
   if (isProtectedSDPath(filePath)) {
-    server.send(403, "text/plain", "Access denied");
+    server.send(HTTP_FORBIDDEN, "text/plain", ERR_ACCESS_DENIED);
     return;
   }
 
   server.sendHeader("Location", buildLocalUrl(HTTP_TRANSFER_PORT, String("/sd/view?file=") + urlEncode(filePath), true));
-  server.send(302, "text/plain", "Redirecting to transfer server");
+  server.send(HTTP_FOUND, "text/plain", "Redirecting to transfer server");
 }
 
 static void handleSDDelete() {
   if (!checkAuth()) {
-    server.send(401, "text/plain", "Unauthorized");
+    server.send(HTTP_UNAUTHORIZED, "text/plain", ERR_UNAUTHORIZED);
     return;
   }
 
-  if (!server.hasArg("file")) {
-    server.send(400, "text/plain", "file parameter required");
+  if (!server.hasArg(PARAM_FILE)) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", ERR_FILE_REQUIRED);
     return;
   }
 
   std::vector<String> filePaths;
   filePaths.reserve(server.args());
   for (int index = 0; index < server.args(); ++index) {
-    if (server.argName(index) != "file") {
+    if (server.argName(index) != PARAM_FILE) {
       continue;
     }
 
     String filePath;
     if (!normalizeAndValidateSDPath(server.arg(index), filePath)) {
-      server.send(400, "text/plain", "Invalid file path");
+      server.send(HTTP_BAD_REQUEST, "text/plain", ERR_INVALID_PATH);
       return;
     }
 
     if (isProtectedSDPath(filePath)) {
-      server.send(403, "text/plain", "Access denied");
+      server.send(HTTP_FORBIDDEN, "text/plain", ERR_ACCESS_DENIED);
       return;
     }
 
@@ -806,50 +770,50 @@ static void handleSDDelete() {
   }
 
   if (filePaths.empty()) {
-    server.send(400, "text/plain", "file parameter required");
+    server.send(HTTP_BAD_REQUEST, "text/plain", ERR_FILE_REQUIRED);
     return;
   }
 
   ScopedSdLock sdLock(pdMS_TO_TICKS(SD_LONG_LOCK_TIMEOUT_MS));
   if (!sdLock.locked()) {
-    server.send(503, "text/plain", "SD card busy");
+    server.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", ERR_SD_CARD_BUSY);
     return;
   }
 
   if (!initSDCard()) {
-    server.send(500, "text/plain", "SD card not available");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", ERR_SD_CARD_NOT_AVAILABLE);
     return;
   }
 
   for (const String &filePath : filePaths) {
     if (!SD_MMC.remove(filePath)) {
-      server.send(500, "text/plain", filePaths.size() > 1 ? "Failed to delete one or more files" : "Failed to delete file");
+      server.send(HTTP_INTERNAL_ERROR, "text/plain", filePaths.size() > 1 ? "Failed to delete one or more files" : "Failed to delete file");
       return;
     }
   }
 
   sdLock.release();
   if (filePaths.size() == 1) {
-    server.send(200, "text/plain", "File deleted");
+    server.send(HTTP_OK, "text/plain", "File deleted");
   } else {
-    server.send(200, "text/plain", String(filePaths.size()) + " files deleted");
+    server.send(HTTP_OK, "text/plain", String(filePaths.size()) + " files deleted");
   }
 }
 
 static void handleSDSortGet() {
   if (!checkAuth()) {
-    server.send(401, "application/json", "{\"error\":\"Unauthorized\"}");
+    server.send(HTTP_UNAUTHORIZED, "application/json", "{\"error\":\"Unauthorized\"}");
     return;
   }
 
   ScopedSdLock sdLock(pdMS_TO_TICKS(SD_LONG_LOCK_TIMEOUT_MS));
   if (!sdLock.locked()) {
-    server.send(503, "application/json", "{\"error\":\"SD card busy\"}");
+    server.send(HTTP_SERVICE_UNAVAILABLE, "application/json", String("{\"error\":\"") + ERR_SD_CARD_BUSY + "\"}");
     return;
   }
 
   if (!initSDCard()) {
-    server.send(500, "application/json", "{\"error\":\"SD card not available\"}");
+    server.send(HTTP_INTERNAL_ERROR, "application/json", String("{\"error\":\"") + ERR_SD_CARD_NOT_AVAILABLE + "\"}");
     return;
   }
 
@@ -859,17 +823,17 @@ static void handleSDSortGet() {
   sdLock.release();
 
   String json = "{\"by\":\"" + jsonEscape(sortBy) + "\",\"dir\":\"" + jsonEscape(sortDir) + "\"}";
-  server.send(200, "application/json", json);
+  server.send(HTTP_OK, "application/json", json);
 }
 
 static void handleSDSortSet() {
   if (!checkAuth()) {
-    server.send(401, "text/plain", "Unauthorized");
+    server.send(HTTP_UNAUTHORIZED, "text/plain", ERR_UNAUTHORIZED);
     return;
   }
 
   if (!server.hasArg("by") || !server.hasArg("dir")) {
-    server.send(400, "text/plain", "by and dir parameters are required");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "by and dir parameters are required");
     return;
   }
 
@@ -879,68 +843,68 @@ static void handleSDSortSet() {
   sortDir.trim();
 
   if (!isValidSortByValue(sortBy) || !isValidSortDirValue(sortDir)) {
-    server.send(400, "text/plain", "Invalid sort values");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Invalid sort values");
     return;
   }
 
   ScopedSdLock sdLock(pdMS_TO_TICKS(SD_LONG_LOCK_TIMEOUT_MS));
   if (!sdLock.locked()) {
-    server.send(503, "text/plain", "SD card busy");
+    server.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", ERR_SD_CARD_BUSY);
     return;
   }
 
   if (!initSDCard()) {
-    server.send(500, "text/plain", "SD card not available");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", ERR_SD_CARD_NOT_AVAILABLE);
     return;
   }
 
   if (!saveSDSortPreferences(sortBy, sortDir)) {
-    server.send(500, "text/plain", "Failed to save sort preferences");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to save sort preferences");
     return;
   }
 
   sdLock.release();
-  server.send(200, "text/plain", "Sort preferences saved");
+  server.send(HTTP_OK, "text/plain", "Sort preferences saved");
 }
 
 static void handleSDMakeDir() {
   if (!checkAuth()) {
-    server.send(401, "text/plain", "Unauthorized");
+    server.send(HTTP_UNAUTHORIZED, "text/plain", ERR_UNAUTHORIZED);
     return;
   }
 
   if (!server.hasArg("dir") || !server.hasArg("name")) {
-    server.send(400, "text/plain", "dir and name parameters are required");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "dir and name parameters are required");
     return;
   }
 
   String dirPath;
   if (!normalizeAndValidateSDPath(server.arg("dir"), dirPath)) {
-    server.send(400, "text/plain", "Invalid directory path");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Invalid directory path");
     return;
   }
 
   String folderName = server.arg("name");
   folderName.trim();
   if (!validateNewSDName(folderName)) {
-    server.send(400, "text/plain", "Invalid folder name");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Invalid folder name");
     return;
   }
 
   ScopedSdLock sdLock(pdMS_TO_TICKS(SD_LONG_LOCK_TIMEOUT_MS));
   if (!sdLock.locked()) {
-    server.send(503, "text/plain", "SD card busy");
+    server.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", ERR_SD_CARD_BUSY);
     return;
   }
 
   if (!initSDCard()) {
-    server.send(500, "text/plain", "SD card not available");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", ERR_SD_CARD_NOT_AVAILABLE);
     return;
   }
 
   File parent = SD_MMC.open(dirPath, FILE_READ);
   if (!parent || !parent.isDirectory()) {
-    server.send(404, "text/plain", "Parent directory not found");
+    server.send(HTTP_NOT_FOUND, "text/plain", "Parent directory not found");
     return;
   }
   parent.close();
@@ -948,70 +912,70 @@ static void handleSDMakeDir() {
   String targetPath = (dirPath == "/") ? ("/" + folderName) : (dirPath + "/" + folderName);
   String normalizedTarget;
   if (!normalizeAndValidateSDPath(targetPath, normalizedTarget)) {
-    server.send(400, "text/plain", "Invalid target path");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Invalid target path");
     return;
   }
 
   if (isProtectedSDPath(normalizedTarget)) {
-    server.send(403, "text/plain", "Access denied");
+    server.send(HTTP_FORBIDDEN, "text/plain", ERR_ACCESS_DENIED);
     return;
   }
 
   if (SD_MMC.exists(normalizedTarget)) {
-    server.send(409, "text/plain", "A file or folder with this name already exists");
+    server.send(HTTP_CONFLICT, "text/plain", "A file or folder with this name already exists");
     return;
   }
 
   if (!SD_MMC.mkdir(normalizedTarget)) {
-    server.send(500, "text/plain", "Failed to create folder");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to create folder");
     return;
   }
 
   sdLock.release();
-  server.send(200, "text/plain", "Folder created");
+  server.send(HTTP_OK, "text/plain", "Folder created");
 }
 
 static void handleSDRemoveDir() {
   if (!checkAuth()) {
-    server.send(401, "text/plain", "Unauthorized");
+    server.send(HTTP_UNAUTHORIZED, "text/plain", ERR_UNAUTHORIZED);
     return;
   }
 
   if (!server.hasArg("dir")) {
-    server.send(400, "text/plain", "dir parameter required");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "dir parameter required");
     return;
   }
 
   String dirPath;
   if (!normalizeAndValidateSDPath(server.arg("dir"), dirPath)) {
-    server.send(400, "text/plain", "Invalid directory path");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Invalid directory path");
     return;
   }
 
   if (dirPath == "/") {
-    server.send(400, "text/plain", "Cannot delete root folder");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Cannot delete root folder");
     return;
   }
 
   if (isProtectedSDPath(dirPath)) {
-    server.send(403, "text/plain", "Access denied");
+    server.send(HTTP_FORBIDDEN, "text/plain", ERR_ACCESS_DENIED);
     return;
   }
 
   ScopedSdLock sdLock(pdMS_TO_TICKS(SD_LONG_LOCK_TIMEOUT_MS));
   if (!sdLock.locked()) {
-    server.send(503, "text/plain", "SD card busy");
+    server.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", ERR_SD_CARD_BUSY);
     return;
   }
 
   if (!initSDCard()) {
-    server.send(500, "text/plain", "SD card not available");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", ERR_SD_CARD_NOT_AVAILABLE);
     return;
   }
 
   File dir = SD_MMC.open(dirPath, FILE_READ);
   if (!dir || !dir.isDirectory()) {
-    server.send(404, "text/plain", "Folder not found");
+    server.send(HTTP_NOT_FOUND, "text/plain", "Folder not found");
     return;
   }
   dir.close();
@@ -1019,20 +983,20 @@ static void handleSDRemoveDir() {
   bool blockedProtectedPath = false;
   if (!removeSDDirectoryRecursive(dirPath, blockedProtectedPath)) {
     if (blockedProtectedPath) {
-      server.send(403, "text/plain", "Folder contains protected content");
+      server.send(HTTP_FORBIDDEN, "text/plain", "Folder contains protected content");
     } else {
-      server.send(500, "text/plain", "Failed to delete folder contents");
+      server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to delete folder contents");
     }
     return;
   }
 
   if (!SD_MMC.rmdir(dirPath)) {
-    server.send(500, "text/plain", "Failed to delete folder");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to delete folder");
     return;
   }
 
   sdLock.release();
-  server.send(200, "text/plain", "Folder deleted");
+  server.send(HTTP_OK, "text/plain", "Folder deleted");
 }
 
 static void handleSDUploadData() {
@@ -1262,7 +1226,7 @@ static void handleSDUploadDataWorker() {
 static void handleSDUploadWorker() {
   if (!checkAuth(transferServer, true)) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(401, "text/plain", "Unauthorized");
+    transferServer.send(HTTP_UNAUTHORIZED, "text/plain", ERR_UNAUTHORIZED);
     return;
   }
 
@@ -1273,13 +1237,13 @@ static void handleSDUploadWorker() {
   transferServer.sendHeader("Access-Control-Allow-Origin", "*");
 
   if (sdUploadBlocked) {
-    transferServer.send(403, "text/plain", "Access denied");
+    transferServer.send(HTTP_FORBIDDEN, "text/plain", ERR_ACCESS_DENIED);
   } else if (sdUploadFailed) {
-    transferServer.send(500, "text/plain", "Upload failed");
+    transferServer.send(HTTP_INTERNAL_ERROR, "text/plain", "Upload failed");
   } else if (sdUploadPath.isEmpty()) {
-    transferServer.send(400, "text/plain", "No file provided");
+    transferServer.send(HTTP_BAD_REQUEST, "text/plain", "No file provided");
   } else {
-    transferServer.send(200, "text/plain", "Uploaded: " + sdUploadPath);
+    transferServer.send(HTTP_OK, "text/plain", "Uploaded: " + sdUploadPath);
   }
 
   sdUploadPath = "";
@@ -1290,7 +1254,7 @@ static void handleSDUploadWorker() {
 static void handleSDUploadMain() {
   if (!checkAuth(server)) {
     server.sendHeader("Access-Control-Allow-Origin", "*");
-    server.send(401, "text/plain", "Unauthorized");
+    server.send(HTTP_UNAUTHORIZED, "text/plain", ERR_UNAUTHORIZED);
     return;
   }
 
@@ -1299,14 +1263,14 @@ static void handleSDUploadMain() {
   if (server.hasArg("dir")) {
     String dirPath;
     if (!normalizeAndValidateSDPath(server.arg("dir"), dirPath)) {
-      server.send(400, "text/plain", "Invalid directory path");
+      server.send(HTTP_BAD_REQUEST, "text/plain", "Invalid directory path");
       return;
     }
     uploadPath += "?dir=" + urlEncode(dirPath);
   }
 
   server.sendHeader("Location", buildLocalUrl(HTTP_TRANSFER_PORT, uploadPath, true));
-  server.send(307, "text/plain", "Redirecting to transfer server");
+  server.send(HTTP_TEMPORARY_REDIRECT, "text/plain", "Redirecting to transfer server");
 }
 
 static void registerSdRoutes() {

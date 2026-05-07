@@ -77,11 +77,11 @@ static void handleCaptureSD() {
 
   String photoPath;
   if (!captureImageToSD(photoPath)) {
-    server.send(500, "text/plain", "Failed to capture to SD");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to capture to SD");
     return;
   }
 
-  server.send(200, "text/plain", String("Saved: ") + photoPath);
+  server.send(HTTP_OK, "text/plain", String("Saved: ") + photoPath);
 }
 
 static bool writeAviHeader(File &file, uint32_t riffSize, uint32_t durationMs, uint32_t frameCount, uint32_t maxFrameSize, uint16_t width, uint16_t height, uint32_t moviListSize, bool hasIndex) {
@@ -373,7 +373,7 @@ static bool startRecordingSessionInternal(String &message) {
     }
 
     if (!initSDCard()) {
-      message = "SD card not available";
+      message = ERR_SD_CARD_NOT_AVAILABLE;
       return false;
     }
   }
@@ -399,7 +399,7 @@ static bool startRecordingSessionInternal(String &message) {
     if (!sdLock.locked()) {
       message = "SD card busy";
     } else if (!initSDCard()) {
-      message = "SD card not available";
+      message = ERR_SD_CARD_NOT_AVAILABLE;
     } else if (!ensureCaptureDirectory()) {
       message = "Failed to create capture directory";
     } else {

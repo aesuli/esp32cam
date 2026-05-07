@@ -100,11 +100,17 @@ static constexpr uint32_t CAMERA_XCLK_FREQS_HZ[] = {
 
 // ─── HTTP status codes ────────────────────────────────────────────────────────
 static constexpr int HTTP_OK = 200;
+static constexpr int HTTP_NO_CONTENT = 204;
+static constexpr int HTTP_FOUND = 302;
+static constexpr int HTTP_TEMPORARY_REDIRECT = 307;
 static constexpr int HTTP_BAD_REQUEST = 400;
 static constexpr int HTTP_UNAUTHORIZED = 401;
 static constexpr int HTTP_FORBIDDEN = 403;
 static constexpr int HTTP_NOT_FOUND = 404;
+static constexpr int HTTP_CONFLICT = 409;
+static constexpr int HTTP_UNSUPPORTED_MEDIA_TYPE = 415;
 static constexpr int HTTP_INTERNAL_ERROR = 500;
+static constexpr int HTTP_SERVICE_UNAVAILABLE = 503;
 
 // ─── HTTP parameter names ────────────────────────────────────────────────────
 static constexpr const char* PARAM_SSID = "ssid";
@@ -120,6 +126,9 @@ static constexpr const char* PARAM_CONFIRM = "confirm";
 static constexpr const char* ERR_FILE_REQUIRED = "file parameter required";
 static constexpr const char* ERR_INVALID_PATH = "Invalid file path";
 static constexpr const char* ERR_ACCESS_DENIED = "Access denied";
+static constexpr const char* ERR_SD_CARD_NOT_AVAILABLE = "SD card not available";
+static constexpr const char* ERR_SD_CARD_BUSY = "SD card busy";
+static constexpr const char* ERR_FILE_NOT_FOUND = "File not found";
 static constexpr const char* ERR_UNAUTHORIZED = "Unauthorized";
 
 // ─── Globals ──────────────────────────────────────────────────────────────────
@@ -529,7 +538,6 @@ static bool appendRecordingFrame(const OwnedJpegFrame &frame);
 static void stopRecordingSession(bool keepFile);
 static bool loadRuntimeConfigWithRetries(StoredConfig &cfg);
 static bool initCameraWithRetries();
-static bool waitForIO0Released(unsigned long timeoutMs);
 static void servicePendingFirmwareRestart();
 static void servicePendingAdminRestart();
 static void configureButtonWakeup();
@@ -1708,7 +1716,7 @@ static String urlEncode(const String &value) {
 
 static void sendHtmlWithToken(String &page) {
   page.replace("__ROUTE_TOKEN__", routeAccessToken);
-  server.send(200, "text/html", page);
+  server.send(HTTP_OK, "text/html", page);
 }
 
 static void sendHtmlWithToken(const char *html) {
@@ -2405,7 +2413,7 @@ static void handleStreamWorker() {
     if (!checkAuth(streamServer, true)) return;
 
     if (!ensureCameraReady()) {
-      streamServer.send(503, "text/plain", "Camera unavailable");
+      streamServer.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", "Camera unavailable");
       return;
     }
 
@@ -2490,7 +2498,7 @@ static void handleStreamMain() {
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   server.sendHeader("Pragma", "no-cache");
   server.sendHeader("Location", buildLocalUrl(HTTP_STREAM_PORT, "/stream", true));
-  server.send(302, "text/plain", "Redirecting to stream server");
+  server.send(HTTP_FOUND, "text/plain", "Redirecting to stream server");
 }
 
 static void handleStreamClose() {
@@ -2503,7 +2511,7 @@ static void handleStreamClose() {
     Serial.println("[STREAM] Close requested by UI");
   }
 
-  server.send(204, "text/plain", "");
+  server.send(HTTP_NO_CONTENT, "text/plain", "");
 }
 
 // ─── Authentication helper ────────────────────────────────────────────────────
@@ -2525,32 +2533,32 @@ static void handleUrlAccess() {
 
 static void handleSetupRoot() {
     handleUrlAccess();
-    server.send_P(200, "text/html", SETUP_HTML);
+  server.send_P(HTTP_OK, "text/html", SETUP_HTML);
 }
 
 static void handleSave() {
     handleUrlAccess();
 
-    if (!server.hasArg("ssid") || !server.hasArg("apass")) {
-        server.send(400, "text/plain", "Missing required fields");
+  if (!server.hasArg(PARAM_SSID) || !server.hasArg(PARAM_APASS)) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Missing required fields");
         return;
     }
 
-    String newSSID  = server.arg("ssid");
-    String newWPass = server.arg("wpass");
-    String newAPass = server.arg("apass");
+  String newSSID  = server.arg(PARAM_SSID);
+  String newWPass = server.arg(PARAM_WPASS);
+  String newAPass = server.arg(PARAM_APASS);
 
     if (newSSID.isEmpty()) {
-        server.send(400, "text/plain", "SSID is required");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "SSID is required");
         return;
     }
     if (newAPass.length() < 8) {
-      server.send(400, "text/plain", "Access password must be at least 8 characters");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Access password must be at least 8 characters");
         return;
     }
 
     if (!isPrintableAscii(newSSID) || !isPrintableAscii(newWPass) || !isPrintableAscii(newAPass)) {
-        server.send(400, "text/plain", "Invalid characters in input");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Invalid characters in input");
         return;
     }
 
@@ -2566,11 +2574,11 @@ static void handleSave() {
     }
 
     if (!persistRuntimeConfig(cfg)) {
-      server.send(500, "text/plain", "Failed to save configuration to SD card");
+      server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to save configuration to SD card");
       return;
     }
 
-    server.send_P(200, "text/html", SAVED_HTML);
+    server.send_P(HTTP_OK, "text/html", SAVED_HTML);
     delay(2000);
     ESP.restart();
 }
@@ -2628,7 +2636,7 @@ static void sendWifiScanResponse(bool requireAuth) {
     if (restoreApOnlyMode) {
       WiFi.mode(WIFI_AP);
     }
-    server.send(500, "application/json", "{\"error\":\"WiFi scan failed\"}");
+    server.send(HTTP_INTERNAL_ERROR, "application/json", "{\"error\":\"WiFi scan failed\"}");
     return;
   }
 
@@ -2667,7 +2675,7 @@ static void sendWifiScanResponse(bool requireAuth) {
     WiFi.mode(WIFI_AP);
   }
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send(200, "application/json", json);
+  server.send(HTTP_OK, "application/json", json);
 }
 
 static void handleSetupWifiScan() {
@@ -2692,26 +2700,26 @@ static void handleWifiList() {
   json += "]}";
 
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send(200, "application/json", json);
+  server.send(HTTP_OK, "application/json", json);
 }
 
 static void handleWifiAdd() {
   if (!checkAuth()) return;
-  if (!server.hasArg("ssid")) {
-    server.send(400, "text/plain", "SSID is required");
+  if (!server.hasArg(PARAM_SSID)) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", "SSID is required");
     return;
   }
 
-  String newSSID = server.arg("ssid");
-  String newWPass = server.arg("wpass");
+  String newSSID = server.arg(PARAM_SSID);
+  String newWPass = server.arg(PARAM_WPASS);
   newSSID.trim();
 
   if (newSSID.isEmpty()) {
-    server.send(400, "text/plain", "SSID is required");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "SSID is required");
     return;
   }
   if (!isPrintableAscii(newSSID) || !isPrintableAscii(newWPass)) {
-    server.send(400, "text/plain", "Invalid characters in input");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Invalid characters in input");
     return;
   }
 
@@ -2733,49 +2741,49 @@ static void handleWifiAdd() {
   }
 
   if (!persistRuntimeConfig(updated)) {
-    server.send(500, "text/plain", "Failed to save configuration");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to save configuration");
     return;
   }
 
-  server.send(200, "text/plain", replaced ? "WiFi credential updated" : "WiFi credential added");
+  server.send(HTTP_OK, "text/plain", replaced ? "WiFi credential updated" : "WiFi credential added");
 }
 
 static void handleWifiDelete() {
   if (!checkAuth()) return;
-  if (!server.hasArg("index")) {
-    server.send(400, "text/plain", "Index is required");
+  if (!server.hasArg(PARAM_INDEX)) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Index is required");
     return;
   }
 
-  int index = server.arg("index").toInt();
+  int index = server.arg(PARAM_INDEX).toInt();
   if (index < 0 || (size_t)index >= runtimeConfig.wifiList.size()) {
-    server.send(400, "text/plain", "Invalid WiFi index");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Invalid WiFi index");
     return;
   }
 
   StoredConfig updated = runtimeConfig;
   updated.wifiList.erase(updated.wifiList.begin() + index);
   if (!persistRuntimeConfig(updated)) {
-    server.send(500, "text/plain", "Failed to save configuration");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to save configuration");
     return;
   }
 
-  server.send(200, "text/plain", "WiFi credential deleted");
+  server.send(HTTP_OK, "text/plain", "WiFi credential deleted");
 }
 
 static void handleWifiMove() {
   if (!checkAuth()) return;
-  if (!server.hasArg("index") || !server.hasArg("dir")) {
-    server.send(400, "text/plain", "Index and dir are required");
+  if (!server.hasArg(PARAM_INDEX) || !server.hasArg("dir")) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Index and dir are required");
     return;
   }
 
-  int index = server.arg("index").toInt();
+  int index = server.arg(PARAM_INDEX).toInt();
   String dir = server.arg("dir");
   int target = dir == "up" ? index - 1 : (dir == "down" ? index + 1 : -1);
 
   if (index < 0 || target < 0 || (size_t)index >= runtimeConfig.wifiList.size() || (size_t)target >= runtimeConfig.wifiList.size()) {
-    server.send(400, "text/plain", "Invalid WiFi move request");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Invalid WiFi move request");
     return;
   }
 
@@ -2785,45 +2793,45 @@ static void handleWifiMove() {
   updated.wifiList[target] = temp;
 
   if (!persistRuntimeConfig(updated)) {
-    server.send(500, "text/plain", "Failed to save configuration");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to save configuration");
     return;
   }
 
-  server.send(200, "text/plain", "WiFi priority updated");
+  server.send(HTTP_OK, "text/plain", "WiFi priority updated");
 }
 
 static void handleAdminPasswordChange() {
   if (!checkAuth()) return;
-  if (!server.hasArg("current") || !server.hasArg("next") || !server.hasArg("confirm")) {
-    server.send(400, "text/plain", "Current, next, and confirm passwords are required");
+  if (!server.hasArg(PARAM_CURRENT) || !server.hasArg(PARAM_NEXT) || !server.hasArg(PARAM_CONFIRM)) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Current, next, and confirm passwords are required");
     return;
   }
 
-  String currentPass = server.arg("current");
-  String nextPass = server.arg("next");
-  String confirmPass = server.arg("confirm");
+  String currentPass = server.arg(PARAM_CURRENT);
+  String nextPass = server.arg(PARAM_NEXT);
+  String confirmPass = server.arg(PARAM_CONFIRM);
 
   if (currentPass != cfgAccessPass) {
-    server.send(403, "text/plain", "Current password is incorrect");
+    server.send(HTTP_FORBIDDEN, "text/plain", "Current password is incorrect");
     return;
   }
   if (nextPass.length() < 8) {
-    server.send(400, "text/plain", "New password must be at least 8 characters");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "New password must be at least 8 characters");
     return;
   }
   if (nextPass != confirmPass) {
-    server.send(400, "text/plain", "New password confirmation does not match");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "New password confirmation does not match");
     return;
   }
   if (!isPrintableAscii(nextPass) || !isPrintableAscii(confirmPass) || !isPrintableAscii(currentPass)) {
-    server.send(400, "text/plain", "Invalid characters in password");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Invalid characters in password");
     return;
   }
 
   StoredConfig updated = runtimeConfig;
   updated.adminPass = nextPass;
   if (!persistRuntimeConfig(updated)) {
-    server.send(500, "text/plain", "Failed to save configuration");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to save configuration");
     return;
   }
 
@@ -2831,20 +2839,20 @@ static void handleAdminPasswordChange() {
   if (WiFi.getMode() == WIFI_AP) {
     message += " Fallback AP password changes on the next AP restart.";
   }
-  server.send(200, "text/plain", message);
+  server.send(HTTP_OK, "text/plain", message);
 }
 
 static void handleCapture() {
     if (!checkAuth()) return;
 
   if (!ensureCameraReady()) {
-    server.send(503, "text/plain", "Camera unavailable");
+    server.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", "Camera unavailable");
     return;
   }
 
     camera_fb_t *fb = lockAndCaptureFrame(pdMS_TO_TICKS(1000));
     if (!fb) {
-        server.send(503, "text/plain", "Camera capture failed");
+      server.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", "Camera capture failed");
         return;
     }
 
@@ -2852,7 +2860,7 @@ static void handleCapture() {
     bool copied = copyCameraFrame(fb, frame);
     unlockCameraFrame(fb);
     if (!copied) {
-        server.send(503, "text/plain", "Camera frame copy failed");
+      server.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", "Camera frame copy failed");
         return;
     }
 
@@ -2874,7 +2882,7 @@ static void handleControl() {
     if (!checkAuth()) return;
 
     if (!server.hasArg("var") || !server.hasArg("val")) {
-        server.send(400, "text/plain", "Missing var or val parameter");
+      server.send(HTTP_BAD_REQUEST, "text/plain", "Missing var or val parameter");
         return;
     }
 
@@ -2893,34 +2901,34 @@ static void handleControl() {
             flashEnabled = false;
             Serial.println("[FLASH] Disabled");
         }
-        server.send(200, "text/plain", "OK");
+        server.send(HTTP_OK, "text/plain", "OK");
         return;
     }
 
       if (varName == "stream_visible") {
         updateStoredCameraSetting(runtimeConfig, varName, val);
         if (persist && !persistRuntimeConfig(runtimeConfig)) {
-          server.send(500, "text/plain", "Failed to persist stream visibility");
+          server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to persist stream visibility");
           return;
         }
-        server.send(200, "text/plain", "OK");
+        server.send(HTTP_OK, "text/plain", "OK");
         return;
       }
 
       if (!ensureCameraReady()) {
-        server.send(503, "text/plain", "Camera unavailable");
+        server.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", "Camera unavailable");
         return;
       }
 
     SemaphoreLock cameraLock(cameraMutex, pdMS_TO_TICKS(1500));
     if (!cameraLock.locked()) {
-        server.send(503, "text/plain", "Camera busy");
+      server.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", "Camera busy");
         return;
     }
 
     sensor_t *s = esp_camera_sensor_get();
     if (!cameraInitialized || !s) {
-        server.send(503, "text/plain", "Camera sensor not available");
+      server.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", "Camera sensor not available");
         return;
     }
 
@@ -2965,7 +2973,7 @@ static void handleControl() {
     else if (varName == "dcw")              res = s->set_dcw(s, val);
     else if (varName == "colorbar")         res = s->set_colorbar(s, val);
     else {
-        server.send(400, "text/plain", "Unknown variable");
+        server.send(HTTP_BAD_REQUEST, "text/plain", "Unknown variable");
         return;
     }
 
@@ -2982,25 +2990,25 @@ static void handleControl() {
     if (res == 0) {
       updateStoredCameraSetting(runtimeConfig, varName, val);
       if (persist && !persistRuntimeConfig(runtimeConfig)) {
-        server.send(500, "text/plain", "Failed to persist camera setting");
+        server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to persist camera setting");
         return;
       }
     }
 
-    server.send(200, "text/plain", res == 0 ? "OK" : "ERROR");
+    server.send(HTTP_OK, "text/plain", res == 0 ? "OK" : "ERROR");
 }
 
 static void handleStatus() {
     if (!checkAuth()) return;
 
   if (!ensureCameraReady()) {
-    server.send(503, "text/plain", "Camera unavailable");
+    server.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", "Camera unavailable");
     return;
   }
 
     sensor_t *s = esp_camera_sensor_get();
     if (!s) {
-        server.send(503, "text/plain", "Camera sensor not available");
+      server.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", "Camera sensor not available");
         return;
     }
 
@@ -3053,11 +3061,11 @@ static void handleStatus() {
     );
 
     server.sendHeader("Access-Control-Allow-Origin", "*");
-    server.send(200, "application/json", json);
+    server.send(HTTP_OK, "application/json", json);
 }
 
 static void handleNotFound() {
-    server.send(404, "text/plain", "Not found");
+    server.send(HTTP_NOT_FOUND, "text/plain", "Not found");
 }
 
 #include "modules/admin_module.inc.h"
@@ -3088,7 +3096,7 @@ static void startAuxHttpServers() {
   if (!streamServerTaskHandle) {
     streamServer.on("/stream", HTTP_GET, handleStreamWorker);
     streamServer.onNotFound([]() {
-      streamServer.send(404, "text/plain", "Not found");
+      streamServer.send(HTTP_NOT_FOUND, "text/plain", "Not found");
     });
     streamServer.begin();
     BaseType_t created = xTaskCreatePinnedToCore(
@@ -3112,7 +3120,7 @@ static void startAuxHttpServers() {
     registerSdTransferRoutes();
     registerOtaTransferRoutes();
     transferServer.onNotFound([]() {
-      transferServer.send(404, "text/plain", "Not found");
+      transferServer.send(HTTP_NOT_FOUND, "text/plain", "Not found");
     });
     transferServer.begin();
     BaseType_t created = xTaskCreatePinnedToCore(

@@ -71,7 +71,7 @@ static void handleFirmwareUploadDataWorker() {
 static void handleFirmwareUploadWorker() {
   if (!checkAuth(transferServer, true)) {
     transferServer.sendHeader("Access-Control-Allow-Origin", "*");
-    transferServer.send(401, "text/plain", "Unauthorized");
+    transferServer.send(HTTP_UNAUTHORIZED, "text/plain", ERR_UNAUTHORIZED);
     return;
   }
 
@@ -79,29 +79,29 @@ static void handleFirmwareUploadWorker() {
   transferServer.sendHeader("Connection", "close");
 
   if (firmwareUploadSuccess) {
-    transferServer.send(200, "text/plain", "Firmware uploaded successfully. Device will reboot in a moment.");
+    transferServer.send(HTTP_OK, "text/plain", "Firmware uploaded successfully. Device will reboot in a moment.");
     return;
   }
 
   if (firmwareUploadFailed) {
-    transferServer.send(500, "text/plain", "Firmware update failed. Check serial log for details.");
+    transferServer.send(HTTP_INTERNAL_ERROR, "text/plain", "Firmware update failed. Check serial log for details.");
     firmwareUploadFailed = false;
     return;
   }
 
-  transferServer.send(400, "text/plain", "No firmware file provided");
+  transferServer.send(HTTP_BAD_REQUEST, "text/plain", "No firmware file provided");
 }
 
 static void handleFirmwareUploadMain() {
   if (!checkAuth(server)) {
     server.sendHeader("Access-Control-Allow-Origin", "*");
-    server.send(401, "text/plain", "Unauthorized");
+    server.send(HTTP_UNAUTHORIZED, "text/plain", ERR_UNAUTHORIZED);
     return;
   }
 
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Location", buildLocalUrl(HTTP_TRANSFER_PORT, "/admin/update", true));
-  server.send(307, "text/plain", "Redirecting to transfer server");
+  server.send(HTTP_TEMPORARY_REDIRECT, "text/plain", "Redirecting to transfer server");
 }
 
 static void registerOtaRoutes() {

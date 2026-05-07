@@ -6,29 +6,29 @@
 static void handleDeviceNameRename() {
   if (!checkAuth()) return;
   if (!server.hasArg("name")) {
-    server.send(400, "text/plain", "Device name is required");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Device name is required");
     return;
   }
 
   String newName = server.arg("name");
   if (newName.isEmpty() || newName.length() > 32) {
-    server.send(400, "text/plain", "Device name must be between 1 and 32 characters");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Device name must be between 1 and 32 characters");
     return;
   }
 
   if (!isPrintableAscii(newName)) {
-    server.send(400, "text/plain", "Invalid characters in device name");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Invalid characters in device name");
     return;
   }
 
   StoredConfig updated = runtimeConfig;
   updated.deviceName = newName;
   if (!persistRuntimeConfig(updated)) {
-    server.send(500, "text/plain", "Failed to save configuration");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to save configuration");
     return;
   }
 
-  server.send(200, "text/plain", "Device name updated to: " + newName);
+  server.send(HTTP_OK, "text/plain", "Device name updated to: " + newName);
 }
 
 static void handleDeviceNameGet() {
@@ -44,7 +44,7 @@ static void handleDeviceNameGet() {
 
   String json = "{\"deviceName\":\"" + jsonEscape(currentName) + "\"}";
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send(200, "application/json", json);
+  server.send(HTTP_OK, "application/json", json);
 }
 
 static void handleAdminTimeStatus() {
@@ -59,7 +59,7 @@ static void handleAdminTimeStatus() {
   json += "}";
 
   server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send(200, "application/json", json);
+  server.send(HTTP_OK, "application/json", json);
 }
 
 static bool parseEpochArg(const String &raw, time_t &epochOut) {
@@ -90,13 +90,13 @@ static bool parseEpochArg(const String &raw, time_t &epochOut) {
 static void handleAdminTimeSet() {
   if (!checkAuth()) return;
   if (!server.hasArg("epoch")) {
-    server.send(400, "text/plain", "epoch is required");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "epoch is required");
     return;
   }
 
   time_t epoch = 0;
   if (!parseEpochArg(server.arg("epoch"), epoch)) {
-    server.send(400, "text/plain", "Invalid epoch value");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Invalid epoch value");
     return;
   }
 
@@ -106,42 +106,42 @@ static void handleAdminTimeSet() {
   tv.tv_sec = epoch;
   tv.tv_usec = 0;
   if (settimeofday(&tv, nullptr) != 0) {
-    server.send(500, "text/plain", "Failed to set system time");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to set system time");
     return;
   }
 
-  server.send(200, "text/plain", "Time set to: " + formatLocalTimeString());
+  server.send(HTTP_OK, "text/plain", "Time set to: " + formatLocalTimeString());
 }
 
 static void handleAdminTimeSync() {
   if (!checkAuth()) return;
 
   if (WiFi.status() != WL_CONNECTED) {
-    server.send(503, "text/plain", "WiFi is not connected");
+    server.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", "WiFi is not connected");
     return;
   }
 
   bool ok = syncClockWithNtp();
   if (!ok) {
-    server.send(500, "text/plain", "NTP sync failed");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", "NTP sync failed");
     return;
   }
 
-  server.send(200, "text/plain", "NTP synced: " + formatLocalTimeString());
+  server.send(HTTP_OK, "text/plain", "NTP synced: " + formatLocalTimeString());
 }
 
 static void handleAdminLedGet() {
   if (!checkAuth()) return;
 
   String json = "{\"ledAccessBlink\":" + String(ledAccessBlinkEnabled ? "true" : "false") + "}";
-  server.send(200, "application/json", json);
+  server.send(HTTP_OK, "application/json", json);
 }
 
 static void handleAdminLedSet() {
   if (!checkAuth()) return;
 
   if (!server.hasArg("ledAccessBlink")) {
-    server.send(400, "text/plain", "Missing ledAccessBlink parameter");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Missing ledAccessBlink parameter");
     return;
   }
 
@@ -153,25 +153,25 @@ static void handleAdminLedSet() {
   ledAccessBlinkEnabled = newValue;
 
   if (!persistRuntimeConfig(runtimeConfig)) {
-    server.send(500, "text/plain", "Failed to save LED configuration");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to save LED configuration");
     return;
   }
 
-  server.send(200, "text/plain", "LED configuration saved");
+  server.send(HTTP_OK, "text/plain", "LED configuration saved");
 }
 
 static void handleAdminLoggingGet() {
   if (!checkAuth()) return;
 
   String json = "{\"loggingEnabled\":" + String(gLoggingEnabled ? "true" : "false") + "}";
-  server.send(200, "application/json", json);
+  server.send(HTTP_OK, "application/json", json);
 }
 
 static void handleAdminLoggingSet() {
   if (!checkAuth()) return;
 
   if (!server.hasArg("loggingEnabled")) {
-    server.send(400, "text/plain", "Missing loggingEnabled parameter");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Missing loggingEnabled parameter");
     return;
   }
 
@@ -182,11 +182,11 @@ static void handleAdminLoggingSet() {
   updateSdLoggingState();
 
   if (!persistRuntimeConfig(runtimeConfig)) {
-    server.send(500, "text/plain", "Failed to save logging configuration");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to save logging configuration");
     return;
   }
 
-  server.send(200, "text/plain", "Logging configuration saved");
+  server.send(HTTP_OK, "text/plain", "Logging configuration saved");
 }
 
 // Valid wifi_power_t raw values accepted from the UI
@@ -215,14 +215,14 @@ static void handleAdminTxPowerGet() {
 
   String json = "{\"txPowerSta\":" + String((int)runtimeConfig.txPowerSta) +
                 ",\"txPowerAp\":"  + String((int)runtimeConfig.txPowerAp) + "}";
-  server.send(200, "application/json", json);
+  server.send(HTTP_OK, "application/json", json);
 }
 
 static void handleAdminTxPowerSet() {
   if (!checkAuth()) return;
 
   if (!server.hasArg("txPowerSta") || !server.hasArg("txPowerAp")) {
-    server.send(400, "text/plain", "Missing txPowerSta or txPowerAp");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Missing txPowerSta or txPowerAp");
     return;
   }
 
@@ -230,7 +230,7 @@ static void handleAdminTxPowerSet() {
   int newAp  = server.arg("txPowerAp").toInt();
 
   if (!isValidTxPowerValue(newSta) || !isValidTxPowerValue(newAp)) {
-    server.send(400, "text/plain", "Invalid TX power value");
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Invalid TX power value");
     return;
   }
 
@@ -246,11 +246,11 @@ static void handleAdminTxPowerSet() {
   }
 
   if (!persistRuntimeConfig(runtimeConfig)) {
-    server.send(500, "text/plain", "Failed to save TX power configuration");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to save TX power configuration");
     return;
   }
 
-  server.send(200, "text/plain", "TX power saved");
+  server.send(HTTP_OK, "text/plain", "TX power saved");
 }
 
 static void handleAdminReset() {
@@ -261,7 +261,7 @@ static void handleAdminReset() {
   handleUrlAccess();
   adminRestartPending = true;
   adminRestartAt = millis() + FIRMWARE_RESTART_DELAY_MS;
-  server.send(200, "text/plain", "Restart requested. Device will reboot shortly.");
+  server.send(HTTP_OK, "text/plain", "Restart requested. Device will reboot shortly.");
 }
 
 static void handleAdminFactoryReset() {
@@ -273,24 +273,24 @@ static void handleAdminFactoryReset() {
 
   ScopedSdLock sdLock(pdMS_TO_TICKS(SD_LONG_LOCK_TIMEOUT_MS));
   if (!sdLock.locked()) {
-    server.send(503, "text/plain", "SD card busy");
+    server.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", ERR_SD_CARD_BUSY);
     return;
   }
 
   if (!initSDCard()) {
-    server.send(500, "text/plain", "SD card not available");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", ERR_SD_CARD_NOT_AVAILABLE);
     return;
   }
 
   if (SD_MMC.exists(CONFIG_FILE_PATH) && !SD_MMC.remove(CONFIG_FILE_PATH)) {
-    server.send(500, "text/plain", "Failed to delete configuration file");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to delete configuration file");
     return;
   }
 
   sdLock.release();
   adminRestartPending = true;
   adminRestartAt = millis() + FIRMWARE_RESTART_DELAY_MS;
-  server.send(200, "text/plain", "Configuration deleted. Rebooting to setup mode shortly.");
+  server.send(HTTP_OK, "text/plain", "Configuration deleted. Rebooting to setup mode shortly.");
 }
 
 static void handleAdminPage() {

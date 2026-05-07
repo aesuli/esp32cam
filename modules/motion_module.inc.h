@@ -109,7 +109,7 @@ static void handleMotionReadings() {
   json += "\"highDurationMs\":" + String(highDurationMs) + ",";
   json += "\"sinceLastDetectedMs\":" + String(sinceLast);
   json += "}";
-  server.send(200, "application/json", json);
+  server.send(HTTP_OK, "application/json", json);
 }
 
 static void handleMotionConfigGet() {
@@ -133,7 +133,7 @@ static void handleMotionConfigGet() {
   json += "\"detectionIntervalSec\":" + String((int)m.detectionIntervalSec) + ",";
   json += "\"notifyUrl\":\"" + notifyUrlEscaped + "\"";
   json += "}";
-  server.send(200, "application/json", json);
+  server.send(HTTP_OK, "application/json", json);
 }
 
 static void handleMotionConfigSet() {
@@ -161,23 +161,23 @@ static void handleMotionConfigSet() {
   runtimeConfig.motionSettings = updated;
 
   if (!persistRuntimeConfig(runtimeConfig)) {
-    server.send(500, "text/plain", "Failed to save motion configuration");
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to save motion configuration");
     return;
   }
 
   configureMotionWakeup(runtimeConfig.motionSettings.wakeOnMotion);
   applyPirInputMode();
   if (wakeDisabledForPin) {
-    server.send(200, "text/plain", "Motion configuration saved; wake on motion is unavailable on the selected PIR pin");
+    server.send(HTTP_OK, "text/plain", "Motion configuration saved; wake on motion is unavailable on the selected PIR pin");
     return;
   }
-  server.send(200, "text/plain", "Motion configuration saved");
+  server.send(HTTP_OK, "text/plain", "Motion configuration saved");
 }
 
 static void handleMotionStandby() {
   if (!checkAuth()) return;
 
-  server.send(200, "text/plain", "Standby requested. Going to deep sleep now...");
+  server.send(HTTP_OK, "text/plain", "Standby requested. Going to deep sleep now...");
   delay(120);
   enterDeepSleepNow("Standby requested from motion page", 0, true);
 }
