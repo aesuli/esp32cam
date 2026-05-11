@@ -50,6 +50,33 @@ __APP_NAV__
         <label>WiFi Password</label>
         <input id="wifi_wpass" type="password" maxlength="64" placeholder="Leave blank if open">
       </div>
+      <div>
+        <label>IP Mode</label>
+        <select id="wifi_netmode">
+          <option value="dhcp">DHCP</option>
+          <option value="static">Static</option>
+        </select>
+      </div>
+      <div id="wifi_static_ip_group" style="display:none">
+        <label>Static IP</label>
+        <input id="wifi_ip" type="text" inputmode="decimal" placeholder="e.g. 192.168.1.70">
+      </div>
+      <div id="wifi_static_gw_group" style="display:none">
+        <label>Gateway</label>
+        <input id="wifi_gw" type="text" inputmode="decimal" placeholder="e.g. 192.168.1.1">
+      </div>
+      <div id="wifi_static_mask_group" style="display:none">
+        <label>Subnet Mask</label>
+        <input id="wifi_mask" type="text" inputmode="decimal" placeholder="e.g. 255.255.255.0">
+      </div>
+      <div>
+        <label>DNS 1 (optional)</label>
+        <input id="wifi_dns1" type="text" inputmode="decimal" placeholder="e.g. 1.1.1.1">
+      </div>
+      <div>
+        <label>DNS 2 (optional)</label>
+        <input id="wifi_dns2" type="text" inputmode="decimal" placeholder="e.g. 8.8.8.8">
+      </div>
       <button type="submit">Add / Update</button>
     </form>
     <div style="display:grid;grid-template-columns:1fr auto;gap:8px;margin:10px 0 12px">
@@ -196,6 +223,7 @@ __APP_FOOTER__
 function id(n){return document.getElementById(n);}
 var transferBase='http://'+window.location.hostname+':82';
 var transferToken=encodeURIComponent('__ROUTE_TOKEN__');
+var wifiCache=[];
 function setWiFiStatus(msg,err){var e=id('wifi_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setAdminStatus(msg,err){var e=id('admin_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setNameStatus(msg,err){var e=id('name_status');e.textContent=msg;e.className=err?'status error':'status';}
@@ -251,12 +279,80 @@ function scanWiFi(){
     setWiFiStatus(data.networks.length+' networks found',false);
   }).catch(function(e){setWiFiStatus(e.message,true);});
 }
+function isValidIpv4(value){
+  var trimmed=(value||'').trim();
+  if(!trimmed){return false;}
+  var parts=trimmed.split('.');
+  if(parts.length!==4){return false;}
+  return parts.every(function(part){
+    if(!/^\d{1,3}$/.test(part)){return false;}
+    var num=Number(part);
+    return num>=0&&num<=255&&String(num)===String(parseInt(part,10));
+  });
+}
+function validateIpv4Field(field,label,required,setStatus){
+  var value=(field.value||'').trim();
+  field.setCustomValidity('');
+  if(!value){
+    if(required){
+      var requiredMsg=label+' is required';
+      field.setCustomValidity(requiredMsg);
+      field.reportValidity();
+      setStatus(requiredMsg,true);
+      return false;
+    }
+    return true;
+  }
+  if(!isValidIpv4(value)){
+    var invalidMsg=label+' must be a valid IPv4 address';
+    field.setCustomValidity(invalidMsg);
+    field.reportValidity();
+    setStatus(invalidMsg,true);
+    return false;
+  }
+  field.value=value;
+  return true;
+}
+function validateWiFiForm(){
+  var staticMode=id('wifi_netmode').value==='static';
+  if(!validateIpv4Field(id('wifi_ip'),'Static IP',staticMode,setWiFiStatus)){return false;}
+  if(!validateIpv4Field(id('wifi_gw'),'Gateway',staticMode,setWiFiStatus)){return false;}
+  if(!validateIpv4Field(id('wifi_mask'),'Subnet mask',staticMode,setWiFiStatus)){return false;}
+  if(!validateIpv4Field(id('wifi_dns1'),'DNS 1',false,setWiFiStatus)){return false;}
+  if(!validateIpv4Field(id('wifi_dns2'),'DNS 2',false,setWiFiStatus)){return false;}
+  return true;
+}
+function updateWiFiStaticFieldVisibility(){
+  var staticMode=id('wifi_netmode').value==='static';
+  id('wifi_static_ip_group').style.display=staticMode?'':'none';
+  id('wifi_static_gw_group').style.display=staticMode?'':'none';
+  id('wifi_static_mask_group').style.display=staticMode?'':'none';
+}
+function setWiFiFormFromItem(item){
+  id('wifi_ssid').value=item.ssid||'';
+  id('wifi_wpass').value='';
+  id('wifi_netmode').value=(item.netmode==='static')?'static':'dhcp';
+  id('wifi_ip').value=item.ip||'';
+  id('wifi_gw').value=item.gw||'';
+  id('wifi_mask').value=item.mask||'';
+  id('wifi_dns1').value=item.dns1||'';
+  id('wifi_dns2').value=item.dns2||'';
+  updateWiFiStaticFieldVisibility();
+}
 function renderWiFiList(items){
   var list=id('wifi_list');
   if(!items.length){list.innerHTML='<div class="empty">No networks saved.</div>';return;}
   list.innerHTML=items.map(function(item,i){
-    return '<div class="item"><div><strong>'+(i+1)+'. '+item.ssid+'</strong><span style="font-size:.8em;color:#bbb">'+(item.hasPassword?'Protected':'Open')+'</span></div><div style="display:flex;gap:6px"><button onclick="moveWiFi('+i+',\'up\')"'+(i===0?' disabled':'')+'>↑</button><button onclick="moveWiFi('+i+',\'down\')"'+(i===items.length-1?' disabled':'')+'>↓</button><button onclick="deleteWiFi('+i+')">✕</button></div></div>';
+    var modeLabel=item.netmode==='static'?'Static':'DHCP';
+    var dnsSummary=(item.dns1||item.dns2)?(' DNS: '+[(item.dns1||''),(item.dns2||'')].filter(Boolean).join(', ')):' DNS: auto';
+    return '<div class="item"><div><strong>'+(i+1)+'. '+item.ssid+'</strong><span style="font-size:.8em;color:#bbb">'+(item.hasPassword?'Protected':'Open')+' • '+modeLabel+dnsSummary+'</span></div><div style="display:flex;gap:6px"><button onclick="editWiFi('+i+')">Edit</button><button onclick="moveWiFi('+i+',\'up\')"'+(i===0?' disabled':'')+'>↑</button><button onclick="moveWiFi('+i+',\'down\')"'+(i===items.length-1?' disabled':'')+'>↓</button><button onclick="deleteWiFi('+i+')">✕</button></div></div>';
   }).join('');
+}
+function editWiFi(i){
+  var item=wifiCache[i];
+  if(!item){return;}
+  setWiFiFormFromItem(item);
+  setWiFiStatus('Editing '+item.ssid+'. Submit to update.',false);
 }
 function moveWiFi(i,dir){
   fetch('/wifi/move',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({index:i,dir:dir})}).then(function(r){if(r.ok)refreshWiFiList();setWiFiStatus(r.ok?'Updated':'Failed',!r.ok);});
@@ -264,8 +360,36 @@ function moveWiFi(i,dir){
 function deleteWiFi(i){
   fetch('/wifi/delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({index:i})}).then(function(r){if(r.ok)refreshWiFiList();setWiFiStatus(r.ok?'Deleted':'Failed',!r.ok);});
 }
-function refreshWiFiList(){fetch('/wifi/list').then(function(r){return r.json();}).then(function(d){renderWiFiList(d.networks||[]);});}
-id('wifi_form').addEventListener('submit',function(e){e.preventDefault();fetch('/wifi/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({ssid:id('wifi_ssid').value,wpass:id('wifi_wpass').value})}).then(function(r){r.text().then(function(msg){setWiFiStatus(msg,!r.ok);if(r.ok){id('wifi_form').reset();refreshWiFiList();id('wifi_scan_list').value='';}});});});
+function resetWiFiForm(){
+  id('wifi_form').reset();
+  id('wifi_netmode').value='dhcp';
+  updateWiFiStaticFieldVisibility();
+}
+function refreshWiFiList(){fetch('/wifi/list').then(function(r){return r.json();}).then(function(d){wifiCache=d.networks||[];renderWiFiList(wifiCache);});}
+id('wifi_form').addEventListener('submit',function(e){
+  e.preventDefault();
+  if(!validateWiFiForm()){return;}
+  var payload={
+    ssid:id('wifi_ssid').value,
+    wpass:id('wifi_wpass').value,
+    netmode:id('wifi_netmode').value,
+    ip:id('wifi_ip').value,
+    gw:id('wifi_gw').value,
+    mask:id('wifi_mask').value,
+    dns1:id('wifi_dns1').value,
+    dns2:id('wifi_dns2').value
+  };
+  fetch('/wifi/add',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData(payload)}).then(function(r){
+    r.text().then(function(msg){
+      setWiFiStatus(msg,!r.ok);
+      if(r.ok){
+        resetWiFiForm();
+        refreshWiFiList();
+        id('wifi_scan_list').value='';
+      }
+    });
+  });
+});
 id('admin_form').addEventListener('submit',function(e){e.preventDefault();fetch('/admin/password',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({current:id('admin_current').value,next:id('admin_new').value,confirm:id('admin_confirm').value})}).then(function(r){r.text().then(function(msg){setAdminStatus(msg,!r.ok);if(r.ok)id('admin_form').reset();});});});
 id('name_form').addEventListener('submit',function(e){e.preventDefault();fetch('/admin/rename',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({name:id('device_name').value})}).then(function(r){r.text().then(function(msg){setNameStatus(msg,!r.ok);if(r.ok)refreshDeviceName();});});});
 id('time_form').addEventListener('submit',function(e){
@@ -284,6 +408,7 @@ id('time_form').addEventListener('submit',function(e){
 });
 id('ntp_sync_btn').addEventListener('click',syncNtpTime);
 id('wifi_scan_list').addEventListener('change',function(){if(this.value)id('wifi_ssid').value=this.value;});
+id('wifi_netmode').addEventListener('change',updateWiFiStaticFieldVisibility);
 function refreshLedStatus(){
   fetch('/admin/led').then(function(r){
     if(!r.ok){throw new Error('Failed to load LED settings');}
@@ -374,6 +499,7 @@ id('factory_reset_form').addEventListener('submit',function(e){
   }).catch(function(err){setFactoryResetStatus(err.message||'Factory reset failed',true);});
 });
 refreshWiFiList();
+resetWiFiForm();
 refreshDeviceName();
 refreshTimeStatus();
 refreshLedStatus();

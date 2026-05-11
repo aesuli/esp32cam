@@ -33,7 +33,7 @@ button:hover,input[type=submit]:hover{background:#c73652}
 </head>
 <body>
 <h1>ESP32-CAM Setup</h1>
-<form method="POST" action="/save">
+<form method="POST" action="/save" id="setup_form">
   <div class="fg">
     <label>WiFi SSID</label>
     <input id="setup_ssid" type="text" name="ssid" placeholder="Network name" required maxlength="32">
@@ -46,6 +46,33 @@ button:hover,input[type=submit]:hover{background:#c73652}
   <div class="fg">
     <label>WiFi Password</label>
     <input type="password" name="wpass" placeholder="Leave blank if open" maxlength="64">
+  </div>
+  <div class="fg">
+    <label>IP Mode</label>
+    <select id="setup_netmode" name="netmode">
+      <option value="dhcp">DHCP</option>
+      <option value="static">Static</option>
+    </select>
+  </div>
+  <div class="fg" id="setup_static_ip_group" style="display:none">
+    <label>Static IP</label>
+    <input type="text" id="setup_ip" name="ip" inputmode="decimal" placeholder="e.g. 192.168.1.70">
+  </div>
+  <div class="fg" id="setup_static_gw_group" style="display:none">
+    <label>Gateway</label>
+    <input type="text" id="setup_gw" name="gw" inputmode="decimal" placeholder="e.g. 192.168.1.1">
+  </div>
+  <div class="fg" id="setup_static_mask_group" style="display:none">
+    <label>Subnet Mask</label>
+    <input type="text" id="setup_mask" name="mask" inputmode="decimal" placeholder="e.g. 255.255.255.0">
+  </div>
+  <div class="fg">
+    <label>DNS 1 (optional)</label>
+    <input type="text" id="setup_dns1" name="dns1" inputmode="decimal" placeholder="e.g. 1.1.1.1">
+  </div>
+  <div class="fg">
+    <label>DNS 2 (optional)</label>
+    <input type="text" id="setup_dns2" name="dns2" inputmode="decimal" placeholder="e.g. 8.8.8.8">
   </div>
   <div class="fg">
     <label>Camera Access Password</label>
@@ -93,10 +120,66 @@ function setupScanWifi(){
     setupSetScanStatus(err.message||'Failed to scan WiFi',true);
   });
 }
+function setupIsValidIpv4(value){
+  var trimmed=(value||'').trim();
+  if(!trimmed){return false;}
+  var parts=trimmed.split('.');
+  if(parts.length!==4){return false;}
+  return parts.every(function(part){
+    if(!/^\d{1,3}$/.test(part)){return false;}
+    var num=Number(part);
+    return num>=0&&num<=255&&String(num)===String(parseInt(part,10));
+  });
+}
+function setupValidateIpv4Field(field,label,required){
+  var value=(field.value||'').trim();
+  field.setCustomValidity('');
+  if(!value){
+    if(required){
+      var requiredMsg=label+' is required';
+      field.setCustomValidity(requiredMsg);
+      field.reportValidity();
+      setupSetScanStatus(requiredMsg,true);
+      return false;
+    }
+    return true;
+  }
+  if(!setupIsValidIpv4(value)){
+    var invalidMsg=label+' must be a valid IPv4 address';
+    field.setCustomValidity(invalidMsg);
+    field.reportValidity();
+    setupSetScanStatus(invalidMsg,true);
+    return false;
+  }
+  field.value=value;
+  return true;
+}
+function setupValidateNetworkFields(){
+  var staticMode=sid('setup_netmode').value==='static';
+  if(!setupValidateIpv4Field(sid('setup_ip'),'Static IP',staticMode)){return false;}
+  if(!setupValidateIpv4Field(sid('setup_gw'),'Gateway',staticMode)){return false;}
+  if(!setupValidateIpv4Field(sid('setup_mask'),'Subnet mask',staticMode)){return false;}
+  if(!setupValidateIpv4Field(sid('setup_dns1'),'DNS 1',false)){return false;}
+  if(!setupValidateIpv4Field(sid('setup_dns2'),'DNS 2',false)){return false;}
+  return true;
+}
 sid('setup_scan_btn').addEventListener('click',setupScanWifi);
 sid('setup_scan_list').addEventListener('change',function(){
   if(this.value){sid('setup_ssid').value=this.value;}
 });
+sid('setup_form').addEventListener('submit',function(e){
+  if(!setupValidateNetworkFields()){
+    e.preventDefault();
+  }
+});
+function setupUpdateStaticFieldVisibility(){
+  var staticMode=sid('setup_netmode').value==='static';
+  sid('setup_static_ip_group').style.display=staticMode?'':'none';
+  sid('setup_static_gw_group').style.display=staticMode?'':'none';
+  sid('setup_static_mask_group').style.display=staticMode?'':'none';
+}
+sid('setup_netmode').addEventListener('change',setupUpdateStaticFieldVisibility);
+setupUpdateStaticFieldVisibility();
 </script>
 </body>
 </html>)html";

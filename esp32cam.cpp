@@ -121,6 +121,12 @@ static constexpr const char* PARAM_INDEX = "index";
 static constexpr const char* PARAM_CURRENT = "current";
 static constexpr const char* PARAM_NEXT = "next";
 static constexpr const char* PARAM_CONFIRM = "confirm";
+static constexpr const char* PARAM_NET_MODE = "netmode";
+static constexpr const char* PARAM_STATIC_IP = "ip";
+static constexpr const char* PARAM_GATEWAY = "gw";
+static constexpr const char* PARAM_SUBNET = "mask";
+static constexpr const char* PARAM_DNS1 = "dns1";
+static constexpr const char* PARAM_DNS2 = "dns2";
 
 // ─── HTTP error messages ──────────────────────────────────────────────────────
 static constexpr const char* ERR_FILE_REQUIRED = "file parameter required";
@@ -451,6 +457,12 @@ struct OwnedJpegFrame {
 struct WifiCredential {
   String ssid;
   String wifiPass;
+  bool useStaticIp = false;
+  String staticIp;
+  String gateway;
+  String subnet;
+  String dns1;
+  String dns2;
 };
 
 struct CameraSettings {
@@ -538,6 +550,7 @@ static bool appendRecordingFrame(const OwnedJpegFrame &frame);
 static void stopRecordingSession(bool keepFile);
 static bool loadRuntimeConfigWithRetries(StoredConfig &cfg);
 static bool initCameraWithRetries();
+static bool applyWifiClientConfig(const WifiCredential &wifi);
 static void servicePendingFirmwareRestart();
 static void servicePendingAdminRestart();
 static void configureButtonWakeup();
@@ -1134,6 +1147,14 @@ static bool connectToSavedStaNetworks(bool showLedFeedback, bool initializeCamer
       }
     }
 
+    if (!applyWifiClientConfig(wifi)) {
+      if (showLedFeedback) {
+        ledWifiFailureSequence();
+      }
+      Serial.printf("[WIFI] Skipping network %s due to invalid network configuration\n", wifi.ssid.c_str());
+      continue;
+    }
+
     if (wifi.wifiPass.isEmpty()) {
       WiFi.begin(wifi.ssid.c_str());
     } else {
@@ -1670,6 +1691,146 @@ static bool isPrintableAscii(const String &value) {
   return true;
 }
 
+static bool parseIpv4String(const String &raw, IPAddress &out) {
+  String trimmed = raw;
+  trimmed.trim();
+  if (trimmed.isEmpty()) {
+    return false;
+  }
+  return out.fromString(trimmed);
+}
+
+static String normalizedIpv4String(const String &raw) {
+  IPAddress ip;
+  if (!parseIpv4String(raw, ip)) {
+    return "";
+  }
+  return ip.toString();
+}
+
+static bool parseWifiNetworkMode(const String &rawMode, bool &useStaticIp) {
+  String mode = rawMode;
+  mode.trim();
+  mode.toLowerCase();
+  if (mode.isEmpty() || mode == "dhcp") {
+    useStaticIp = false;
+    return true;
+  }
+  if (mode == "static") {
+    useStaticIp = true;
+    return true;
+  }
+  return false;
+}
+
+static bool parseWifiNetworkArgs(WifiCredential &wifi, String &errorOut) {
+  bool useStaticIp = false;
+  String modeValue = server.hasArg(PARAM_NET_MODE) ? server.arg(PARAM_NET_MODE) : "dhcp";
+  if (!parseWifiNetworkMode(modeValue, useStaticIp)) {
+    errorOut = "Invalid network mode";
+    return false;
+  }
+
+  String ip = server.hasArg(PARAM_STATIC_IP) ? server.arg(PARAM_STATIC_IP) : "";
+  String gw = server.hasArg(PARAM_GATEWAY) ? server.arg(PARAM_GATEWAY) : "";
+  String mask = server.hasArg(PARAM_SUBNET) ? server.arg(PARAM_SUBNET) : "";
+  String dns1 = server.hasArg(PARAM_DNS1) ? server.arg(PARAM_DNS1) : "";
+  String dns2 = server.hasArg(PARAM_DNS2) ? server.arg(PARAM_DNS2) : "";
+
+  ip.trim();
+  gw.trim();
+  mask.trim();
+  dns1.trim();
+  dns2.trim();
+
+  if (useStaticIp) {
+    if (ip.isEmpty() || gw.isEmpty() || mask.isEmpty()) {
+      errorOut = "Static mode requires IP, gateway, and subnet";
+      return false;
+    }
+    String normalizedIp = normalizedIpv4String(ip);
+    String normalizedGw = normalizedIpv4String(gw);
+    String normalizedMask = normalizedIpv4String(mask);
+    if (normalizedIp.isEmpty() || normalizedGw.isEmpty() || normalizedMask.isEmpty()) {
+      errorOut = "Invalid static IPv4 address values";
+      return false;
+    }
+    wifi.staticIp = normalizedIp;
+    wifi.gateway = normalizedGw;
+    wifi.subnet = normalizedMask;
+  } else {
+    wifi.staticIp = "";
+    wifi.gateway = "";
+    wifi.subnet = "";
+  }
+
+  if (!dns1.isEmpty()) {
+    String normalizedDns1 = normalizedIpv4String(dns1);
+    if (normalizedDns1.isEmpty()) {
+      errorOut = "Invalid DNS 1 IPv4 address";
+      return false;
+    }
+    wifi.dns1 = normalizedDns1;
+  } else {
+    wifi.dns1 = "";
+  }
+
+  if (!dns2.isEmpty()) {
+    String normalizedDns2 = normalizedIpv4String(dns2);
+    if (normalizedDns2.isEmpty()) {
+      errorOut = "Invalid DNS 2 IPv4 address";
+      return false;
+    }
+    wifi.dns2 = normalizedDns2;
+  } else {
+    wifi.dns2 = "";
+  }
+
+  wifi.useStaticIp = useStaticIp;
+  return true;
+}
+
+static bool applyWifiClientConfig(const WifiCredential &wifi) {
+  IPAddress none((uint32_t)0U);
+  IPAddress dns1 = none;
+  IPAddress dns2 = none;
+
+  if (!wifi.dns1.isEmpty() && !dns1.fromString(wifi.dns1)) {
+    Serial.printf("[WIFI] Invalid DNS1 for %s: %s\n", wifi.ssid.c_str(), wifi.dns1.c_str());
+    return false;
+  }
+  if (!wifi.dns2.isEmpty() && !dns2.fromString(wifi.dns2)) {
+    Serial.printf("[WIFI] Invalid DNS2 for %s: %s\n", wifi.ssid.c_str(), wifi.dns2.c_str());
+    return false;
+  }
+
+  if (wifi.useStaticIp) {
+    IPAddress ip;
+    IPAddress gw;
+    IPAddress mask;
+    if (!ip.fromString(wifi.staticIp) || !gw.fromString(wifi.gateway) || !mask.fromString(wifi.subnet)) {
+      Serial.printf("[WIFI] Invalid static IP config for %s\n", wifi.ssid.c_str());
+      return false;
+    }
+
+    if (dns1 == none) {
+      dns1 = gw;
+    }
+
+    bool ok = WiFi.config(ip, gw, mask, dns1, dns2);
+    Serial.printf("[WIFI] %s static config for %s\n", ok ? "Applied" : "Failed to apply", wifi.ssid.c_str());
+    return ok;
+  }
+
+  bool ok = (dns1 == none && dns2 == none)
+      ? WiFi.config(none, none, none)
+      : WiFi.config(none, none, none, dns1, dns2);
+  if (!ok) {
+    Serial.printf("[WIFI] Failed to apply DHCP config for %s\n", wifi.ssid.c_str());
+  }
+  return ok;
+}
+
 static String jsonEscape(const String &value) {
   String escaped;
   escaped.reserve(value.length() + 8);
@@ -1892,7 +2053,7 @@ static bool decryptPayload(const String &ivHex, const String &cipherHex, std::ve
 
 static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipherHex) {
   std::vector<uint8_t> plain;
-  plain.reserve(cfg.adminPass.length() + cfg.deviceName.length() + cfg.wifiList.size() * 32 + cfg.motionSettings.notifyUrl.length() + 66);
+  plain.reserve(cfg.adminPass.length() + cfg.deviceName.length() + cfg.wifiList.size() * 96 + cfg.motionSettings.notifyUrl.length() + 128);
 
   uint16_t wifiCount = (uint16_t)cfg.wifiList.size();
   plain.push_back((uint8_t)(wifiCount & 0xFF));
@@ -1900,6 +2061,12 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
   for (size_t i = 0; i < cfg.wifiList.size(); ++i) {
     appendField(plain, cfg.wifiList[i].ssid);
     appendField(plain, cfg.wifiList[i].wifiPass);
+    appendU8(plain, cfg.wifiList[i].useStaticIp ? 1 : 0);
+    appendField(plain, cfg.wifiList[i].staticIp);
+    appendField(plain, cfg.wifiList[i].gateway);
+    appendField(plain, cfg.wifiList[i].subnet);
+    appendField(plain, cfg.wifiList[i].dns1);
+    appendField(plain, cfg.wifiList[i].dns2);
   }
   appendField(plain, cfg.adminPass);
   appendField(plain, cfg.deviceName);
@@ -1927,7 +2094,7 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
   return encryptPayload(plain, ivHex, cipherHex);
 }
 
-static bool decryptConfigV6(const String &ivHex, const String &cipherHex, StoredConfig &cfg) {
+static bool decryptConfigV7(const String &ivHex, const String &cipherHex, StoredConfig &cfg) {
   std::vector<uint8_t> plain;
   if (!decryptPayload(ivHex, cipherHex, plain)) {
     return false;
@@ -1945,8 +2112,16 @@ static bool decryptConfigV6(const String &ivHex, const String &cipherHex, Stored
   cfg.wifiList.reserve(wifiCount);
   for (uint16_t i = 0; i < wifiCount; ++i) {
     WifiCredential wifi;
+    uint8_t useStaticIp = 0;
     if (!readField(plain, offset, wifi.ssid)) return false;
     if (!readField(plain, offset, wifi.wifiPass)) return false;
+    if (!readU8(plain, offset, useStaticIp)) return false;
+    wifi.useStaticIp = (useStaticIp != 0);
+    if (!readField(plain, offset, wifi.staticIp)) return false;
+    if (!readField(plain, offset, wifi.gateway)) return false;
+    if (!readField(plain, offset, wifi.subnet)) return false;
+    if (!readField(plain, offset, wifi.dns1)) return false;
+    if (!readField(plain, offset, wifi.dns2)) return false;
     cfg.wifiList.push_back(wifi);
   }
   if (!readField(plain, offset, cfg.adminPass)) {
@@ -2045,7 +2220,6 @@ static bool decryptConfigV6(const String &ivHex, const String &cipherHex, Stored
     if (offset + 2 <= plain.size()) {
       if (!readU16(plain, offset, cfg.motionSettings.detectionIntervalSec)) return false;
     }
-    // Backward compatibility: very old configs may include trailing legacy bytes.
     size_t remaining = plain.size() - offset;
     if (remaining == 1) {
       uint8_t legacySensitivity = 0;
@@ -2089,7 +2263,7 @@ static bool saveConfigToSD(const StoredConfig &cfg) {
       return false;
     }
 
-    file.println("ESP32CAMCFG6");
+    file.println("ESP32CAMCFG7");
     file.println(ivHex);
     file.println(cipherHex);
     file.close();
@@ -2130,11 +2304,14 @@ static bool loadConfigFromSD(StoredConfig &cfg) {
   ivHex.trim();
   cipherHex.trim();
 
-  if (magic == "ESP32CAMCFG6") {
-    if (!decryptConfigV6(ivHex, cipherHex, cfg)) {
-      Serial.println("[CFG] Failed to decrypt config");
+  if (magic == "ESP32CAMCFG7") {
+    if (!decryptConfigV7(ivHex, cipherHex, cfg)) {
+      Serial.println("[CFG] Failed to decrypt CFG7 config");
       return false;
     }
+  } else {
+    Serial.printf("[CFG] Unsupported config magic: %s\n", magic.c_str());
+    return false;
   }
 
   clampMotionSettings(cfg.motionSettings);
@@ -2566,6 +2743,11 @@ static void handleSave() {
     WifiCredential wifi;
     wifi.ssid = newSSID;
     wifi.wifiPass = newWPass;
+    String wifiNetworkError;
+    if (!parseWifiNetworkArgs(wifi, wifiNetworkError)) {
+      server.send(HTTP_BAD_REQUEST, "text/plain", wifiNetworkError);
+      return;
+    }
     cfg.wifiList.push_back(wifi);
     cfg.adminPass = newAPass;
     cfg.deviceName = server.hasArg("dname") ? server.arg("dname") : "ESP32-CAM";
@@ -2695,6 +2877,14 @@ static void handleWifiList() {
     json += "{\"ssid\":\"" + jsonEscape(runtimeConfig.wifiList[i].ssid) + "\",";
     json += "\"hasPassword\":";
     json += runtimeConfig.wifiList[i].wifiPass.isEmpty() ? "false" : "true";
+    json += ",\"netmode\":\"";
+    json += runtimeConfig.wifiList[i].useStaticIp ? "static" : "dhcp";
+    json += "\",";
+    json += "\"ip\":\"" + jsonEscape(runtimeConfig.wifiList[i].staticIp) + "\",";
+    json += "\"gw\":\"" + jsonEscape(runtimeConfig.wifiList[i].gateway) + "\",";
+    json += "\"mask\":\"" + jsonEscape(runtimeConfig.wifiList[i].subnet) + "\",";
+    json += "\"dns1\":\"" + jsonEscape(runtimeConfig.wifiList[i].dns1) + "\",";
+    json += "\"dns2\":\"" + jsonEscape(runtimeConfig.wifiList[i].dns2) + "\"";
     json += '}';
   }
   json += "]}";
@@ -2723,21 +2913,28 @@ static void handleWifiAdd() {
     return;
   }
 
+  WifiCredential incoming;
+  incoming.ssid = newSSID;
+  incoming.wifiPass = newWPass;
+
+  String wifiNetworkError;
+  if (!parseWifiNetworkArgs(incoming, wifiNetworkError)) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", wifiNetworkError);
+    return;
+  }
+
   StoredConfig updated = runtimeConfig;
   bool replaced = false;
   for (size_t i = 0; i < updated.wifiList.size(); ++i) {
     if (updated.wifiList[i].ssid == newSSID) {
-      updated.wifiList[i].wifiPass = newWPass;
+      updated.wifiList[i] = incoming;
       replaced = true;
       break;
     }
   }
 
   if (!replaced) {
-    WifiCredential wifi;
-    wifi.ssid = newSSID;
-    wifi.wifiPass = newWPass;
-    updated.wifiList.push_back(wifi);
+    updated.wifiList.push_back(incoming);
   }
 
   if (!persistRuntimeConfig(updated)) {
