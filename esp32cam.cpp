@@ -389,6 +389,12 @@ static void serviceLogFileFlush() {
     return;
   }
 
+  // In recovery/no-SD boot path, avoid periodic SD re-mount attempts from logger flush.
+  if (!sdCardAvailableAtBoot) {
+    clearLogFileBuffer();
+    return;
+  }
+
   if (motionActionWindowActive || gLogWriteInProgress || gSdOperationInProgress || !sdMutex) {
     return;
   }
@@ -703,6 +709,7 @@ static void serviceLogFileFlush();
 static void configureButtonWakeup();
 static void configureMotionWakeup(bool enabled);
 static void applyPirInputMode();
+static void clearRtcGpioDControl();
 static void restoreInputPinsAfterSDInit();
 static void logSharedPinCaveats();
 static void updateSdLoggingState();
@@ -933,25 +940,56 @@ static bool initSDCard() {
   // 1-bit mode stops SDMMC from actively using DAT1/DAT2/DAT3, but the socket
   // and the card still keep GPIO12/GPIO13 electrically tied to DAT2/DAT3.
   // Retry several times: SD cards can be slow to respond on cold boot.
+  bool sawCardPresence = false;
   for (int attempt = 1; attempt <= 5; ++attempt) {
+    SD_MMC.end();
     bool mounted = SD_MMC.begin("/sdcard", true);
     restoreInputPinsAfterSDInit();
+
+    sdcard_type_t cardType = SD_MMC.cardType();
+    if (cardType != CARD_NONE) {
+      sawCardPresence = true;
+    }
+
     if (mounted) {
-      if (SD_MMC.cardType() != CARD_NONE) {
-        gSdCardMounted = true;
-        Logger.Log("[SD] Mounted in 1-bit mode (attempt %d)\n", attempt);
-        return true;
+      if (cardType == CARD_NONE) {
+        SD_MMC.end();
+        gSdCardMounted = false;
+        restoreInputPinsAfterSDInit();
+        Logger.Log("[SD] No card detected on attempt %d\n", attempt);
+      } else {
+        // Extra sanity check: card responded and mount succeeded, ensure root FS is readable.
+        File root = SD_MMC.open("/");
+        if (!root || !root.isDirectory()) {
+          if (root) {
+            root.close();
+          }
+          SD_MMC.end();
+          gSdCardMounted = false;
+          restoreInputPinsAfterSDInit();
+          Logger.Log("[SD] Card detected but filesystem invalid/unreadable on attempt %d\n", attempt);
+        } else {
+          root.close();
+          gSdCardMounted = true;
+          Logger.Log("[SD] Mounted in 1-bit mode (attempt %d)\n", attempt);
+          return true;
+        }
       }
-      SD_MMC.end();
-      gSdCardMounted = false;
-      restoreInputPinsAfterSDInit();
-      Logger.Log("[SD] No card detected on attempt %d\n", attempt);
     } else {
-      Logger.Log("[SD] Mount failed on attempt %d\n", attempt);
+      if (cardType == CARD_NONE) {
+        Logger.Log("[SD] No card/electrical response on attempt %d\n", attempt);
+      } else {
+        Logger.Log("[SD] Card detected but mount failed on attempt %d\n", attempt);
+      }
     }
     delay(500);
   }
 
+  if (sawCardPresence) {
+    Logger.LogLine("[SD] Card was detected, but filesystem mount failed (possible corrupted or unsupported filesystem)");
+  } else {
+    Logger.LogLine("[SD] No SD card detected (or SD bus did not respond)");
+  }
   Logger.LogLine("[SD] Failed to mount after 5 attempts");
   return false;
 }
@@ -3817,13 +3855,10 @@ static void initializeWakeupIndicator() {
 }
 
 static void initializeBootPins() {
-  pinMode(BUTTON_GPIO, INPUT_PULLUP);
-  pinMode(PIR_GPIO, INPUT);
-  attachInterrupt(digitalPinToInterrupt(PIR_GPIO), onPirEdgeInterrupt, CHANGE);
+  clearRtcGpioDControl();
   pinMode(LED_FLASH_GPIO_NUM, OUTPUT);
   digitalWrite(LED_FLASH_GPIO_NUM, LOW);
   powerDownCameraHardware();
-  configureButtonWakeup();
 }
 
 static void initializeButtonState() {
@@ -3886,6 +3921,8 @@ static void loadStartupConfig() {
   if (!sdCardAvailableAtBoot) {
     Logger.LogLine("[CFG] SD card missing at boot - skipping config load");
     applyDefaultStartupConfig();
+    runtimeConfig.logFileEnabled = false;
+    gLogFileEnabled = false;
     return;
   }
 
@@ -3949,7 +3986,6 @@ void setup() {
   }
 
   initializeBootPins();
-  initializeButtonState();
   logInputPinConfiguration();
   resetMotionRuntimeState();
 
@@ -3957,6 +3993,10 @@ void setup() {
   if (!sdCardAvailableAtBoot) {
     Logger.LogLine("[SD] Boot check: SD card unavailable");
   }
+
+  // Configure and sample button only after SD probe has completed, because
+  // GPIO13 is electrically shared with SD DAT3 on ESP32-CAM.
+  initializeButtonState();
 
   loadStartupConfig();
   finalizeMotionStartupConfig();

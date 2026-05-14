@@ -3,6 +3,8 @@
 // Motion, PIR, wake/sleep, and motion-route handlers.
 // Included directly by esp32cam.cpp so it can share existing static firmware state.
 
+static bool motionWakeupExt1Enabled = false;  // Track if EXT1 wakeup is currently enabled
+
 static bool isValidMotionIntervalSec(uint16_t seconds) {
   return seconds == 0 || seconds == 5 || seconds == 10 || seconds == 30 || seconds == 60 || seconds == 600;
 }
@@ -25,6 +27,14 @@ static void clampMotionSettings(MotionSettings &settings) {
     settings.notifyUrl = settings.notifyUrl.substring(0, 255);
     settings.notifyUrl.trim();
   }
+}
+
+static void clearRtcGpioDControl() {
+  // After deep sleep with RTC GPIO config (rtc_gpio_pullup_en, etc), those settings
+  // persist and block SD_MMC from using GPIO12/13. Clear RTC claims on shared pins.
+  rtc_gpio_deinit((gpio_num_t)BUTTON_GPIO);
+  rtc_gpio_deinit((gpio_num_t)PIR_GPIO);
+  Logger.LogLine("[GPIO] Cleared RTC control from GPIO13 and GPIO12 after wake-up");
 }
 
 static void applyPirInputMode() {
@@ -202,7 +212,13 @@ static void configureButtonWakeup() {
 }
 
 static void configureMotionWakeup(bool enabled) {
-  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
+  // Only attempt to disable EXT1 if it was previously enabled to avoid errors
+  // during initial configuration when the wakeup source hasn't been set up yet.
+  if (motionWakeupExt1Enabled) {
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
+  }
+  motionWakeupExt1Enabled = false;
+  
   if (!enabled) {
     Logger.LogLine("[SLEEP] Motion wakeup disabled");
     return;
@@ -217,6 +233,7 @@ static void configureMotionWakeup(bool enabled) {
 
   rtc_gpio_pullup_dis((gpio_num_t)PIR_GPIO);
   rtc_gpio_pulldown_dis((gpio_num_t)PIR_GPIO);
+  motionWakeupExt1Enabled = true;
   Logger.Log("[SLEEP] Wakeup source configured: motion GPIO%d HIGH\n", PIR_GPIO);
 }
 
@@ -282,7 +299,11 @@ static void prepareDeviceForDeepSleep() {
   Logger.Log("[SLEEP] %s\n", reason ? reason : "Entering deep sleep");
   prepareDeviceForDeepSleep();
 
-  esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
+  // Only disable EXT1 if it was previously enabled to avoid errors
+  if (motionWakeupExt1Enabled) {
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
+    motionWakeupExt1Enabled = false;
+  }
   configureButtonWakeup();
   if (allowMotionWake && runtimeConfig.motionSettings.wakeOnMotion) {
     configureMotionWakeup(true);
