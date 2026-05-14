@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 // Motion, PIR, wake/sleep, and motion-route handlers.
 // Included directly by esp32cam.cpp so it can share existing static firmware state.
@@ -28,8 +28,10 @@ static void clampMotionSettings(MotionSettings &settings) {
 }
 
 static void applyPirInputMode() {
-  pinMode(PIR_GPIO, INPUT_PULLDOWN);
-  Serial.printf("[GPIO] PIR mode applied on GPIO%d: INPUT_PULLDOWN\n", PIR_GPIO);
+  // Keep PIR input high-impedance; internal pull resistors can mask weak module outputs,
+  // especially on shared GPIO12/SD lines.
+  pinMode(PIR_GPIO, INPUT);
+  Logger.Log("[GPIO] PIR mode applied on GPIO%d: INPUT\n", PIR_GPIO);
 }
 
 static void restoreInputPinsAfterSDInit() {
@@ -38,26 +40,25 @@ static void restoreInputPinsAfterSDInit() {
   attachInterrupt(digitalPinToInterrupt(PIR_GPIO), onPirEdgeInterrupt, CHANGE);
 }
 
-static void logSharedPinCaveats() {
-  if (PIR_GPIO == 12) {
-    Serial.println("[GPIO] Warning: PIR on GPIO12 shares SD DAT2 and the ESP32 strap/pulldown network; weak HIGH outputs may remain LOW with an SD card inserted");
-  } else if (PIR_GPIO == 13) {
-    Serial.println("[GPIO] Warning: PIR on GPIO13 shares SD DAT3 and its pull-up network; the line can read HIGH or edge on card insert/remove");
-  }
-
-  if (BUTTON_GPIO == 12) {
-    Serial.println("[GPIO] Note: button on GPIO12 shares SD DAT2; a strong switch to GND usually works, but the line is not isolated from the SD socket");
-  } else if (BUTTON_GPIO == 13) {
-    Serial.println("[GPIO] Note: button on GPIO13 shares SD DAT3; a strong switch to GND usually works, but the line is not isolated from the SD socket");
-  }
+static void resetMotionDetectionState() {
+  motionRawHigh = false;
+  motionLatched = false;
+  motionBootEventPending = false;
+  motionEdgePending = false;
+  motionHighSinceAt = 0;
+  motionLastDetectedAt = 0;
+  motionActionWindowActive = false;
+  motionNotifyPending = false;
+  motionNotifyLastAttemptAt = 0;
+  motionIgnoreUntilAt = 0;
+  motionPendingImages = 0;
+  motionVideoManagedRecording = false;
+  motionRecordingStopAt = 0;
 }
 
 static void updateSdLoggingState() {
-  gLogSdMirrorEnabled = gLoggingEnabled;
-}
-
-static bool pirSupportsRtcWakeup() {
-  return rtc_gpio_is_valid_gpio((gpio_num_t)PIR_GPIO);
+  gLogSerialEnabled = runtimeConfig.logSerialEnabled;
+  gLogFileEnabled = runtimeConfig.logFileEnabled;
 }
 
 static void IRAM_ATTR onPirEdgeInterrupt() {
@@ -127,6 +128,7 @@ static void handleMotionConfigGet() {
   json += "\"imageDelayDs\":" + String((int)m.imageDelayDs) + ",";
   json += "\"captureVideo\":" + String(m.captureVideo ? "true" : "false") + ",";
   json += "\"videoDurationSec\":" + String((int)m.videoDurationSec) + ",";
+  json += "\"standbyButtonEnabled\":" + String(m.standbyButtonEnabled ? "true" : "false") + ",";
   json += "\"wakeOnMotion\":" + String(m.wakeOnMotion ? "true" : "false") + ",";
   json += "\"autoStandby\":" + String(m.autoStandby ? "true" : "false") + ",";
   json += "\"standbyAfterSec\":" + String((int)m.standbyAfterSec) + ",";
@@ -146,6 +148,7 @@ static void handleMotionConfigSet() {
   if (server.hasArg("imageDelayDs")) updated.imageDelayDs = (uint8_t)server.arg("imageDelayDs").toInt();
   if (server.hasArg("captureVideo")) updated.captureVideo = server.arg("captureVideo") == "1" || server.arg("captureVideo") == "true";
   if (server.hasArg("videoDurationSec")) updated.videoDurationSec = (uint8_t)server.arg("videoDurationSec").toInt();
+  if (server.hasArg("standbyButtonEnabled")) updated.standbyButtonEnabled = server.arg("standbyButtonEnabled") == "1" || server.arg("standbyButtonEnabled") == "true";
   if (server.hasArg("wakeOnMotion")) updated.wakeOnMotion = server.arg("wakeOnMotion") == "1" || server.arg("wakeOnMotion") == "true";
   if (server.hasArg("autoStandby")) updated.autoStandby = server.arg("autoStandby") == "1" || server.arg("autoStandby") == "true";
   if (server.hasArg("standbyAfterSec")) updated.standbyAfterSec = (uint16_t)server.arg("standbyAfterSec").toInt();
@@ -153,11 +156,6 @@ static void handleMotionConfigSet() {
   if (server.hasArg("notifyUrl")) updated.notifyUrl = server.arg("notifyUrl");
 
   clampMotionSettings(updated);
-  bool wakeDisabledForPin = false;
-  if (updated.wakeOnMotion && !pirSupportsRtcWakeup()) {
-    updated.wakeOnMotion = false;
-    wakeDisabledForPin = true;
-  }
   runtimeConfig.motionSettings = updated;
 
   if (!persistRuntimeConfig(runtimeConfig)) {
@@ -165,12 +163,10 @@ static void handleMotionConfigSet() {
     return;
   }
 
+  resetMotionDetectionState();
   configureMotionWakeup(runtimeConfig.motionSettings.wakeOnMotion);
   applyPirInputMode();
-  if (wakeDisabledForPin) {
-    server.send(HTTP_OK, "text/plain", "Motion configuration saved; wake on motion is unavailable on the selected PIR pin");
-    return;
-  }
+  attachInterrupt(digitalPinToInterrupt(PIR_GPIO), onPirEdgeInterrupt, CHANGE);
   server.send(HTTP_OK, "text/plain", "Motion configuration saved");
 }
 
@@ -196,42 +192,37 @@ static void registerMotionRoutes() {
 static void configureButtonWakeup() {
   esp_err_t err = esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_GPIO, 0);
   if (err != ESP_OK) {
-    Serial.printf("[SLEEP] Failed to enable EXT0 wakeup on GPIO%d (err=0x%x)\n", BUTTON_GPIO, err);
+    Logger.Log("[SLEEP] Failed to enable EXT0 wakeup on GPIO%d (err=0x%x)\n", BUTTON_GPIO, err);
     return;
   }
 
   rtc_gpio_pullup_en((gpio_num_t)BUTTON_GPIO);
   rtc_gpio_pulldown_dis((gpio_num_t)BUTTON_GPIO);
-  Serial.printf("[SLEEP] Wakeup source configured: button GPIO%d LOW\n", BUTTON_GPIO);
+  Logger.Log("[SLEEP] Wakeup source configured: button GPIO%d LOW\n", BUTTON_GPIO);
 }
 
 static void configureMotionWakeup(bool enabled) {
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
   if (!enabled) {
-    Serial.println("[SLEEP] Motion wakeup disabled");
-    return;
-  }
-
-  if (!pirSupportsRtcWakeup()) {
-    Serial.printf("[SLEEP] Motion wakeup unavailable on GPIO%d; an RTC-capable GPIO is required\n", PIR_GPIO);
+    Logger.LogLine("[SLEEP] Motion wakeup disabled");
     return;
   }
 
   uint64_t mask = (1ULL << PIR_GPIO);
   esp_err_t err = esp_sleep_enable_ext1_wakeup(mask, ESP_EXT1_WAKEUP_ANY_HIGH);
   if (err != ESP_OK) {
-    Serial.printf("[SLEEP] Failed to enable EXT1 wakeup on GPIO%d (err=0x%x)\n", PIR_GPIO, err);
+    Logger.Log("[SLEEP] Failed to enable EXT1 wakeup on GPIO%d (err=0x%x)\n", PIR_GPIO, err);
     return;
   }
 
   rtc_gpio_pullup_dis((gpio_num_t)PIR_GPIO);
-  rtc_gpio_pulldown_en((gpio_num_t)PIR_GPIO);
-  Serial.printf("[SLEEP] Wakeup source configured: motion GPIO%d HIGH\n", PIR_GPIO);
+  rtc_gpio_pulldown_dis((gpio_num_t)PIR_GPIO);
+  Logger.Log("[SLEEP] Wakeup source configured: motion GPIO%d HIGH\n", PIR_GPIO);
 }
 
 static void handleWakeupIndicator() {
   if (bootWakeCause == ESP_SLEEP_WAKEUP_EXT0) {
-    Serial.printf("[BOOT] Wakeup from deep sleep via button GPIO%d\n", BUTTON_GPIO);
+    Logger.Log("[BOOT] Wakeup from deep sleep via button GPIO%d\n", BUTTON_GPIO);
     ledBlinkCount(2, BUTTON_BLINK_ON_MS, BUTTON_BLINK_OFF_MS);
     return;
   }
@@ -239,7 +230,7 @@ static void handleWakeupIndicator() {
   if (bootWakeCause == ESP_SLEEP_WAKEUP_EXT1) {
     uint64_t mask = esp_sleep_get_ext1_wakeup_status();
     if ((mask & (1ULL << PIR_GPIO)) != 0ULL) {
-      Serial.printf("[BOOT] Wakeup from deep sleep via motion GPIO%d\n", PIR_GPIO);
+      Logger.Log("[BOOT] Wakeup from deep sleep via motion GPIO%d\n", PIR_GPIO);
       motionBootEventPending = true;
       ledQuickBlink();
       return;
@@ -255,12 +246,12 @@ static void prepareDeviceForDeepSleep() {
   SemaphoreLock recordingLock(recordingMutex, pdMS_TO_TICKS(RECORDING_LONG_LOCK_TIMEOUT_MS));
   if (recordingLock.locked()) {
     if (recordingActive) {
-      Serial.println("[SLEEP] Stopping active recording before deep sleep");
+      Logger.LogLine("[SLEEP] Stopping active recording before deep sleep");
       ScopedSdLock sdLock(pdMS_TO_TICKS(SD_LONG_LOCK_TIMEOUT_MS));
       if (sdLock.locked()) {
         stopRecordingSession(true);
       } else {
-        Serial.println("[SLEEP] SD card busy; recording may not be finalized");
+        Logger.LogLine("[SLEEP] SD card busy; recording may not be finalized");
       }
     }
   }
@@ -273,7 +264,7 @@ static void prepareDeviceForDeepSleep() {
     if (cameraInitialized) {
       esp_err_t err = esp_camera_deinit();
       if (err != ESP_OK) {
-        Serial.printf("[SLEEP] Camera deinit failed: 0x%x\n", err);
+        Logger.Log("[SLEEP] Camera deinit failed: 0x%x\n", err);
       } else {
         cameraInitialized = false;
       }
@@ -288,7 +279,7 @@ static void prepareDeviceForDeepSleep() {
 }
 
 [[noreturn]] static void enterDeepSleepNow(const char *reason, int blinkCount, bool allowMotionWake) {
-  Serial.printf("[SLEEP] %s\n", reason ? reason : "Entering deep sleep");
+  Logger.Log("[SLEEP] %s\n", reason ? reason : "Entering deep sleep");
   prepareDeviceForDeepSleep();
 
   esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
@@ -333,12 +324,12 @@ static bool sendMotionNotifyRequest(const String &url) {
   }
 
   if (!staLinkUp || WiFi.status() != WL_CONNECTED) {
-    Serial.println("[MOTION] Notify deferred (WiFi not connected)");
+    Logger.LogLine("[MOTION] Notify deferred (WiFi not connected)");
     return false;
   }
 
   if (!url.startsWith("http://") && !url.startsWith("https://")) {
-    Serial.printf("[MOTION] Notify URL ignored (must start with http:// or https://): %s\n", url.c_str());
+    Logger.Log("[MOTION] Notify URL ignored (must start with http:// or https://): %s\n", url.c_str());
     return true;
   }
 
@@ -346,15 +337,15 @@ static bool sendMotionNotifyRequest(const String &url) {
   http.setConnectTimeout(1500);
   http.setTimeout(2500);
   if (!http.begin(url)) {
-    Serial.printf("[MOTION] Notify request failed to begin: %s\n", url.c_str());
+    Logger.Log("[MOTION] Notify request failed to begin: %s\n", url.c_str());
     return false;
   }
 
   int status = http.GET();
   if (status > 0) {
-    Serial.printf("[MOTION] Notify GET status %d for %s\n", status, url.c_str());
+    Logger.Log("[MOTION] Notify GET status %d for %s\n", status, url.c_str());
   } else {
-    Serial.printf("[MOTION] Notify GET error %d for %s\n", status, url.c_str());
+    Logger.Log("[MOTION] Notify GET error %d for %s\n", status, url.c_str());
   }
   http.end();
   return status > 0;
@@ -374,7 +365,7 @@ static void triggerMotionEvent(const char *source) {
   motionRecordingStopAt = 0;
   motionNotifyPending = !runtimeConfig.motionSettings.notifyUrl.isEmpty();
   motionNotifyLastAttemptAt = 0;
-  Serial.printf("[MOTION] Triggered (%s)\n", source ? source : "runtime");
+  Logger.Log("[MOTION] Triggered (%s)\n", source ? source : "runtime");
 
   if (runtimeConfig.motionSettings.captureImage) {
     motionPendingImages = runtimeConfig.motionSettings.imageCount;
@@ -386,13 +377,13 @@ static void triggerMotionEvent(const char *source) {
     if (recordingActive) {
       motionVideoManagedRecording = true;
       motionRecordingStopAt = now + ((unsigned long)runtimeConfig.motionSettings.videoDurationSec * 1000UL);
-      Serial.printf("[MOTION] Extended recording stop deadline by motion to %lus\n", (unsigned long)runtimeConfig.motionSettings.videoDurationSec);
+      Logger.Log("[MOTION] Extended recording stop deadline by motion to %lus\n", (unsigned long)runtimeConfig.motionSettings.videoDurationSec);
     } else if (startRecordingSessionInternal(message)) {
       motionVideoManagedRecording = true;
       motionRecordingStopAt = now + ((unsigned long)runtimeConfig.motionSettings.videoDurationSec * 1000UL);
-      Serial.printf("[MOTION] %s\n", message.c_str());
+      Logger.Log("[MOTION] %s\n", message.c_str());
     } else {
-      Serial.printf("[MOTION] Failed to start recording: %s\n", message.c_str());
+      Logger.Log("[MOTION] Failed to start recording: %s\n", message.c_str());
     }
   }
 
@@ -402,6 +393,11 @@ static void triggerMotionEvent(const char *source) {
 }
 
 static void serviceButtonSleepRequest() {
+  if (!runtimeConfig.motionSettings.standbyButtonEnabled) {
+    buttonSleepRequestPending = false;
+    return;
+  }
+
   unsigned long now = millis();
   bool rawPressed = (digitalRead(BUTTON_GPIO) == LOW);
 
@@ -417,13 +413,14 @@ static void serviceButtonSleepRequest() {
       buttonSleepArmed = true;
       return;
     }
+  }
 
-    if (buttonSleepArmed && !buttonSleepRequestPending) {
-      buttonSleepRequestPending = true;
-      buttonSleepRequestAt = now;
-      buttonSleepArmed = false;
-      Serial.printf("[BUTTON] Sleep requested, entering deep sleep in %lu ms\n", BUTTON_SLEEP_DELAY_MS);
-    }
+  if ((now - buttonLastChangeAt) >= BUTTON_DEBOUNCE_MS &&
+      buttonStablePressed && buttonSleepArmed && !buttonSleepRequestPending) {
+    buttonSleepRequestPending = true;
+    buttonSleepRequestAt = now;
+    buttonSleepArmed = false;
+    Logger.Log("[BUTTON] Sleep requested, entering deep sleep in %lu ms\n", BUTTON_SLEEP_DELAY_MS);
   }
 
   if (buttonSleepRequestPending && (now - buttonSleepRequestAt) >= BUTTON_SLEEP_DELAY_MS) {
@@ -505,9 +502,9 @@ static void serviceMotionActions() {
   if (motionPendingImages > 0 && now >= motionNextImageAt) {
     String path;
     if (captureImageToSD(path)) {
-      Serial.printf("[MOTION] Image captured: %s\n", path.c_str());
+      Logger.Log("[MOTION] Image captured: %s\n", path.c_str());
     } else {
-      Serial.println("[MOTION] Failed to capture image");
+      Logger.LogLine("[MOTION] Failed to capture image");
     }
 
     --motionPendingImages;
@@ -517,7 +514,7 @@ static void serviceMotionActions() {
   if (motionVideoManagedRecording && motionRecordingStopAt != 0 && now >= motionRecordingStopAt) {
     String message;
     if (stopRecordingSessionInternal(message)) {
-      Serial.printf("[MOTION] %s\n", message.c_str());
+      Logger.Log("[MOTION] %s\n", message.c_str());
     }
     motionVideoManagedRecording = false;
     motionRecordingStopAt = 0;
@@ -553,7 +550,7 @@ static void serviceDeferredNetworkStartup() {
   }
 
   deferredNetworkStartupPending = false;
-  Serial.println("[BOOT] Starting deferred network services after motion wake actions");
+  Logger.LogLine("[BOOT] Starting deferred network services after motion wake actions");
 
   if (isConfigured) {
     startSTAMode();
@@ -591,6 +588,6 @@ static void serviceMotionNotifyRetry() {
   if (sendMotionNotifyRequest(runtimeConfig.motionSettings.notifyUrl)) {
     motionNotifyPending = false;
     motionNotifyLastAttemptAt = 0;
-    Serial.println("[MOTION] Deferred notify delivered");
+    Logger.LogLine("[MOTION] Deferred notify delivered");
   }
 }

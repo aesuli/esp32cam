@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 // Still capture and MJPEG AVI recording implementation.
 // Included directly by esp32cam.cpp so it can share existing static firmware state.
@@ -273,7 +273,7 @@ static bool appendRecordingFrame(const OwnedJpegFrame &frame) {
   size_t padding = frame.len & 1U;
   uint32_t chunkSpan = 8U + (uint32_t)frame.len + (uint32_t)padding;
   if (0xFFFFFFFFUL - recordingMoviListSize < chunkSpan) {
-    Serial.println("[REC] AVI size limit reached; stopping recording");
+    Logger.LogLine("[REC] AVI size limit reached; stopping recording");
     return false;
   }
 
@@ -326,7 +326,7 @@ static bool recordFrameIfDue(const OwnedJpegFrame &frame, unsigned long now) {
           recordingFile.flush();
         }
       } else {
-        Serial.println("[REC] Failed to write frame; aborting recording");
+        Logger.LogLine("[REC] Failed to write frame; aborting recording");
         stopRecordingSession(false);
       }
     }

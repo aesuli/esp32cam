@@ -1,7 +1,13 @@
-#pragma once
+﻿#pragma once
 
 // OTA firmware upload routes and transfer-server workers.
 // Included directly by esp32cam.cpp so it can share existing static firmware state.
+
+static void logOtaUpdateError(const char *context) {
+  Logger.Log("[OTA] %s (Update error code=%u)\n",
+             context ? context : "Update operation failed",
+             (unsigned int)Update.getError());
+}
 
 static void handleFirmwareUploadDataWorker() {
   if (!cfgAccessPass.isEmpty()) {
@@ -22,7 +28,7 @@ static void handleFirmwareUploadDataWorker() {
     firmwareRestartAt = 0;
 
     if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) {
-      Update.printError(Serial);
+      logOtaUpdateError("Update.begin failed");
       firmwareUploadFailed = true;
     }
     return;
@@ -35,7 +41,7 @@ static void handleFirmwareUploadDataWorker() {
 
     size_t written = Update.write(upload.buf, upload.currentSize);
     if (written != upload.currentSize) {
-      Update.printError(Serial);
+      logOtaUpdateError("Update.write failed");
       firmwareUploadFailed = true;
     }
     return;
@@ -48,14 +54,14 @@ static void handleFirmwareUploadDataWorker() {
     }
 
     if (!Update.end(true) || !Update.isFinished()) {
-      Update.printError(Serial);
+      logOtaUpdateError("Update.end failed");
       firmwareUploadFailed = true;
       return;
     }
 
     firmwareUploadSuccess = true;
     firmwareRestartAt = millis() + FIRMWARE_RESTART_DELAY_MS;
-    Serial.printf("[OTA] Firmware upload complete (%u bytes). Restart scheduled.\n", (unsigned int)upload.totalSize);
+    Logger.Log("[OTA] Firmware upload complete (%u bytes). Restart scheduled.\n", (unsigned int)upload.totalSize);
     return;
   }
 
@@ -64,7 +70,7 @@ static void handleFirmwareUploadDataWorker() {
     firmwareUploadFailed = true;
     firmwareUploadSuccess = false;
     firmwareRestartAt = 0;
-    Serial.println("[OTA] Firmware upload aborted");
+    Logger.LogLine("[OTA] Firmware upload aborted");
   }
 }
 

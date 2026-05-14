@@ -1,4 +1,4 @@
-/**
+﻿/**
  * ESP32-CAM Multipurpose Firmware
  *
  * Hardware:
@@ -54,7 +54,7 @@
 
 // ─── Pin definitions ──────────────────────────────────────────────────────────
 // Button wiring: one side to GPIO13, other side to GND (INPUT_PULLUP, active LOW).
-// PIR wiring: VCC -> 5V (or module-supported rail), DATA -> GPIO12, GND -> GND.
+// PIR wiring: VCC -> 3.3, DATA -> GPIO12, GND -> GND.
 // Note: GPIO12/GPIO13 remain electrically tied to SD DAT2/DAT3 while the card is mounted.
 static constexpr int BUTTON_GPIO = 13;
 static constexpr int PIR_GPIO    = 12;
@@ -69,6 +69,7 @@ static constexpr bool APP_UART_CONSOLE_ENABLED = true;
 #define AP_SETUP_SSID   "ESP32-CAM-Setup"
 #define AP_SETUP_PASS   "ESP32-CAM"
 #define AP_FALLBACK_SSID "ESP32-CAM"
+#define AP_OTA_RECOVERY_SSID "ESP32-CAM-OTA"
 static constexpr int AP_CHANNEL = 1;
 static constexpr bool AP_HIDDEN = false;
 static constexpr int AP_MAX_CONNECTIONS = 4;
@@ -77,6 +78,10 @@ static constexpr wifi_power_t DEFAULT_TX_POWER_STA = WIFI_POWER_19_5dBm;
 static constexpr wifi_power_t DEFAULT_TX_POWER_AP  = WIFI_POWER_8_5dBm;
 // Beacon interval for fallback AP in TU (1 TU = 1024 µs). Default is 100; Must be a multiple of 100, range 100–60000.
 static constexpr uint16_t AP_FALLBACK_BEACON_INTERVAL_TU = 10000;
+// AP fallback stability knobs: ESP32-CAM boards can become unstable when
+// AP modem sleep and long beacon intervals are combined with camera traffic.
+static constexpr bool AP_FALLBACK_MODEM_SLEEP_ENABLED = false;
+static constexpr bool AP_FALLBACK_EXTENDED_BEACON_ENABLED = false;
 static constexpr const char *NTP_SERVER = "pool.ntp.org";
 static constexpr const char *TIME_ZONE = "BRT3";
 static constexpr int CONFIG_LOAD_RETRIES = 5;
@@ -160,6 +165,7 @@ static bool   cameraInitialized = false;
 static bool   ledAccessBlinkEnabled = false;
 static bool   wifiModemSleepEnabled = false;
 static bool   staConnectedAtBoot = false;
+static bool   sdCardAvailableAtBoot = false;
 static bool   buttonLastRawPressed = false;
 static bool   buttonStablePressed = false;
 static bool   buttonSleepArmed = true;
@@ -247,10 +253,22 @@ static bool gLogWriteInProgress = false;
 static bool gLogSdReady = false;
 static bool gLogSdFailureReported = false;
 static bool gLogFileFailureReported = false;
-static bool gLoggingEnabled = true;
-static bool gLogSdMirrorEnabled = false;
+static bool gLogSerialEnabled = true;
+static bool gLogFileEnabled = true;
 static bool gSdCardMounted = false;
 static volatile bool gSdOperationInProgress = false;
+static constexpr size_t LOG_FILE_BUFFER_CAPACITY = 8192;
+static constexpr size_t LOG_FILE_FLUSH_CHUNK_BYTES = 1024;
+static constexpr size_t LOG_FILE_MAX_BATCH_BYTES = 3072;
+static constexpr unsigned long LOG_FILE_FLUSH_INTERVAL_MS = 250;
+static uint8_t gLogFileBuffer[LOG_FILE_BUFFER_CAPACITY];
+static uint8_t gLogFileFlushChunk[LOG_FILE_FLUSH_CHUNK_BYTES];
+static size_t gLogFileBufferHead = 0;
+static size_t gLogFileBufferTail = 0;
+static size_t gLogFileBufferSize = 0;
+static uint32_t gLogFileDroppedBytes = 0;
+static unsigned long gLogLastFlushAt = 0;
+static portMUX_TYPE gLogFileBufferMux = portMUX_INITIALIZER_UNLOCKED;
 
 class SemaphoreLock {
  public:
@@ -313,14 +331,80 @@ class ScopedSdLock {
   bool locked_;
 };
 
-static bool appendSerialLogChunk(const uint8_t *data, size_t len) {
-  if (!gLoggingEnabled || !gLogSdMirrorEnabled || motionActionWindowActive || !data || len == 0 ||
-      gLogWriteInProgress || gSdOperationInProgress) {
-    return false;
+static void enqueueLogFileChunk(const uint8_t *data, size_t len) {
+  if (!data || len == 0) {
+    return;
   }
 
-  if (!sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(100)) != pdTRUE) {
-    return false;
+  portENTER_CRITICAL(&gLogFileBufferMux);
+  for (size_t i = 0; i < len; ++i) {
+    if (gLogFileBufferSize >= LOG_FILE_BUFFER_CAPACITY) {
+      gLogFileBufferTail = (gLogFileBufferTail + 1) % LOG_FILE_BUFFER_CAPACITY;
+      --gLogFileBufferSize;
+      ++gLogFileDroppedBytes;
+    }
+
+    gLogFileBuffer[gLogFileBufferHead] = data[i];
+    gLogFileBufferHead = (gLogFileBufferHead + 1) % LOG_FILE_BUFFER_CAPACITY;
+    ++gLogFileBufferSize;
+  }
+  portEXIT_CRITICAL(&gLogFileBufferMux);
+}
+
+static size_t dequeueLogFileChunk(uint8_t *out, size_t maxLen) {
+  if (!out || maxLen == 0) {
+    return 0;
+  }
+
+  portENTER_CRITICAL(&gLogFileBufferMux);
+  size_t len = (gLogFileBufferSize < maxLen) ? gLogFileBufferSize : maxLen;
+  for (size_t i = 0; i < len; ++i) {
+    out[i] = gLogFileBuffer[gLogFileBufferTail];
+    gLogFileBufferTail = (gLogFileBufferTail + 1) % LOG_FILE_BUFFER_CAPACITY;
+  }
+  gLogFileBufferSize -= len;
+  portEXIT_CRITICAL(&gLogFileBufferMux);
+  return len;
+}
+
+static size_t currentLogFileBufferSize() {
+  portENTER_CRITICAL(&gLogFileBufferMux);
+  size_t size = gLogFileBufferSize;
+  portEXIT_CRITICAL(&gLogFileBufferMux);
+  return size;
+}
+
+static void clearLogFileBuffer() {
+  portENTER_CRITICAL(&gLogFileBufferMux);
+  gLogFileBufferHead = 0;
+  gLogFileBufferTail = 0;
+  gLogFileBufferSize = 0;
+  gLogFileDroppedBytes = 0;
+  portEXIT_CRITICAL(&gLogFileBufferMux);
+}
+
+static void serviceLogFileFlush() {
+  if (!gLogFileEnabled) {
+    clearLogFileBuffer();
+    return;
+  }
+
+  if (motionActionWindowActive || gLogWriteInProgress || gSdOperationInProgress || !sdMutex) {
+    return;
+  }
+
+  size_t pendingBytes = currentLogFileBufferSize();
+  if (pendingBytes == 0) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if ((now - gLogLastFlushAt) < LOG_FILE_FLUSH_INTERVAL_MS && pendingBytes < (LOG_FILE_BUFFER_CAPACITY / 2)) {
+    return;
+  }
+
+  if (xSemaphoreTake(sdMutex, 0) != pdTRUE) {
+    return;
   }
 
   gLogWriteInProgress = true;
@@ -331,7 +415,7 @@ static bool appendSerialLogChunk(const uint8_t *data, size_t len) {
       gLogSdFailureReported = true;
       gLogWriteInProgress = false;
       xSemaphoreGive(sdMutex);
-      return false;
+      return;
     }
   }
 
@@ -340,23 +424,54 @@ static bool appendSerialLogChunk(const uint8_t *data, size_t len) {
     gLogFileFailureReported = true;
     gLogWriteInProgress = false;
     xSemaphoreGive(sdMutex);
-    return false;
+    return;
   }
 
-  size_t written = file.write(data, len);
+  size_t totalWritten = 0;
+  size_t totalRequested = 0;
+  for (;;) {
+    if (totalRequested >= LOG_FILE_MAX_BATCH_BYTES) {
+      break;
+    }
+
+    size_t chunkLen = dequeueLogFileChunk(gLogFileFlushChunk, LOG_FILE_FLUSH_CHUNK_BYTES);
+    if (chunkLen == 0) {
+      break;
+    }
+
+    size_t written = file.write(gLogFileFlushChunk, chunkLen);
+    totalRequested += chunkLen;
+    totalWritten += written;
+    if (written != chunkLen) {
+      gLogFileFailureReported = true;
+      break;
+    }
+  }
+
+  uint32_t droppedBytes = 0;
+  portENTER_CRITICAL(&gLogFileBufferMux);
+  droppedBytes = gLogFileDroppedBytes;
+  gLogFileDroppedBytes = 0;
+  portEXIT_CRITICAL(&gLogFileBufferMux);
+  if (droppedBytes > 0) {
+    char dropMsg[64];
+    int n = snprintf(dropMsg, sizeof(dropMsg), "[LOGGER] dropped %lu bytes\n", (unsigned long)droppedBytes);
+    if (n > 0) {
+      (void)file.write((const uint8_t *)dropMsg, (size_t)n);
+    }
+  }
+
   file.flush();
   file.close();
 
-  if (written != len && !gLogFileFailureReported) {
-    gLogFileFailureReported = true;
-  }
+  (void)totalWritten;
+  gLogLastFlushAt = now;
 
   gLogWriteInProgress = false;
   xSemaphoreGive(sdMutex);
-  return written == len;
 }
 
-class SerialMirror : public Print {
+class AppLogger {
  public:
   void begin(unsigned long baud) {
     if (APP_UART_CONSOLE_ENABLED) {
@@ -367,29 +482,7 @@ class SerialMirror : public Print {
     }
   }
 
-  size_t write(uint8_t b) override {
-    if (!gLoggingEnabled) {
-      return 1;
-    }
-    appendSerialLogChunk(&b, 1);
-    if (APP_UART_CONSOLE_ENABLED) {
-      return ::Serial.write(b);
-    }
-    return 1;
-  }
-
-  size_t write(const uint8_t *buffer, size_t size) override {
-    if (!gLoggingEnabled) {
-      return size;
-    }
-    appendSerialLogChunk(buffer, size);
-    if (APP_UART_CONSOLE_ENABLED) {
-      return ::Serial.write(buffer, size);
-    }
-    return size;
-  }
-
-  int printf(const char *format, ...) {
+  int Log(const char *format, ...) {
     va_list args;
     va_start(args, format);
 
@@ -408,17 +501,68 @@ class SerialMirror : public Print {
     va_end(args);
 
     if (written > 0) {
-      write((const uint8_t *)buffer.data(), (size_t)written);
+      String line = buildTimestampPrefix();
+      line += String(buffer.data());
+      if (!line.endsWith("\n")) {
+        line += "\n";
+      }
+      write((const uint8_t *)line.c_str(), line.length());
     }
 
     return written;
   }
+
+  void LogLine(const char *message) {
+    Log("%s", message ? message : "");
+  }
+
+  void LogLine(const String &message) {
+    Log("%s", message.c_str());
+  }
+
+  void LogRaw(char c) {
+    write((const uint8_t *)&c, 1);
+  }
+
+  void LogRaw(const char *text) {
+    if (!text) {
+      return;
+    }
+    write((const uint8_t *)text, strlen(text));
+  }
+
+ private:
+  size_t write(const uint8_t *buffer, size_t size) {
+    if (!buffer || size == 0 || (!gLogSerialEnabled && !gLogFileEnabled)) {
+      return size;
+    }
+    if (gLogFileEnabled) {
+      enqueueLogFileChunk(buffer, size);
+    }
+    if (gLogSerialEnabled && APP_UART_CONSOLE_ENABLED) {
+      return ::Serial.write(buffer, size);
+    }
+    return size;
+  }
+
+  String buildTimestampPrefix() {
+    time_t now = time(nullptr);
+    struct tm timeinfo;
+    char stamp[32];
+    if (now >= 1704067200 && localtime_r(&now, &timeinfo)) {
+      strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    } else {
+      snprintf(stamp, sizeof(stamp), "uptime+%lus", (unsigned long)(millis() / 1000UL));
+    }
+
+    String prefix = "[";
+    prefix += stamp;
+    prefix += "] ";
+    return prefix;
+  }
 };
 
-static SerialMirror LogSerial;
-
-// Redirect this translation unit's Serial prints to a mirrored logger.
-#define Serial LogSerial
+static AppLogger Logger;
 
 struct AviIndexEntry {
   uint32_t offset;
@@ -488,6 +632,7 @@ struct MotionSettings {
   uint8_t imageDelayDs = 1;          // deciseconds: 1..20 (0.1s..2.0s)
   bool captureVideo = false;
   uint8_t videoDurationSec = 5;      // 1..30
+  bool standbyButtonEnabled = true;
   bool wakeOnMotion = false;
   bool autoStandby = false;
   uint16_t standbyAfterSec = 30;     // 5..120
@@ -503,7 +648,8 @@ struct StoredConfig {
   CameraSettings cameraSettings;
   MotionSettings motionSettings;
   bool ledAccessBlink = false;  // LED blink on URL access
-  bool loggingEnabled = true;
+  bool logSerialEnabled = true;
+  bool logFileEnabled = true;
   int8_t txPowerSta = (int8_t)DEFAULT_TX_POWER_STA;  // wifi_power_t cast to int8
   int8_t txPowerAp  = (int8_t)DEFAULT_TX_POWER_AP;
 };
@@ -553,13 +699,13 @@ static bool initCameraWithRetries();
 static bool applyWifiClientConfig(const WifiCredential &wifi);
 static void servicePendingFirmwareRestart();
 static void servicePendingAdminRestart();
+static void serviceLogFileFlush();
 static void configureButtonWakeup();
 static void configureMotionWakeup(bool enabled);
 static void applyPirInputMode();
 static void restoreInputPinsAfterSDInit();
 static void logSharedPinCaveats();
 static void updateSdLoggingState();
-static bool pirSupportsRtcWakeup();
 static void IRAM_ATTR onPirEdgeInterrupt();
 static void handleWakeupIndicator();
 static void serviceButtonSleepRequest();
@@ -586,24 +732,27 @@ static bool sendMotionNotifyRequest(const String &url);
 static void prepareDeviceForDeepSleep();
 [[noreturn]] static void enterDeepSleepFromButton();
 [[noreturn]] static void enterDeepSleepNow(const char *reason, int blinkCount, bool allowMotionWake);
+static bool isValidRuntimeTxPowerValue(int value);
+static wifi_power_t validatedTxPowerValue(int configuredValue, wifi_power_t fallback, const char *label);
 static void setWifiModemSleep(bool enabled, const char *reason = nullptr);
 static void registerCameraRoutes();
 static void startAuxHttpServers();
+static void startOtaRecoveryAPMode();
 
 static void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   switch (event) {
     case ARDUINO_EVENT_WIFI_STA_CONNECTED:
-      Serial.println("[WIFI] STA associated with AP");
+      Logger.LogLine("[WIFI] STA associated with AP");
       break;
 
     case ARDUINO_EVENT_WIFI_STA_GOT_IP:
       staLinkUp = true;
-      Serial.printf("[WIFI] STA got IP: %s\n", WiFi.localIP().toString().c_str());
+      Logger.Log("[WIFI] STA got IP: %s\n", WiFi.localIP().toString().c_str());
       break;
 
     case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
       staLinkUp = false;
-      Serial.printf("[WIFI] STA disconnected (reason=%u)\n",
+      Logger.Log("[WIFI] STA disconnected (reason=%u)\n",
         (unsigned int)info.wifi_sta_disconnected.reason);
       break;
 
@@ -641,12 +790,12 @@ static const char *frameSizeLabel(framesize_t value) {
 
 static void logSensorFrameSize(sensor_t *sensor, const char *prefix) {
   if (!sensor || sensor->status.framesize < 0 || sensor->status.framesize >= FRAMESIZE_INVALID) {
-    Serial.printf("%s: invalid framesize %d\n", prefix, sensor ? sensor->status.framesize : -1);
+    Logger.Log("%s: invalid framesize %d\n", prefix, sensor ? sensor->status.framesize : -1);
     return;
   }
 
   const resolution_info_t &info = resolution[sensor->status.framesize];
-  Serial.printf("%s: %s (%ux%u, enum=%d)\n",
+  Logger.Log("%s: %s (%ux%u, enum=%d)\n",
     prefix,
     frameSizeLabel(sensor->status.framesize),
     info.width,
@@ -790,22 +939,20 @@ static bool initSDCard() {
     if (mounted) {
       if (SD_MMC.cardType() != CARD_NONE) {
         gSdCardMounted = true;
-        Serial.printf("[SD] Mounted in 1-bit mode (attempt %d)\n", attempt);
-        Serial.printf("[SD] GPIO%d/GPIO%d remain shared with SD DAT2/DAT3 pull-ups while a card is inserted\n",
-          BUTTON_GPIO, PIR_GPIO);
+        Logger.Log("[SD] Mounted in 1-bit mode (attempt %d)\n", attempt);
         return true;
       }
       SD_MMC.end();
       gSdCardMounted = false;
       restoreInputPinsAfterSDInit();
-      Serial.printf("[SD] No card detected on attempt %d\n", attempt);
+      Logger.Log("[SD] No card detected on attempt %d\n", attempt);
     } else {
-      Serial.printf("[SD] Mount failed on attempt %d\n", attempt);
+      Logger.Log("[SD] Mount failed on attempt %d\n", attempt);
     }
     delay(500);
   }
 
-  Serial.println("[SD] Failed to mount after 5 attempts");
+  Logger.LogLine("[SD] Failed to mount after 5 attempts");
   return false;
 }
 
@@ -896,13 +1043,13 @@ static bool ensureCameraReady(TickType_t timeoutTicks) {
 
   bool ok = true;
   if (!cameraInitialized) {
-    Serial.println("[CAM] Powering up camera on demand");
+    Logger.LogLine("[CAM] Powering up camera on demand");
     ok = initCameraWithRetries();
     if (ok) {
       cameraInitialized = true;
-      Serial.println("[CAM] Camera ready");
+      Logger.LogLine("[CAM] Camera ready");
     } else {
-      Serial.println("[CAM] Camera init failed");
+      Logger.LogLine("[CAM] Camera init failed");
     }
   }
 
@@ -931,11 +1078,11 @@ static void serviceCameraIdleTimeout() {
   if (cameraInitialized && !streamClientConnected && !recordingActive) {
     esp_err_t err = esp_camera_deinit();
     if (err != ESP_OK) {
-      Serial.printf("[CAM] Deinit failed: 0x%x\n", err);
+      Logger.Log("[CAM] Deinit failed: 0x%x\n", err);
     } else {
       cameraInitialized = false;
       powerDownCameraHardware();
-      Serial.printf("[CAM] Camera powered down after %lu ms idle\n", cameraIdleTimeoutMs);
+      Logger.Log("[CAM] Camera powered down after %lu ms idle\n", cameraIdleTimeoutMs);
     }
   }
 }
@@ -959,13 +1106,13 @@ static bool isRecordingFrameDue(unsigned long now) {
 static bool saveCaptureSequence(uint32_t value) {
   File file = SD_MMC.open(CAPTURE_COUNTER_FILE_PATH, FILE_WRITE);
   if (!file) {
-    Serial.println("[SEQ] Failed to open capture counter file for write");
+    Logger.LogLine("[SEQ] Failed to open capture counter file for write");
     return false;
   }
 
   if (file.print(value) == 0) {
     file.close();
-    Serial.println("[SEQ] Failed to write capture counter value");
+    Logger.LogLine("[SEQ] Failed to write capture counter value");
     return false;
   }
 
@@ -987,7 +1134,7 @@ static bool loadCaptureSequence() {
   if (SD_MMC.exists(CAPTURE_COUNTER_FILE_PATH)) {
     File file = SD_MMC.open(CAPTURE_COUNTER_FILE_PATH, FILE_READ);
     if (!file) {
-      Serial.println("[SEQ] Failed to open capture counter file for read");
+      Logger.LogLine("[SEQ] Failed to open capture counter file for read");
       return false;
     }
 
@@ -1014,13 +1161,13 @@ static bool loadCaptureSequence() {
       if (valid) {
         captureSequence = (uint32_t)parsed;
       } else {
-        Serial.println("[SEQ] Invalid capture counter content, resetting to 0");
+        Logger.LogLine("[SEQ] Invalid capture counter content, resetting to 0");
       }
     }
   }
 
   captureSequenceLoaded = true;
-  Serial.printf("[SEQ] Current capture sequence: %lu\n", (unsigned long)captureSequence);
+  Logger.Log("[SEQ] Current capture sequence: %lu\n", (unsigned long)captureSequence);
   return true;
 }
 
@@ -1066,7 +1213,7 @@ static void ensureClockBeforeTimestamp() {
   if (WiFi.status() == WL_CONNECTED) {
     syncClockWithNtp();
   } else {
-    Serial.println("[NTP] Clock not synced and WiFi is not connected");
+    Logger.LogLine("[NTP] Clock not synced and WiFi is not connected");
   }
 }
 
@@ -1117,7 +1264,7 @@ static void serviceNtpSync() {
 
 static bool connectToSavedStaNetworks(bool showLedFeedback, bool initializeCameraHttpServices) {
   if (runtimeConfig.wifiList.empty()) {
-    Serial.println("[WIFI] No saved STA networks");
+    Logger.LogLine("[WIFI] No saved STA networks");
     return false;
   }
 
@@ -1141,9 +1288,9 @@ static bool connectToSavedStaNetworks(bool showLedFeedback, bool initializeCamer
 
     if (!cfgDeviceName.isEmpty()) {
       if (!WiFi.setHostname(cfgDeviceName.c_str())) {
-        Serial.println("[WIFI] Failed to set STA hostname");
+        Logger.LogLine("[WIFI] Failed to set STA hostname");
       } else {
-        Serial.printf("[WIFI] STA hostname set to: %s\n", cfgDeviceName.c_str());
+        Logger.Log("[WIFI] STA hostname set to: %s\n", cfgDeviceName.c_str());
       }
     }
 
@@ -1151,7 +1298,7 @@ static bool connectToSavedStaNetworks(bool showLedFeedback, bool initializeCamer
       if (showLedFeedback) {
         ledWifiFailureSequence();
       }
-      Serial.printf("[WIFI] Skipping network %s due to invalid network configuration\n", wifi.ssid.c_str());
+      Logger.Log("[WIFI] Skipping network %s due to invalid network configuration\n", wifi.ssid.c_str());
       continue;
     }
 
@@ -1166,7 +1313,7 @@ static bool connectToSavedStaNetworks(bool showLedFeedback, bool initializeCamer
       ledWifiTestSequence();
     }
 
-    Serial.printf("[WIFI] Trying network %u/%u: %s\n",
+    Logger.Log("[WIFI] Trying network %u/%u: %s\n",
       (unsigned int)(i + 1),
       (unsigned int)runtimeConfig.wifiList.size(),
       wifi.ssid.c_str());
@@ -1187,16 +1334,17 @@ static bool connectToSavedStaNetworks(bool showLedFeedback, bool initializeCamer
         ledWifiSuccessSequence();
       }
 
-      WiFi.setTxPower((wifi_power_t)runtimeConfig.txPowerSta);
-      Serial.printf("[WIFI] STA TX power set to %d (raw)\n", (int)runtimeConfig.txPowerSta);
-      Serial.printf("[WIFI] Connected to %s — IP: %s\n", wifi.ssid.c_str(), WiFi.localIP().toString().c_str());
+      wifi_power_t staTxPower = validatedTxPowerValue((int)runtimeConfig.txPowerSta, DEFAULT_TX_POWER_STA, "STA");
+      WiFi.setTxPower(staTxPower);
+      Logger.Log("[WIFI] STA TX power set to %d (raw)\n", (int)staTxPower);
+      Logger.Log("[WIFI] Connected to %s — IP: %s\n", wifi.ssid.c_str(), WiFi.localIP().toString().c_str());
       syncClockWithNtp();
 
       if (initializeCameraHttpServices) {
         registerCameraRoutes();
         server.begin();
         startAuxHttpServers();
-        Serial.println("[HTTP] Camera server ready on port 80");
+        Logger.LogLine("[HTTP] Camera server ready on port 80");
       }
 
       setWifiModemSleep(true, "idle");
@@ -1207,7 +1355,7 @@ static bool connectToSavedStaNetworks(bool showLedFeedback, bool initializeCamer
       // LED feedback: long blink on failure
       ledWifiFailureSequence();
     }
-    Serial.printf("[WIFI] Failed to connect to %s (status=%d)\n", wifi.ssid.c_str(), (int)result);
+    Logger.Log("[WIFI] Failed to connect to %s (status=%d)\n", wifi.ssid.c_str(), (int)result);
   }
 
   staLinkUp = false;
@@ -1240,12 +1388,12 @@ static void serviceStaReconnect() {
   }
 
   lastStaReconnectAttemptAt = now;
-  Serial.println("[WIFI] STA link lost — attempting reconnect to saved networks");
+  Logger.LogLine("[WIFI] STA link lost — attempting reconnect to saved networks");
 
   if (connectToSavedStaNetworks(false, false)) {
-    Serial.println("[WIFI] STA reconnect successful");
+    Logger.LogLine("[WIFI] STA reconnect successful");
   } else {
-    Serial.println("[WIFI] STA reconnect failed; will retry");
+    Logger.LogLine("[WIFI] STA reconnect failed; will retry");
   }
 }
 
@@ -1270,11 +1418,11 @@ static void setWifiModemSleep(bool enabled, const char *reason) {
 
   if (!WiFi.setSleep(enabled)) {
     if (reason && reason[0] != '\0') {
-      Serial.printf("[WIFI] Failed to %s modem sleep (%s)\n",
+      Logger.Log("[WIFI] Failed to %s modem sleep (%s)\n",
         enabled ? "enable" : "disable",
         reason);
     } else {
-      Serial.printf("[WIFI] Failed to %s modem sleep\n",
+      Logger.Log("[WIFI] Failed to %s modem sleep\n",
         enabled ? "enable" : "disable");
     }
     return;
@@ -1282,11 +1430,11 @@ static void setWifiModemSleep(bool enabled, const char *reason) {
 
   wifiModemSleepEnabled = enabled;
   if (reason && reason[0] != '\0') {
-    Serial.printf("[WIFI] Modem sleep %s (%s)\n",
+    Logger.Log("[WIFI] Modem sleep %s (%s)\n",
       enabled ? "enabled" : "disabled",
       reason);
   } else {
-    Serial.printf("[WIFI] Modem sleep %s\n",
+    Logger.Log("[WIFI] Modem sleep %s\n",
       enabled ? "enabled" : "disabled");
   }
 }
@@ -1398,9 +1546,9 @@ static void disableRecordingIndex(const char *reason) {
   recordingIndexEnabled = false;
   std::vector<AviIndexEntry>().swap(recordingIndex);
   if (reason && reason[0] != '\0') {
-    Serial.printf("[REC] AVI seek index disabled for this recording (%s)\n", reason);
+    Logger.Log("[REC] AVI seek index disabled for this recording (%s)\n", reason);
   } else {
-    Serial.println("[REC] AVI seek index disabled for this recording");
+    Logger.LogLine("[REC] AVI seek index disabled for this recording");
   }
 }
 
@@ -1641,13 +1789,13 @@ static void applyStoredCameraSettings(const StoredConfig &cfg) {
 
   sensor_t *sensor = esp_camera_sensor_get();
   if (!sensor) {
-    Serial.println("[CAM] Cannot apply stored settings: sensor unavailable");
+    Logger.LogLine("[CAM] Cannot apply stored settings: sensor unavailable");
     return;
   }
 
   int framesizeResult = 0;
   if (!isValidFrameSizeValue(sensor, cfg.cameraSettings.framesize)) {
-    Serial.printf("[CAM] Stored framesize %d is not supported by this sensor\n", cfg.cameraSettings.framesize);
+    Logger.Log("[CAM] Stored framesize %d is not supported by this sensor\n", cfg.cameraSettings.framesize);
     framesizeResult = -1;
   } else {
     framesizeResult = sensor->set_framesize(sensor, (framesize_t)cfg.cameraSettings.framesize);
@@ -1676,7 +1824,7 @@ static void applyStoredCameraSettings(const StoredConfig &cfg) {
 
   for (size_t i = 0; i < sizeof(pending) / sizeof(pending[0]); ++i) {
     if (pending[i].result != 0) {
-      Serial.printf("[CAM] Failed to apply stored %s\n", pending[i].name);
+      Logger.Log("[CAM] Failed to apply stored %s\n", pending[i].name);
     }
   }
 }
@@ -1796,11 +1944,11 @@ static bool applyWifiClientConfig(const WifiCredential &wifi) {
   IPAddress dns2 = none;
 
   if (!wifi.dns1.isEmpty() && !dns1.fromString(wifi.dns1)) {
-    Serial.printf("[WIFI] Invalid DNS1 for %s: %s\n", wifi.ssid.c_str(), wifi.dns1.c_str());
+    Logger.Log("[WIFI] Invalid DNS1 for %s: %s\n", wifi.ssid.c_str(), wifi.dns1.c_str());
     return false;
   }
   if (!wifi.dns2.isEmpty() && !dns2.fromString(wifi.dns2)) {
-    Serial.printf("[WIFI] Invalid DNS2 for %s: %s\n", wifi.ssid.c_str(), wifi.dns2.c_str());
+    Logger.Log("[WIFI] Invalid DNS2 for %s: %s\n", wifi.ssid.c_str(), wifi.dns2.c_str());
     return false;
   }
 
@@ -1809,7 +1957,7 @@ static bool applyWifiClientConfig(const WifiCredential &wifi) {
     IPAddress gw;
     IPAddress mask;
     if (!ip.fromString(wifi.staticIp) || !gw.fromString(wifi.gateway) || !mask.fromString(wifi.subnet)) {
-      Serial.printf("[WIFI] Invalid static IP config for %s\n", wifi.ssid.c_str());
+      Logger.Log("[WIFI] Invalid static IP config for %s\n", wifi.ssid.c_str());
       return false;
     }
 
@@ -1818,7 +1966,7 @@ static bool applyWifiClientConfig(const WifiCredential &wifi) {
     }
 
     bool ok = WiFi.config(ip, gw, mask, dns1, dns2);
-    Serial.printf("[WIFI] %s static config for %s\n", ok ? "Applied" : "Failed to apply", wifi.ssid.c_str());
+    Logger.Log("[WIFI] %s static config for %s\n", ok ? "Applied" : "Failed to apply", wifi.ssid.c_str());
     return ok;
   }
 
@@ -1826,7 +1974,7 @@ static bool applyWifiClientConfig(const WifiCredential &wifi) {
       ? WiFi.config(none, none, none)
       : WiFi.config(none, none, none, dns1, dns2);
   if (!ok) {
-    Serial.printf("[WIFI] Failed to apply DHCP config for %s\n", wifi.ssid.c_str());
+    Logger.Log("[WIFI] Failed to apply DHCP config for %s\n", wifi.ssid.c_str());
   }
   return ok;
 }
@@ -2075,7 +2223,8 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
     appendCameraSettings(plain, cfg.cameraSettings);
   }
   appendU8(plain, cfg.ledAccessBlink ? 1 : 0);
-  appendU8(plain, cfg.loggingEnabled ? 1 : 0);
+  appendU8(plain, cfg.logSerialEnabled ? 1 : 0);
+  appendU8(plain, cfg.logFileEnabled ? 1 : 0);
   appendU8(plain, (uint8_t)cfg.txPowerSta);
   appendU8(plain, (uint8_t)cfg.txPowerAp);
 
@@ -2090,6 +2239,7 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
   appendU16(plain, cfg.motionSettings.standbyAfterSec);
   appendU16(plain, cfg.motionSettings.detectionIntervalSec);
   appendField(plain, cfg.motionSettings.notifyUrl);
+  appendU8(plain, cfg.motionSettings.standbyButtonEnabled ? 1 : 0);
 
   return encryptPayload(plain, ivHex, cipherHex);
 }
@@ -2152,13 +2302,26 @@ static bool decryptConfigV7(const String &ivHex, const String &cipherHex, Stored
   }
   cfg.ledAccessBlink = (ledAccessBlink != 0);
 
-  cfg.loggingEnabled = true;
+  cfg.logSerialEnabled = true;
+  cfg.logFileEnabled = true;
   if (offset < plain.size()) {
-    uint8_t loggingEnabled = 1;
-    if (!readU8(plain, offset, loggingEnabled)) {
+    uint8_t logSerialEnabled = 1;
+    if (!readU8(plain, offset, logSerialEnabled)) {
       return false;
     }
-    cfg.loggingEnabled = (loggingEnabled != 0);
+    cfg.logSerialEnabled = (logSerialEnabled != 0);
+    cfg.logFileEnabled = cfg.logSerialEnabled;
+
+    // Backward compatibility:
+    // - Legacy payload: [loggingEnabled][txPowerSta][txPowerAp]...
+    // - Current payload: [logSerialEnabled][logFileEnabled][txPowerSta][txPowerAp]...
+    if (offset < plain.size() && (plain[offset] == 0 || plain[offset] == 1)) {
+      uint8_t logFileEnabled = 1;
+      if (!readU8(plain, offset, logFileEnabled)) {
+        return false;
+      }
+      cfg.logFileEnabled = (logFileEnabled != 0);
+    }
   }
 
   uint8_t txPowerSta = (uint8_t)DEFAULT_TX_POWER_STA;
@@ -2232,6 +2395,12 @@ static bool decryptConfigV7(const String &ivHex, const String &cipherHex, Stored
     } else if (remaining >= 2) {
       if (!readField(plain, offset, cfg.motionSettings.notifyUrl)) return false;
     }
+
+    if (offset < plain.size()) {
+      uint8_t b = 1;
+      if (!readU8(plain, offset, b)) return false;
+      cfg.motionSettings.standbyButtonEnabled = (b != 0);
+    }
   }
 
   clampMotionSettings(cfg.motionSettings);
@@ -2242,14 +2411,14 @@ static bool saveConfigToSD(const StoredConfig &cfg) {
   String ivHex;
   String cipherHex;
   if (!encryptConfig(cfg, ivHex, cipherHex)) {
-    Serial.println("[CFG] Encryption failed");
+    Logger.LogLine("[CFG] Encryption failed");
     return false;
   }
 
   {
     ScopedSdLock sdLock(pdMS_TO_TICKS(SD_LONG_LOCK_TIMEOUT_MS));
     if (!sdLock.locked()) {
-      Serial.println("[CFG] SD card is busy; config not saved");
+      Logger.LogLine("[CFG] SD card is busy; config not saved");
       return false;
     }
 
@@ -2259,24 +2428,24 @@ static bool saveConfigToSD(const StoredConfig &cfg) {
 
     File file = SD_MMC.open(CONFIG_FILE_PATH, FILE_WRITE);
     if (!file) {
-      Serial.println("[CFG] Failed to open config file for write");
+      Logger.LogLine("[CFG] Failed to open config file for write");
       return false;
     }
 
-    file.println("ESP32CAMCFG7");
+    file.println("ESP32CAMCFG9");
     file.println(ivHex);
     file.println(cipherHex);
     file.close();
   }
 
-  Serial.println("[CFG] Encrypted config saved to SD");
+  Logger.LogLine("[CFG] Encrypted config saved to SD");
   return true;
 }
 
 static bool loadConfigFromSD(StoredConfig &cfg) {
   ScopedSdLock sdLock(pdMS_TO_TICKS(SD_LONG_LOCK_TIMEOUT_MS));
   if (!sdLock.locked()) {
-    Serial.println("[CFG] SD card is busy; config not loaded");
+    Logger.LogLine("[CFG] SD card is busy; config not loaded");
     return false;
   }
 
@@ -2285,13 +2454,13 @@ static bool loadConfigFromSD(StoredConfig &cfg) {
   }
 
   if (!SD_MMC.exists(CONFIG_FILE_PATH)) {
-    Serial.println("[CFG] Config file missing");
+    Logger.LogLine("[CFG] Config file missing");
     return false;
   }
 
   File file = SD_MMC.open(CONFIG_FILE_PATH, FILE_READ);
   if (!file) {
-    Serial.println("[CFG] Failed to open config file");
+    Logger.LogLine("[CFG] Failed to open config file");
     return false;
   }
 
@@ -2304,13 +2473,13 @@ static bool loadConfigFromSD(StoredConfig &cfg) {
   ivHex.trim();
   cipherHex.trim();
 
-  if (magic == "ESP32CAMCFG7") {
+  if (magic == "ESP32CAMCFG7" || magic == "ESP32CAMCFG8" || magic == "ESP32CAMCFG9") {
     if (!decryptConfigV7(ivHex, cipherHex, cfg)) {
-      Serial.println("[CFG] Failed to decrypt CFG7 config");
+      Logger.Log("[CFG] Failed to decrypt %s config\n", magic.c_str());
       return false;
     }
   } else {
-    Serial.printf("[CFG] Unsupported config magic: %s\n", magic.c_str());
+    Logger.Log("[CFG] Unsupported config magic: %s\n", magic.c_str());
     return false;
   }
 
@@ -2412,7 +2581,7 @@ static bool initCamera(uint32_t xclkFreqHz) {
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
-    Serial.printf("[CAM] Init failed: 0x%x\n", err);
+    Logger.Log("[CAM] Init failed: 0x%x\n", err);
     return false;
   }
 
@@ -2427,14 +2596,14 @@ static bool initCameraWithRetries() {
   for (int attempt = 1; attempt <= CAMERA_INIT_RETRIES; ++attempt) {
     uint32_t xclkHz = CAMERA_XCLK_FREQS_HZ[(size_t)(attempt - 1) % xclkCount];
 
-    Serial.printf("[CAM] Init attempt %d/%d using XCLK=%lu Hz\n",
+    Logger.Log("[CAM] Init attempt %d/%d using XCLK=%lu Hz\n",
                   attempt,
                   CAMERA_INIT_RETRIES,
                   (unsigned long)xclkHz);
 
     if (initCamera(xclkHz)) {
       if (attempt > 1) {
-        Serial.printf("[CAM] Init succeeded on attempt %d (XCLK=%lu Hz)\n",
+        Logger.Log("[CAM] Init succeeded on attempt %d (XCLK=%lu Hz)\n",
                       attempt,
                       (unsigned long)xclkHz);
       }
@@ -2442,7 +2611,7 @@ static bool initCameraWithRetries() {
     }
 
     esp_camera_deinit();
-    Serial.printf("[CAM] Retry %d/%d\n", attempt, CAMERA_INIT_RETRIES);
+    Logger.Log("[CAM] Retry %d/%d\n", attempt, CAMERA_INIT_RETRIES);
     delay(CAMERA_INIT_RETRY_DELAY_MS);
   }
 
@@ -2453,13 +2622,13 @@ static bool loadRuntimeConfigWithRetries(StoredConfig &cfg) {
   for (int attempt = 1; attempt <= CONFIG_LOAD_RETRIES; ++attempt) {
     if (loadConfigFromSD(cfg)) {
       if (attempt > 1) {
-        Serial.printf("[CFG] Loaded config on attempt %d\n", attempt);
+        Logger.Log("[CFG] Loaded config on attempt %d\n", attempt);
       }
       return true;
     }
 
     if (attempt < CONFIG_LOAD_RETRIES) {
-      Serial.printf("[CFG] Load attempt %d/%d failed, retrying in %lu ms\n",
+      Logger.Log("[CFG] Load attempt %d/%d failed, retrying in %lu ms\n",
         attempt,
         CONFIG_LOAD_RETRIES,
         (unsigned long)CONFIG_LOAD_RETRY_DELAY_MS);
@@ -2475,14 +2644,21 @@ static bool loadRuntimeConfigWithRetries(StoredConfig &cfg) {
 static bool startSoftAPWithRetries(const char *ssid, const char *password) {
   for (int attempt = 1; attempt <= AP_START_RETRIES; ++attempt) {
     WiFi.mode(WIFI_AP);
-    if (WiFi.softAP(ssid, password, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONNECTIONS)) {
+    bool started = false;
+    if (password && password[0] != '\0') {
+      started = WiFi.softAP(ssid, password, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONNECTIONS);
+    } else {
+      started = WiFi.softAP(ssid, nullptr, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONNECTIONS);
+    }
+
+    if (started) {
       if (attempt > 1) {
-        Serial.printf("[WIFI] AP start succeeded on attempt %d\n", attempt);
+        Logger.Log("[WIFI] AP start succeeded on attempt %d\n", attempt);
       }
       return true;
     }
 
-    Serial.printf("[WIFI] AP start attempt %d/%d failed\n", attempt, AP_START_RETRIES);
+    Logger.Log("[WIFI] AP start attempt %d/%d failed\n", attempt, AP_START_RETRIES);
     delay(AP_START_RETRY_DELAY_MS);
   }
 
@@ -2518,6 +2694,38 @@ static void registerSdRoutes();
 static void registerSdTransferRoutes();
 static void registerRecordingRoutes();
 static void registerMotionRoutes();
+
+static bool isValidRuntimeTxPowerValue(int value) {
+  switch ((wifi_power_t)value) {
+    case WIFI_POWER_MINUS_1dBm:
+    case WIFI_POWER_2dBm:
+    case WIFI_POWER_5dBm:
+    case WIFI_POWER_7dBm:
+    case WIFI_POWER_8_5dBm:
+    case WIFI_POWER_11dBm:
+    case WIFI_POWER_13dBm:
+    case WIFI_POWER_15dBm:
+    case WIFI_POWER_17dBm:
+    case WIFI_POWER_18_5dBm:
+    case WIFI_POWER_19dBm:
+    case WIFI_POWER_19_5dBm:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static wifi_power_t validatedTxPowerValue(int configuredValue, wifi_power_t fallback, const char *label) {
+  if (isValidRuntimeTxPowerValue(configuredValue)) {
+    return (wifi_power_t)configuredValue;
+  }
+
+  Logger.Log("[WIFI] Invalid %s TX power value in config: %d; using default %d\n",
+    label ? label : "WiFi",
+    configuredValue,
+    (int)fallback);
+  return fallback;
+}
 
 static bool hasSharedAccessToken(WebServer &srv) {
   if (routeAccessToken.isEmpty() || !srv.hasArg("t")) {
@@ -2597,7 +2805,7 @@ static void handleStreamWorker() {
     setWifiModemSleep(false, "active stream");
 
     WiFiClient client = streamServer.client();
-    Serial.println("[STREAM] Client connected");
+    Logger.LogLine("[STREAM] Client connected");
     streamClientAbortRequested = false;
     streamClientConnected = true;
     unsigned long lastFrameAt = 0;
@@ -2664,7 +2872,7 @@ static void handleStreamWorker() {
     noteAuthenticatedWebActivity();
     client.stop();
     setWifiModemSleep(true, "idle");
-    Serial.println("[STREAM] Client disconnected");
+    Logger.LogLine("[STREAM] Client disconnected");
 }
 
 static void handleStreamMain() {
@@ -2685,7 +2893,7 @@ static void handleStreamClose() {
 
   if (streamClientConnected) {
     streamClientAbortRequested = true;
-    Serial.println("[STREAM] Close requested by UI");
+    Logger.LogLine("[STREAM] Close requested by UI");
   }
 
   server.send(HTTP_NO_CONTENT, "text/plain", "");
@@ -2711,6 +2919,45 @@ static void handleUrlAccess() {
 static void handleSetupRoot() {
     handleUrlAccess();
   server.send_P(HTTP_OK, "text/html", SETUP_HTML);
+}
+
+static void handleOtaRecoveryRoot() {
+  String page =
+    "<!DOCTYPE html><html lang=\"en\"><head>"
+    "<meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+    "<title>ESP32-CAM OTA Recovery</title>"
+    "<style>"
+    "*{box-sizing:border-box}"
+    "body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;"
+    "font-family:Arial,sans-serif;background:#10131a;color:#e6edf3;padding:20px}"
+    ".card{width:min(520px,100%);background:#1a2230;border:1px solid #2e3b52;border-radius:12px;padding:20px}"
+    "h1{margin:0 0 10px;font-size:1.35rem;color:#7dd3fc}"
+    "p{margin:0 0 12px;line-height:1.45;color:#cbd5e1}"
+    "label{display:block;margin:0 0 8px;color:#cbd5e1;font-size:.92rem}"
+    "input[type=file]{display:block;width:100%;padding:10px;background:#0f1722;border:1px solid #334155;border-radius:8px;color:#e6edf3;margin-bottom:12px}"
+    "button{width:100%;padding:11px 14px;background:#16a34a;color:#fff;border:0;border-radius:8px;cursor:pointer;font-weight:600}"
+    "button:hover{background:#15803d}"
+    ".status{margin-top:12px;min-height:1.2em;color:#93c5fd;font-size:.92rem}"
+    "</style></head><body><div class=\"card\">"
+    "<h1>OTA Recovery Mode</h1>"
+    "<p>microSD was not detected during boot. This access point exposes only firmware update so you can recover the device.</p>"
+    "<p><strong>Firmware:</strong> " + String(FIRMWARE_VERSION_TEXT) + "</p>"
+    "<form id=\"fw\" method=\"POST\" enctype=\"multipart/form-data\">"
+    "<label for=\"firmware\">Firmware Binary (.bin)</label>"
+    "<input id=\"firmware\" type=\"file\" name=\"firmware\" accept=\".bin,application/octet-stream\" required>"
+    "<button type=\"submit\">Upload Firmware</button>"
+    "</form><div class=\"status\" id=\"status\"></div>"
+    "<script>"
+    "(function(){"
+    "var form=document.getElementById('fw');"
+    "var status=document.getElementById('status');"
+    "var token='" + routeAccessToken + "';"
+    "form.action='http://'+window.location.hostname+':" + String(HTTP_TRANSFER_PORT) + "/admin/update?t='+encodeURIComponent(token);"
+    "form.addEventListener('submit',function(){status.textContent='Uploading firmware... do not power off.';});"
+    "})();"
+    "</script></div></body></html>";
+
+  server.send(HTTP_OK, "text/html", page);
 }
 
 static void handleSave() {
@@ -3092,11 +3339,11 @@ static void handleControl() {
         if (val) {
             digitalWrite(LED_FLASH_GPIO_NUM, HIGH);
             flashEnabled = true;
-            Serial.println("[FLASH] Enabled");
+            Logger.LogLine("[FLASH] Enabled");
         } else {
             digitalWrite(LED_FLASH_GPIO_NUM, LOW);
             flashEnabled = false;
-            Serial.println("[FLASH] Disabled");
+            Logger.LogLine("[FLASH] Disabled");
         }
         server.send(HTTP_OK, "text/plain", "OK");
         return;
@@ -3306,10 +3553,10 @@ static void startAuxHttpServers() {
       ARDUINO_RUNNING_CORE
     );
     if (created == pdPASS) {
-      Serial.printf("[HTTP] Stream server ready on port %u\n", (unsigned int)HTTP_STREAM_PORT);
+      Logger.Log("[HTTP] Stream server ready on port %u\n", (unsigned int)HTTP_STREAM_PORT);
     } else {
       streamServerTaskHandle = nullptr;
-      Serial.println("[HTTP] Failed to start stream server task");
+      Logger.LogLine("[HTTP] Failed to start stream server task");
     }
   }
 
@@ -3330,10 +3577,10 @@ static void startAuxHttpServers() {
       ARDUINO_RUNNING_CORE
     );
     if (created == pdPASS) {
-      Serial.printf("[HTTP] Transfer server ready on port %u\n", (unsigned int)HTTP_TRANSFER_PORT);
+      Logger.Log("[HTTP] Transfer server ready on port %u\n", (unsigned int)HTTP_TRANSFER_PORT);
     } else {
       transferServerTaskHandle = nullptr;
-      Serial.println("[HTTP] Failed to start transfer server task");
+      Logger.LogLine("[HTTP] Failed to start transfer server task");
     }
   }
 }
@@ -3360,11 +3607,11 @@ static void startSetupAPMode() {
   wifiModemSleepEnabled = false;
   bool ok = startSoftAPWithRetries(AP_SETUP_SSID, AP_SETUP_PASS);
   if (!ok) {
-    Serial.println("[WIFI] Setup AP start failed");
+    Logger.LogLine("[WIFI] Setup AP start failed");
     return;
   }
     ledSetupAPSequence();
-    Serial.printf("[WIFI] Protected setup AP started — SSID: %s  Password: %s  IP: %s\n",
+    Logger.Log("[WIFI] Protected setup AP started — SSID: %s  Password: %s  IP: %s\n",
     AP_SETUP_SSID, AP_SETUP_PASS, WiFi.softAPIP().toString().c_str());
 
     server.on("/",     HTTP_GET,  handleSetupRoot);
@@ -3372,62 +3619,113 @@ static void startSetupAPMode() {
     server.on("/save", HTTP_POST, handleSave);
     server.onNotFound(handleNotFound);
     server.begin();
-    Serial.println("[HTTP] Setup server ready on port 80");
+    Logger.LogLine("[HTTP] Setup server ready on port 80");
+}
+
+static void startOtaRecoveryAPMode() {
+  wifiModemSleepEnabled = false;
+  bool ok = startSoftAPWithRetries(AP_OTA_RECOVERY_SSID, nullptr);
+  if (!ok) {
+    Logger.LogLine("[WIFI] OTA recovery AP start failed");
+    return;
+  }
+
+  WiFi.setSleep(false);
+  Logger.Log("[WIFI] OTA recovery AP started — SSID: %s (open)  IP: %s\n",
+    AP_OTA_RECOVERY_SSID,
+    WiFi.softAPIP().toString().c_str());
+
+  server.on("/", HTTP_GET, handleOtaRecoveryRoot);
+  registerOtaRoutes();
+  server.onNotFound(handleNotFound);
+  server.begin();
+  Logger.LogLine("[HTTP] OTA recovery server ready on port 80");
+
+  if (!transferServerTaskHandle) {
+    registerOtaTransferRoutes();
+    transferServer.onNotFound([]() {
+      transferServer.send(HTTP_NOT_FOUND, "text/plain", "Not found");
+    });
+    transferServer.begin();
+    BaseType_t created = xTaskCreatePinnedToCore(
+      transferServerTask,
+      "http-transfer",
+      HTTP_TRANSFER_TASK_STACK,
+      &transferServer,
+      1,
+      &transferServerTaskHandle,
+      ARDUINO_RUNNING_CORE
+    );
+    if (created == pdPASS) {
+      Logger.Log("[HTTP] OTA transfer server ready on port %u\n", (unsigned int)HTTP_TRANSFER_PORT);
+    } else {
+      transferServerTaskHandle = nullptr;
+      Logger.LogLine("[HTTP] Failed to start OTA transfer server task");
+    }
+  }
 }
 
 static void startCameraAPMode() {
   wifiModemSleepEnabled = false;
   if (!cfgDeviceName.isEmpty()) {
     if (!WiFi.softAPsetHostname(cfgDeviceName.c_str())) {
-      Serial.println("[WIFI] Failed to set AP hostname");
+      Logger.LogLine("[WIFI] Failed to set AP hostname");
     } else {
-      Serial.printf("[WIFI] AP hostname set to: %s\n", cfgDeviceName.c_str());
+      Logger.Log("[WIFI] AP hostname set to: %s\n", cfgDeviceName.c_str());
     }
   }
 
   bool ok = startSoftAPWithRetries(AP_FALLBACK_SSID, cfgAccessPass.c_str());
   if (!ok) {
-    Serial.println("[WIFI] Fallback AP start failed (check password length >= 8)");
+    Logger.LogLine("[WIFI] Fallback AP start failed (check password length >= 8)");
     return;
   }
 
   // Reduce TX power — client is always nearby in fallback mode
-  WiFi.setTxPower((wifi_power_t)runtimeConfig.txPowerAp);
-  Serial.printf("[WIFI] Fallback AP TX power set to %d (raw)\n", (int)runtimeConfig.txPowerAp);
+  wifi_power_t apTxPower = validatedTxPowerValue((int)runtimeConfig.txPowerAp, DEFAULT_TX_POWER_AP, "AP");
+  WiFi.setTxPower(apTxPower);
+  Logger.Log("[WIFI] Fallback AP TX power set to %d (raw)\n", (int)apTxPower);
 
-  // Increase beacon interval: fewer beacon TX events.
-  {
+  if (AP_FALLBACK_EXTENDED_BEACON_ENABLED) {
+    // Optional power optimization disabled by default for AP stability.
     wifi_config_t apCfg = {};
     if (esp_wifi_get_config(WIFI_IF_AP, &apCfg) == ESP_OK) {
       apCfg.ap.beacon_interval = AP_FALLBACK_BEACON_INTERVAL_TU;
       if (esp_wifi_set_config(WIFI_IF_AP, &apCfg) == ESP_OK) {
-        Serial.printf("[WIFI] Fallback AP: beacon_interval=%u TU\n",
+        Logger.Log("[WIFI] Fallback AP: beacon_interval=%u TU\n",
                       AP_FALLBACK_BEACON_INTERVAL_TU);
       } else {
-        Serial.println("[WIFI] Failed to apply extended fallback AP config");
+        Logger.LogLine("[WIFI] Failed to apply extended fallback AP config");
       }
+    } else {
+      Logger.LogLine("[WIFI] Failed to read fallback AP config");
     }
   }
 
-  // Enable modem sleep so idle periods between frames/requests save power
-  WiFi.setSleep(true);
-  wifiModemSleepEnabled = true;
-  Serial.printf("[WIFI] Fallback AP power: reduced TX + modem sleep enabled\n");
-
+  // Keep modem sleep disabled in fallback AP mode for better runtime stability.
+  if (AP_FALLBACK_MODEM_SLEEP_ENABLED) {
+    WiFi.setSleep(true);
+    wifiModemSleepEnabled = true;
+    Logger.Log("[WIFI] Fallback AP power: reduced TX + modem sleep enabled\n");
+  } else {
+    WiFi.setSleep(false);
+    wifiModemSleepEnabled = false;
+    Logger.LogLine("[WIFI] Fallback AP stability mode: modem sleep disabled");
+  }
   // LED feedback: triple blink when fallback AP activated
   ledFallbackAPSequence();
 
-  Serial.printf("[WIFI] Fallback AP started — SSID: %s  IP: %s\n",
+  Logger.Log("[WIFI] Fallback AP started — SSID: %s  IP: %s\n",
     AP_FALLBACK_SSID, WiFi.softAPIP().toString().c_str());
 
   registerCameraRoutes();
   server.begin();
   startAuxHttpServers();
-  Serial.println("[HTTP] Camera server ready on port 80 (AP mode)");
+  Logger.LogLine("[HTTP] Camera server ready on port 80 (AP mode)");
 }
 
 static bool syncClockWithNtp() {
-  Serial.printf("[NTP] Syncing clock using %s (TZ=%s)\n", NTP_SERVER, TIME_ZONE);
+  Logger.Log("[NTP] Syncing clock using %s (TZ=%s)\n", NTP_SERVER, TIME_ZONE);
   applyLocalTimeZone();
   configTzTime(TIME_ZONE, NTP_SERVER);
 
@@ -3436,20 +3734,20 @@ static bool syncClockWithNtp() {
     if (getLocalTime(&timeinfo, 500)) {
       char ts[32];
       strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &timeinfo);
-      Serial.printf("[NTP] Time synced: %s\n", ts);
+      Logger.Log("[NTP] Time synced: %s\n", ts);
       return true;
     }
     delay(500);
-    Serial.print('.');
+    Logger.LogRaw('.');
   }
 
-  Serial.println("[NTP] Time sync failed; clock may be incorrect");
+  Logger.LogLine("[NTP] Time sync failed; clock may be incorrect");
   return false;
 }
 
 static void startSTAMode() {
   if (runtimeConfig.wifiList.empty()) {
-    Serial.println("[WIFI] No saved STA networks — switching to fallback AP");
+    Logger.LogLine("[WIFI] No saved STA networks — switching to fallback AP");
     startCameraAPMode();
     return;
   }
@@ -3460,7 +3758,7 @@ static void startSTAMode() {
     return;
   }
 
-  Serial.println("[WIFI] All saved networks failed — switching to fallback AP");
+  Logger.LogLine("[WIFI] All saved networks failed — switching to fallback AP");
   startCameraAPMode();
 }
 
@@ -3474,7 +3772,7 @@ static void servicePendingFirmwareRestart() {
     return;
   }
 
-  Serial.println("[OTA] Restarting after successful firmware update");
+  Logger.LogLine("[OTA] Restarting after successful firmware update");
   delay(100);
   ESP.restart();
 }
@@ -3491,7 +3789,7 @@ static void servicePendingAdminRestart() {
 
   adminRestartPending = false;
   adminRestartAt = 0;
-  Serial.println("[ADMIN] Restarting on admin request");
+  Logger.LogLine("[ADMIN] Restarting on admin request");
   delay(100);
   ESP.restart();
 }
@@ -3499,7 +3797,7 @@ static void servicePendingAdminRestart() {
 #include "modules/motion_module.inc.h"
 
 [[noreturn]] static void haltBoot(const char *message) {
-  Serial.println(message);
+  Logger.LogLine(message);
   for (;;) {
     delay(1000);
   }
@@ -3532,14 +3830,20 @@ static void initializeButtonState() {
   buttonLastRawPressed = (digitalRead(BUTTON_GPIO) == LOW);
   buttonStablePressed = buttonLastRawPressed;
   buttonLastChangeAt = millis();
+  // Require a release before arming if button is currently held LOW.
   buttonSleepArmed = !buttonStablePressed;
+
+  // After wake from button (EXT0), keep sleep disarmed until release to
+  // avoid immediate sleep->wake loops when the line is still LOW.
+  if (bootWakeCause == ESP_SLEEP_WAKEUP_EXT0) {
+    buttonSleepArmed = false;
+  }
   buttonSleepRequestPending = false;
 }
 
 static void logInputPinConfiguration() {
-  Serial.printf("[GPIO] Button: GPIO%d (to GND, active LOW), PIR DATA: GPIO%d\n", BUTTON_GPIO, PIR_GPIO);
-  Serial.println("[GPIO] PIR power: VCC -> 5V (or compatible rail), GND -> GND");
-  logSharedPinCaveats();
+  Logger.Log("[GPIO] Button: GPIO%d (to GND, active LOW), PIR DATA: GPIO%d\n", BUTTON_GPIO, PIR_GPIO);
+  Logger.LogLine("[GPIO] PIR power: VCC -> 3.3V (or compatible rail), GND -> GND");
 }
 
 static void resetMotionRuntimeState() {
@@ -3561,7 +3865,8 @@ static void applyLoadedStartupConfig(const StoredConfig &cfg) {
   cfgAccessPass = cfg.adminPass;
   cfgDeviceName = cfg.deviceName;
   ledAccessBlinkEnabled = cfg.ledAccessBlink;
-  gLoggingEnabled = cfg.loggingEnabled;
+  gLogSerialEnabled = cfg.logSerialEnabled;
+  gLogFileEnabled = cfg.logFileEnabled;
   if (cfgDeviceName.isEmpty()) {
     cfgDeviceName = "ESP32-CAM";
   }
@@ -3572,11 +3877,18 @@ static void applyDefaultStartupConfig() {
   runtimeConfig = StoredConfig();
   cfgDeviceName = "ESP32-CAM";
   ledAccessBlinkEnabled = false;
-  gLoggingEnabled = true;
+  gLogSerialEnabled = true;
+  gLogFileEnabled = true;
   isConfigured = false;
 }
 
 static void loadStartupConfig() {
+  if (!sdCardAvailableAtBoot) {
+    Logger.LogLine("[CFG] SD card missing at boot - skipping config load");
+    applyDefaultStartupConfig();
+    return;
+  }
+
   StoredConfig cfg;
   if (loadRuntimeConfigWithRetries(cfg)) {
     applyLoadedStartupConfig(cfg);
@@ -3587,12 +3899,9 @@ static void loadStartupConfig() {
 
 static void finalizeMotionStartupConfig() {
   clampMotionSettings(runtimeConfig.motionSettings);
-  if (runtimeConfig.motionSettings.wakeOnMotion && !pirSupportsRtcWakeup()) {
-    runtimeConfig.motionSettings.wakeOnMotion = false;
-    Serial.printf("[CFG] Disabled wake on motion because GPIO%d is not RTC-capable\n", PIR_GPIO);
-  }
-
+  resetMotionDetectionState();
   applyPirInputMode();
+  attachInterrupt(digitalPinToInterrupt(PIR_GPIO), onPirEdgeInterrupt, CHANGE);
   configureMotionWakeup(runtimeConfig.motionSettings.wakeOnMotion);
   updateSdLoggingState();
 
@@ -3604,17 +3913,23 @@ static void finalizeMotionStartupConfig() {
 
 static void initializeRouteAccessToken() {
   routeAccessToken = String((uint32_t)esp_random(), HEX) + String((uint32_t)esp_random(), HEX);
-  Serial.printf("[HTTP] Shared route token initialized (%u chars)\n", (unsigned int)routeAccessToken.length());
+  Logger.Log("[HTTP] Shared route token initialized (%u chars)\n", (unsigned int)routeAccessToken.length());
 }
 
 static void startInitialNetworkServices() {
-  Serial.printf("[CFG] Configured: %s\n", isConfigured ? "yes" : "no");
-  Serial.printf("[CAM] Lazy init enabled with idle timeout %lu ms\n", cameraIdleTimeoutMs);
+  Logger.Log("[CFG] Configured: %s\n", isConfigured ? "yes" : "no");
+  Logger.Log("[CAM] Lazy init enabled with idle timeout %lu ms\n", cameraIdleTimeoutMs);
+
+  if (!sdCardAvailableAtBoot) {
+    Logger.LogLine("[BOOT] SD missing at boot - starting OTA recovery AP mode");
+    startOtaRecoveryAPMode();
+    return;
+  }
 
   bool motionWakeBoot = motionBootEventPending && bootWakeCause == ESP_SLEEP_WAKEUP_EXT1;
   if (motionWakeBoot) {
     deferredNetworkStartupPending = true;
-    Serial.println("[BOOT] Deferring network startup until motion capture completes");
+    Logger.LogLine("[BOOT] Deferring network startup until motion capture completes");
   } else if (isConfigured) {
     startSTAMode();
   } else {
@@ -3624,8 +3939,8 @@ static void startInitialNetworkServices() {
 
 // ─── Arduino entry points ─────────────────────────────────────────────────────
 void setup() {
-  Serial.begin(115200);
-  Serial.println("\n[BOOT] ESP32-CAM starting");
+  Logger.begin(115200);
+  Logger.LogLine("[BOOT] *** ESP32-CAM starting ***");
   WiFi.onEvent(onWifiEvent);
 
   initializeWakeupIndicator();
@@ -3638,10 +3953,16 @@ void setup() {
   logInputPinConfiguration();
   resetMotionRuntimeState();
 
+  sdCardAvailableAtBoot = initSDCard();
+  if (!sdCardAvailableAtBoot) {
+    Logger.LogLine("[SD] Boot check: SD card unavailable");
+  }
+
   loadStartupConfig();
   finalizeMotionStartupConfig();
   initializeRouteAccessToken();
   startInitialNetworkServices();
+  serviceLogFileFlush();
 }
 
 void loop() {
@@ -3658,5 +3979,6 @@ void loop() {
   serviceButtonSleepRequest();
   servicePendingFirmwareRestart();
   servicePendingAdminRestart();
+  serviceLogFileFlush();
   delay(2);
 }

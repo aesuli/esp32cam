@@ -144,12 +144,16 @@ __APP_NAV__
     <h3>Logging</h3>
     <form class="form" id="logging_form">
       <div style="display:flex;align-items:center;gap:10px">
-        <label for="logging_enabled" style="margin:0">Enable serial + file logging</label>
-        <input id="logging_enabled" type="checkbox" style="width:auto">
+        <label for="logging_serial_enabled" style="margin:0">Enable serial logging</label>
+        <input id="logging_serial_enabled" type="checkbox" style="width:auto">
+      </div>
+      <div style="display:flex;align-items:center;gap:10px">
+        <label for="logging_file_enabled" style="margin:0">Enable /log.txt file logging</label>
+        <input id="logging_file_enabled" type="checkbox" style="width:auto">
       </div>
     </form>
     <div id="logging_status" class="status"></div>
-    <div style="font-size:.85em;color:#bbb;margin-top:10px">Disables all firmware logs globally, including serial output and /log.txt writes.</div>
+    <div style="font-size:.85em;color:#bbb;margin-top:10px">Choose where firmware logs are emitted. Every log line is timestamped by the firmware.</div>
   </div>
   <div class="panel">
     <h3>TX Power</h3>
@@ -431,18 +435,20 @@ function refreshLoggingStatus(){
     if(!r.ok){throw new Error('Failed to load logging settings');}
     return r.json();
   }).then(function(d){
-    id('logging_enabled').checked=d.loggingEnabled!==false;
+    id('logging_serial_enabled').checked=d.loggingSerialEnabled!==false;
+    id('logging_file_enabled').checked=d.loggingFileEnabled!==false;
   }).catch(function(){});
 }
 function saveLoggingSettings(){
   setLoggingStatus('Saving...',false);
-  fetch('/admin/logging',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({loggingEnabled:id('logging_enabled').checked?'1':'0'})}).then(function(r){r.text().then(function(msg){setLoggingStatus(msg||'Saved',!r.ok);refreshLoggingStatus();});}).catch(function(err){setLoggingStatus(err.message||'Failed to save logging settings',true);});
+  fetch('/admin/logging',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({loggingSerialEnabled:id('logging_serial_enabled').checked?'1':'0',loggingFileEnabled:id('logging_file_enabled').checked?'1':'0'})}).then(function(r){r.text().then(function(msg){setLoggingStatus(msg||'Saved',!r.ok);refreshLoggingStatus();});}).catch(function(err){setLoggingStatus(err.message||'Failed to save logging settings',true);});
 }
 id('logging_form').addEventListener('submit',function(e){
   e.preventDefault();
   saveLoggingSettings();
 });
-id('logging_enabled').addEventListener('change',saveLoggingSettings);
+id('logging_serial_enabled').addEventListener('change',saveLoggingSettings);
+id('logging_file_enabled').addEventListener('change',saveLoggingSettings);
 function refreshTxPower(){
   fetch('/admin/txpower').then(function(r){
     if(!r.ok){throw new Error('Failed to load TX power settings');}

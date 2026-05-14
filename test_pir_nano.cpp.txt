@@ -1,0 +1,35 @@
+#include <Arduino.h>
+
+const int pirPin = 2;
+
+volatile bool motionFlag = false;
+volatile bool motionState = false;
+
+void handleMotion() {
+    motionState = digitalRead(pirPin);
+    motionFlag = true;
+}
+
+void setup() {
+    pinMode(pirPin, INPUT);
+    Serial.begin(9600);
+
+    Serial.println("Ready");
+
+    attachInterrupt(digitalPinToInterrupt(pirPin), handleMotion, CHANGE);
+}
+
+void loop() {
+    if (motionFlag) {
+        noInterrupts();
+        bool state = motionState;
+        motionFlag = false;
+        interrupts();
+
+        if (state) {
+            Serial.println("Motion detected");
+        } else {
+            Serial.println("Motion ended");
+        }
+    }
+}

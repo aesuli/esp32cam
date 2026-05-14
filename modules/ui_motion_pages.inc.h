@@ -39,6 +39,7 @@ __APP_NAV__
     <h3>Settings</h3>
     <div class="cg"><a href="/motion/graph" style="color:#7dd3fc;text-decoration:none">Open Motion Graph</a></div>
     <div class="cg"><label><input id="enabled" type="checkbox"> Enable motion detection</label></div>
+    <div class="cg"><label><input id="standby_button_enabled" type="checkbox"> Enable stand-by button (GPIO13)</label></div>
     <div class="cg"><label><input id="wake_on_motion" type="checkbox"> Wake up on motion</label></div>
     <div class="cg"><label><input id="auto_standby" type="checkbox"> Automatic stand-by</label></div>
     <div class="small">When the device enters stand-by, the next motion wake is handled immediately.</div>
@@ -102,6 +103,7 @@ var saveInFlight=false;
 function buildPayload(){
   return {
     enabled:id('enabled').checked?1:0,
+    standbyButtonEnabled:id('standby_button_enabled').checked?1:0,
     wakeOnMotion:id('wake_on_motion').checked?1:0,
     autoStandby:id('auto_standby').checked?1:0,
     standbyAfterSec:asInt(id('standby_after_sec').value,30),
@@ -166,6 +168,7 @@ function loadConfig(){
     return r.json();
   }).then(function(c){
     id('enabled').checked=!!c.enabled;
+    id('standby_button_enabled').checked=(c.standbyButtonEnabled!==false);
     id('wake_on_motion').checked=!!c.wakeOnMotion;
     id('auto_standby').checked=!!c.autoStandby;
     id('standby_after_sec').value=c.standbyAfterSec;
@@ -193,6 +196,7 @@ id('standby_btn').addEventListener('click',function(){
 });
 
 bindAutoSave('enabled');
+bindAutoSave('standby_button_enabled');
 bindAutoSave('wake_on_motion');
 bindAutoSave('auto_standby');
 bindAutoSave('standby_after_sec');

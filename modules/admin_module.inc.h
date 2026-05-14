@@ -163,22 +163,45 @@ static void handleAdminLedSet() {
 static void handleAdminLoggingGet() {
   if (!checkAuth()) return;
 
-  String json = "{\"loggingEnabled\":" + String(gLoggingEnabled ? "true" : "false") + "}";
+  String json = "{";
+  json += "\"loggingSerialEnabled\":" + String(gLogSerialEnabled ? "true" : "false") + ",";
+  json += "\"loggingFileEnabled\":" + String(gLogFileEnabled ? "true" : "false") + ",";
+  json += "\"loggingEnabled\":" + String((gLogSerialEnabled || gLogFileEnabled) ? "true" : "false");
+  json += "}";
   server.send(HTTP_OK, "application/json", json);
 }
 
 static void handleAdminLoggingSet() {
   if (!checkAuth()) return;
 
-  if (!server.hasArg("loggingEnabled")) {
-    server.send(HTTP_BAD_REQUEST, "text/plain", "Missing loggingEnabled parameter");
+  bool hasSerial = server.hasArg("loggingSerialEnabled");
+  bool hasFile = server.hasArg("loggingFileEnabled");
+  if (!hasSerial && !hasFile && !server.hasArg("loggingEnabled")) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Missing loggingSerialEnabled/loggingFileEnabled parameter");
     return;
   }
 
-  bool newValue = (server.arg("loggingEnabled") == "1" || server.arg("loggingEnabled") == "true");
+  bool serialEnabled = runtimeConfig.logSerialEnabled;
+  bool fileEnabled = runtimeConfig.logFileEnabled;
 
-  runtimeConfig.loggingEnabled = newValue;
-  gLoggingEnabled = newValue;
+  if (server.hasArg("loggingEnabled")) {
+    bool legacyValue = (server.arg("loggingEnabled") == "1" || server.arg("loggingEnabled") == "true");
+    serialEnabled = legacyValue;
+    fileEnabled = legacyValue;
+  }
+
+  if (hasSerial) {
+    String raw = server.arg("loggingSerialEnabled");
+    serialEnabled = (raw == "1" || raw == "true");
+  }
+
+  if (hasFile) {
+    String raw = server.arg("loggingFileEnabled");
+    fileEnabled = (raw == "1" || raw == "true");
+  }
+
+  runtimeConfig.logSerialEnabled = serialEnabled;
+  runtimeConfig.logFileEnabled = fileEnabled;
   updateSdLoggingState();
 
   if (!persistRuntimeConfig(runtimeConfig)) {

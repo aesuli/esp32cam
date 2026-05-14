@@ -6,7 +6,7 @@ Firmware for AI-Thinker ESP32-CAM (OV3660) with web streaming, camera controls, 
 
 - SD runs in 1-bit SD_MMC mode.
 - Push button: connect between GPIO13 and GND (configured as INPUT_PULLUP, active LOW).
-- PIR sensor: DATA to GPIO12, VCC to 5V.
+- PIR sensor: DATA to GPIO12, VCC to 3.3V.
 - Button behavior: on press, firmware waits 1 second, blinks the status LED 3 fast times, then enters deep sleep.
 - Wake-up source: pressing the button wakes from deep sleep and blinks the status LED 2 fast times.
 
@@ -15,7 +15,7 @@ Firmware for AI-Thinker ESP32-CAM (OV3660) with web streaming, camera controls, 
 - SD card is required to save configuration. 
 - Configuration is stored in encrypted SD file `/config.enc`. 
 - If `/config.enc` does not exist, the device enters first-setup mode.
-- When changing the SD card, copy `/config.enc` to the new card to preserve the configuraiton.
+- When changing the SD card, copy `/config.enc` to the new card to preserve the configuration.
 
 ## First-setup mode
 
@@ -82,7 +82,7 @@ The web interface is composed of four main pages:
 - Change device name
 - Set or sync device time
 - Enable or disable LED URL-access blink
-- Enable or disable global logging (serial output and `/log.txt` SD logging)
+- Enable or disable serial logging and `/log.txt` SD logging independently
 - Set WiFi TX power for STA and fallback AP
 - Upload firmware binary for OTA update
 - Restart device
