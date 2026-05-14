@@ -157,6 +157,7 @@ static String cfgAccessPass;
 static String cfgDeviceName;
 static String routeAccessToken;
 static bool   isConfigured = false;
+static bool   otaRecoveryModeActive = false;
 static bool   recordingActive = false;
 static volatile bool streamClientConnected = false;
 static volatile bool streamClientAbortRequested = false;
@@ -2975,6 +2976,8 @@ static void handleOtaRecoveryRoot() {
     "input[type=file]{display:block;width:100%;padding:10px;background:#0f1722;border:1px solid #334155;border-radius:8px;color:#e6edf3;margin-bottom:12px}"
     "button{width:100%;padding:11px 14px;background:#16a34a;color:#fff;border:0;border-radius:8px;cursor:pointer;font-weight:600}"
     "button:hover{background:#15803d}"
+    ".danger{margin-top:10px;background:#b91c1c}"
+    ".danger:hover{background:#991b1b}"
     ".status{margin-top:12px;min-height:1.2em;color:#93c5fd;font-size:.92rem}"
     "</style></head><body><div class=\"card\">"
     "<h1>OTA Recovery Mode</h1>"
@@ -2984,18 +2987,80 @@ static void handleOtaRecoveryRoot() {
     "<label for=\"firmware\">Firmware Binary (.bin)</label>"
     "<input id=\"firmware\" type=\"file\" name=\"firmware\" accept=\".bin,application/octet-stream\" required>"
     "<button type=\"submit\">Upload Firmware</button>"
-    "</form><div class=\"status\" id=\"status\"></div>"
+    "</form>"
+    "<button class=\"danger\" id=\"format_sd\" type=\"button\">Format SD Card (Erase All Data)</button>"
+    "<div class=\"status\" id=\"status\"></div>"
     "<script>"
     "(function(){"
     "var form=document.getElementById('fw');"
+    "var formatBtn=document.getElementById('format_sd');"
     "var status=document.getElementById('status');"
     "var token='" + routeAccessToken + "';"
     "form.action='http://'+window.location.hostname+':" + String(HTTP_TRANSFER_PORT) + "/admin/update?t='+encodeURIComponent(token);"
     "form.addEventListener('submit',function(){status.textContent='Uploading firmware... do not power off.';});"
+    "formatBtn.addEventListener('click',function(){"
+    "if(!confirm('Format SD card now? This will erase all files and folders on the card.')) return;"
+    "formatBtn.disabled=true;"
+    "status.textContent='Formatting SD card...';"
+    "fetch('/ota/format-sd',{method:'POST'})"
+    ".then(function(r){return r.text().then(function(t){if(!r.ok) throw new Error(t||('HTTP '+r.status)); return t;});})"
+    ".then(function(t){status.textContent=t||'SD format complete.';})"
+    ".catch(function(e){status.textContent='Format failed: '+(e&&e.message?e.message:'unknown error');})"
+    ".finally(function(){formatBtn.disabled=false;});"
+    "});"
     "})();"
     "</script></div></body></html>";
 
   server.send(HTTP_OK, "text/html", page);
+}
+
+static void handleOtaFormatSd() {
+  if (!otaRecoveryModeActive) {
+    server.send(HTTP_FORBIDDEN, "text/plain", "SD format is only available in OTA recovery mode");
+    return;
+  }
+
+  ScopedSdLock sdLock(pdMS_TO_TICKS(SD_LONG_LOCK_TIMEOUT_MS));
+  if (!sdLock.locked()) {
+    server.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", ERR_SD_CARD_BUSY);
+    return;
+  }
+
+  SD_MMC.end();
+  gSdCardMounted = false;
+  gLogSdReady = false;
+  restoreInputPinsAfterSDInit();
+
+  // formatOnFail=true lets the SD stack create a fresh FAT filesystem when mount fails.
+  bool mounted = SD_MMC.begin("/sdcard", true, true);
+  restoreInputPinsAfterSDInit();
+
+  if (!mounted || SD_MMC.cardType() == CARD_NONE) {
+    SD_MMC.end();
+    gSdCardMounted = false;
+    gLogSdReady = false;
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Unable to format SD card (no card or SD bus error)");
+    return;
+  }
+
+  File root = SD_MMC.open("/");
+  if (!root || !root.isDirectory()) {
+    if (root) {
+      root.close();
+    }
+    SD_MMC.end();
+    gSdCardMounted = false;
+    gLogSdReady = false;
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", "SD card responded, but filesystem is still unreadable");
+    return;
+  }
+  root.close();
+
+  gSdCardMounted = true;
+  gLogSdReady = true;
+  sdCardAvailableAtBoot = true;
+  Logger.LogLine("[SD] Format completed from OTA recovery page");
+  server.send(HTTP_OK, "text/plain", "SD format complete. Reboot recommended.");
 }
 
 static void handleSave() {
@@ -3642,6 +3707,7 @@ static void registerCameraRoutes() {
 }
 
 static void startSetupAPMode() {
+  otaRecoveryModeActive = false;
   wifiModemSleepEnabled = false;
   bool ok = startSoftAPWithRetries(AP_SETUP_SSID, AP_SETUP_PASS);
   if (!ok) {
@@ -3661,6 +3727,7 @@ static void startSetupAPMode() {
 }
 
 static void startOtaRecoveryAPMode() {
+  otaRecoveryModeActive = true;
   wifiModemSleepEnabled = false;
   bool ok = startSoftAPWithRetries(AP_OTA_RECOVERY_SSID, nullptr);
   if (!ok) {
@@ -3674,6 +3741,7 @@ static void startOtaRecoveryAPMode() {
     WiFi.softAPIP().toString().c_str());
 
   server.on("/", HTTP_GET, handleOtaRecoveryRoot);
+  server.on("/ota/format-sd", HTTP_POST, handleOtaFormatSd);
   registerOtaRoutes();
   server.onNotFound(handleNotFound);
   server.begin();
@@ -3704,6 +3772,7 @@ static void startOtaRecoveryAPMode() {
 }
 
 static void startCameraAPMode() {
+  otaRecoveryModeActive = false;
   wifiModemSleepEnabled = false;
   if (!cfgDeviceName.isEmpty()) {
     if (!WiFi.softAPsetHostname(cfgDeviceName.c_str())) {
@@ -3784,6 +3853,7 @@ static bool syncClockWithNtp() {
 }
 
 static void startSTAMode() {
+  otaRecoveryModeActive = false;
   if (runtimeConfig.wifiList.empty()) {
     Logger.LogLine("[WIFI] No saved STA networks — switching to fallback AP");
     startCameraAPMode();
