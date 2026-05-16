@@ -31,21 +31,19 @@ static void clampMotionSettings(MotionSettings &settings) {
 
 static void clearRtcGpioDControl() {
   // After deep sleep with RTC GPIO config (rtc_gpio_pullup_en, etc), those settings
-  // persist and block SD_MMC from using GPIO12/13. Clear RTC claims on shared pins.
-  rtc_gpio_deinit((gpio_num_t)BUTTON_GPIO);
+  // persist and can block SD_MMC from using the shared PIR pin. Clear RTC claims.
   rtc_gpio_deinit((gpio_num_t)PIR_GPIO);
-  Logger.LogLine("[GPIO] Cleared RTC control from GPIO13 and GPIO12 after wake-up");
+  Logger.Log("[GPIO] Cleared RTC control from GPIO%d after wake-up\n", PIR_GPIO);
 }
 
 static void applyPirInputMode() {
   // Keep PIR input high-impedance; internal pull resistors can mask weak module outputs,
-  // especially on shared GPIO12/SD lines.
+  // especially on shared SD data lines.
   pinMode(PIR_GPIO, INPUT);
   Logger.Log("[GPIO] PIR mode applied on GPIO%d: INPUT\n", PIR_GPIO);
 }
 
 static void restoreInputPinsAfterSDInit() {
-  pinMode(BUTTON_GPIO, INPUT_PULLUP);
   applyPirInputMode();
   attachInterrupt(digitalPinToInterrupt(PIR_GPIO), onPirEdgeInterrupt, CHANGE);
 }
@@ -138,7 +136,6 @@ static void handleMotionConfigGet() {
   json += "\"imageDelayDs\":" + String((int)m.imageDelayDs) + ",";
   json += "\"captureVideo\":" + String(m.captureVideo ? "true" : "false") + ",";
   json += "\"videoDurationSec\":" + String((int)m.videoDurationSec) + ",";
-  json += "\"standbyButtonEnabled\":" + String(m.standbyButtonEnabled ? "true" : "false") + ",";
   json += "\"wakeOnMotion\":" + String(m.wakeOnMotion ? "true" : "false") + ",";
   json += "\"autoStandby\":" + String(m.autoStandby ? "true" : "false") + ",";
   json += "\"standbyAfterSec\":" + String((int)m.standbyAfterSec) + ",";
@@ -158,7 +155,6 @@ static void handleMotionConfigSet() {
   if (server.hasArg("imageDelayDs")) updated.imageDelayDs = (uint8_t)server.arg("imageDelayDs").toInt();
   if (server.hasArg("captureVideo")) updated.captureVideo = server.arg("captureVideo") == "1" || server.arg("captureVideo") == "true";
   if (server.hasArg("videoDurationSec")) updated.videoDurationSec = (uint8_t)server.arg("videoDurationSec").toInt();
-  if (server.hasArg("standbyButtonEnabled")) updated.standbyButtonEnabled = server.arg("standbyButtonEnabled") == "1" || server.arg("standbyButtonEnabled") == "true";
   if (server.hasArg("wakeOnMotion")) updated.wakeOnMotion = server.arg("wakeOnMotion") == "1" || server.arg("wakeOnMotion") == "true";
   if (server.hasArg("autoStandby")) updated.autoStandby = server.arg("autoStandby") == "1" || server.arg("autoStandby") == "true";
   if (server.hasArg("standbyAfterSec")) updated.standbyAfterSec = (uint16_t)server.arg("standbyAfterSec").toInt();
@@ -199,18 +195,6 @@ static void registerMotionRoutes() {
 
 // ─── Motion runtime and sleep handling ───────────────────────────────────────
 
-static void configureButtonWakeup() {
-  esp_err_t err = esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_GPIO, 0);
-  if (err != ESP_OK) {
-    Logger.Log("[SLEEP] Failed to enable EXT0 wakeup on GPIO%d (err=0x%x)\n", BUTTON_GPIO, err);
-    return;
-  }
-
-  rtc_gpio_pullup_en((gpio_num_t)BUTTON_GPIO);
-  rtc_gpio_pulldown_dis((gpio_num_t)BUTTON_GPIO);
-  Logger.Log("[SLEEP] Wakeup source configured: button GPIO%d LOW\n", BUTTON_GPIO);
-}
-
 static void configureMotionWakeup(bool enabled) {
   // Only attempt to disable EXT1 if it was previously enabled to avoid errors
   // during initial configuration when the wakeup source hasn't been set up yet.
@@ -238,12 +222,6 @@ static void configureMotionWakeup(bool enabled) {
 }
 
 static void handleWakeupIndicator() {
-  if (bootWakeCause == ESP_SLEEP_WAKEUP_EXT0) {
-    Logger.Log("[BOOT] Wakeup from deep sleep via button GPIO%d\n", BUTTON_GPIO);
-    ledBlinkCount(2, BUTTON_BLINK_ON_MS, BUTTON_BLINK_OFF_MS);
-    return;
-  }
-
   if (bootWakeCause == ESP_SLEEP_WAKEUP_EXT1) {
     uint64_t mask = esp_sleep_get_ext1_wakeup_status();
     if ((mask & (1ULL << PIR_GPIO)) != 0ULL) {
@@ -304,13 +282,12 @@ static void prepareDeviceForDeepSleep() {
     esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
     motionWakeupExt1Enabled = false;
   }
-  configureButtonWakeup();
   if (allowMotionWake && runtimeConfig.motionSettings.wakeOnMotion) {
     configureMotionWakeup(true);
   }
 
   if (blinkCount > 0) {
-    ledBlinkCount(blinkCount, BUTTON_BLINK_ON_MS, BUTTON_BLINK_OFF_MS);
+    ledBlinkCount(blinkCount, SLEEP_BLINK_ON_MS, SLEEP_BLINK_OFF_MS);
   }
   delay(20);
   esp_deep_sleep_start();
@@ -318,11 +295,6 @@ static void prepareDeviceForDeepSleep() {
   for (;;) {
     delay(1000);
   }
-}
-
-[[noreturn]] static void enterDeepSleepFromButton() {
-  // Manual button sleep can also wake on motion when enabled in settings.
-  enterDeepSleepNow("Button requested deep sleep", 3, true);
 }
 
 static void closeMotionActionWindow() {
@@ -410,43 +382,6 @@ static void triggerMotionEvent(const char *source) {
 
   if (motionPendingImages == 0 && !motionVideoManagedRecording) {
     closeMotionActionWindow();
-  }
-}
-
-static void serviceButtonSleepRequest() {
-  if (!runtimeConfig.motionSettings.standbyButtonEnabled) {
-    buttonSleepRequestPending = false;
-    return;
-  }
-
-  unsigned long now = millis();
-  bool rawPressed = (digitalRead(BUTTON_GPIO) == LOW);
-
-  if (rawPressed != buttonLastRawPressed) {
-    buttonLastRawPressed = rawPressed;
-    buttonLastChangeAt = now;
-  }
-
-  if ((now - buttonLastChangeAt) >= BUTTON_DEBOUNCE_MS && rawPressed != buttonStablePressed) {
-    buttonStablePressed = rawPressed;
-
-    if (!buttonStablePressed) {
-      buttonSleepArmed = true;
-      return;
-    }
-  }
-
-  if ((now - buttonLastChangeAt) >= BUTTON_DEBOUNCE_MS &&
-      buttonStablePressed && buttonSleepArmed && !buttonSleepRequestPending) {
-    buttonSleepRequestPending = true;
-    buttonSleepRequestAt = now;
-    buttonSleepArmed = false;
-    Logger.Log("[BUTTON] Sleep requested, entering deep sleep in %lu ms\n", BUTTON_SLEEP_DELAY_MS);
-  }
-
-  if (buttonSleepRequestPending && (now - buttonSleepRequestAt) >= BUTTON_SLEEP_DELAY_MS) {
-    buttonSleepRequestPending = false;
-    enterDeepSleepFromButton();
   }
 }
 

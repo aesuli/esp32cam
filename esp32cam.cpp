@@ -4,8 +4,7 @@
  * Hardware:
  *   - AI-Thinker ESP32-CAM with OV3660 camera sensor
  *   - microSD in 1-bit mode so SDMMC does not actively drive GPIO12/GPIO13
- *   - GPIO13 reserved for push button (shared with SD DAT3 pull network)
- *   - GPIO12 reserved for PIR input (shared with SD DAT2 pull network)
+ *   - GPIO13 reserved for PIR input (shared with SD DAT3 pull network)
  *
  * First Boot (unconfigured or missing config file):
  *   Broadcasts protected WiFi AP "ESP32-CAM-Setup"
@@ -53,16 +52,12 @@
 #endif
 
 // ─── Pin definitions ──────────────────────────────────────────────────────────
-// Button wiring: one side to GPIO13, other side to GND (INPUT_PULLUP, active LOW).
-// PIR wiring: VCC -> 3.3, DATA -> GPIO12, GND -> GND.
+// PIR wiring: VCC -> 3.3, DATA -> GPIO13, GND -> GND.
 // Note: GPIO12/GPIO13 remain electrically tied to SD DAT2/DAT3 while the card is mounted.
-static constexpr int BUTTON_GPIO = 13;
-static constexpr int PIR_GPIO    = 12;
+static constexpr int PIR_GPIO    = 13;
 static constexpr int LED_GPIO    = 33;  // Internal red LED on ESP32-CAM
-static constexpr unsigned long BUTTON_DEBOUNCE_MS = 40;
-static constexpr unsigned long BUTTON_SLEEP_DELAY_MS = 1000;
-static constexpr unsigned long BUTTON_BLINK_ON_MS = 70;
-static constexpr unsigned long BUTTON_BLINK_OFF_MS = 70;
+static constexpr unsigned long SLEEP_BLINK_ON_MS = 70;
+static constexpr unsigned long SLEEP_BLINK_OFF_MS = 70;
 static constexpr bool APP_UART_CONSOLE_ENABLED = true;
 
 // ─── AP setup credentials ─────────────────────────────────────────────────────
@@ -167,10 +162,6 @@ static bool   ledAccessBlinkEnabled = false;
 static bool   wifiModemSleepEnabled = false;
 static bool   staConnectedAtBoot = false;
 static bool   sdCardAvailableAtBoot = false;
-static bool   buttonLastRawPressed = false;
-static bool   buttonStablePressed = false;
-static bool   buttonSleepArmed = true;
-static bool   buttonSleepRequestPending = false;
 static bool   motionRawHigh = false;
 static bool   motionLatched = false;
 static bool   motionBootEventPending = false;
@@ -186,8 +177,6 @@ static volatile bool staLinkUp = false;
 static unsigned long lastUrlAccessBlink = 0;
 static unsigned long lastCameraActivityAt = 0;
 static unsigned long lastStaReconnectAttemptAt = 0;
-static unsigned long buttonLastChangeAt = 0;
-static unsigned long buttonSleepRequestAt = 0;
 static unsigned long motionHighSinceAt = 0;
 static unsigned long motionLastDetectedAt = 0;
 static unsigned long motionLastActivityAt = 0;
@@ -639,7 +628,6 @@ struct MotionSettings {
   uint8_t imageDelayDs = 1;          // deciseconds: 1..20 (0.1s..2.0s)
   bool captureVideo = false;
   uint8_t videoDurationSec = 5;      // 1..30
-  bool standbyButtonEnabled = true;
   bool wakeOnMotion = false;
   bool autoStandby = false;
   uint16_t standbyAfterSec = 30;     // 5..120
@@ -707,7 +695,6 @@ static bool applyWifiClientConfig(const WifiCredential &wifi);
 static void servicePendingFirmwareRestart();
 static void servicePendingAdminRestart();
 static void serviceLogFileFlush();
-static void configureButtonWakeup();
 static void configureMotionWakeup(bool enabled);
 static void applyPirInputMode();
 static void clearRtcGpioDControl();
@@ -716,7 +703,6 @@ static void logSharedPinCaveats();
 static void updateSdLoggingState();
 static void IRAM_ATTR onPirEdgeInterrupt();
 static void handleWakeupIndicator();
-static void serviceButtonSleepRequest();
 static void serviceMotionDetection();
 static void serviceMotionActions();
 static void serviceMotionNotifyRetry();
@@ -738,7 +724,6 @@ static void handleMotionConfigSet();
 static void handleMotionStandby();
 static bool sendMotionNotifyRequest(const String &url);
 static void prepareDeviceForDeepSleep();
-[[noreturn]] static void enterDeepSleepFromButton();
 [[noreturn]] static void enterDeepSleepNow(const char *reason, int blinkCount, bool allowMotionWake);
 static bool isValidRuntimeTxPowerValue(int value);
 static wifi_power_t validatedTxPowerValue(int configuredValue, wifi_power_t fallback, const char *label);
@@ -2278,7 +2263,6 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
   appendU16(plain, cfg.motionSettings.standbyAfterSec);
   appendU16(plain, cfg.motionSettings.detectionIntervalSec);
   appendField(plain, cfg.motionSettings.notifyUrl);
-  appendU8(plain, cfg.motionSettings.standbyButtonEnabled ? 1 : 0);
 
   return encryptPayload(plain, ivHex, cipherHex);
 }
@@ -2435,10 +2419,11 @@ static bool decryptConfigV7(const String &ivHex, const String &cipherHex, Stored
       if (!readField(plain, offset, cfg.motionSettings.notifyUrl)) return false;
     }
 
+    // Backward compatibility: older payloads may include one trailing byte.
+    // Consume and ignore it.
     if (offset < plain.size()) {
-      uint8_t b = 1;
-      if (!readU8(plain, offset, b)) return false;
-      cfg.motionSettings.standbyButtonEnabled = (b != 0);
+      uint8_t legacyTrailingFlag = 1;
+      if (!readU8(plain, offset, legacyTrailingFlag)) return false;
     }
   }
 
@@ -3931,23 +3916,8 @@ static void initializeBootPins() {
   powerDownCameraHardware();
 }
 
-static void initializeButtonState() {
-  buttonLastRawPressed = (digitalRead(BUTTON_GPIO) == LOW);
-  buttonStablePressed = buttonLastRawPressed;
-  buttonLastChangeAt = millis();
-  // Require a release before arming if button is currently held LOW.
-  buttonSleepArmed = !buttonStablePressed;
-
-  // After wake from button (EXT0), keep sleep disarmed until release to
-  // avoid immediate sleep->wake loops when the line is still LOW.
-  if (bootWakeCause == ESP_SLEEP_WAKEUP_EXT0) {
-    buttonSleepArmed = false;
-  }
-  buttonSleepRequestPending = false;
-}
-
 static void logInputPinConfiguration() {
-  Logger.Log("[GPIO] Button: GPIO%d (to GND, active LOW), PIR DATA: GPIO%d\n", BUTTON_GPIO, PIR_GPIO);
+  Logger.Log("[GPIO] PIR DATA: GPIO%d\n", PIR_GPIO);
   Logger.LogLine("[GPIO] PIR power: VCC -> 3.3V (or compatible rail), GND -> GND");
 }
 
@@ -4064,10 +4034,6 @@ void setup() {
     Logger.LogLine("[SD] Boot check: SD card unavailable");
   }
 
-  // Configure and sample button only after SD probe has completed, because
-  // GPIO13 is electrically shared with SD DAT3 on ESP32-CAM.
-  initializeButtonState();
-
   loadStartupConfig();
   finalizeMotionStartupConfig();
   initializeRouteAccessToken();
@@ -4086,7 +4052,6 @@ void loop() {
   serviceMotionNotifyRetry();
   serviceCameraIdleTimeout();
   serviceMotionAutoStandby();
-  serviceButtonSleepRequest();
   servicePendingFirmwareRestart();
   servicePendingAdminRestart();
   serviceLogFileFlush();

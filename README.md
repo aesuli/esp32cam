@@ -5,10 +5,7 @@ Firmware for AI-Thinker ESP32-CAM (OV3660) with web streaming, camera controls, 
 ## Hardware and pins
 
 - SD runs in 1-bit SD_MMC mode.
-- Push button: connect between GPIO13 and GND (configured as INPUT_PULLUP, active LOW).
-- PIR sensor: DATA to GPIO12, VCC to 3.3V.
-- Button behavior: on press, firmware waits 1 second, blinks the status LED 3 fast times, then enters deep sleep.
-- Wake-up source: pressing the button wakes from deep sleep and blinks the status LED 2 fast times.
+- PIR sensor: DATA to GPIO13, VCC to 3.3V.
 
 ## Configuration storage
 
