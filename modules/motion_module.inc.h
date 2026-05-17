@@ -37,10 +37,10 @@ static void clearRtcGpioDControl() {
 }
 
 static void applyPirInputMode() {
-  // Keep PIR input high-impedance; internal pull resistors can mask weak module outputs,
-  // especially on shared SD data lines.
-  pinMode(PIR_GPIO, INPUT);
-  Logger.Log("[GPIO] PIR mode applied on GPIO%d: INPUT\n", PIR_GPIO);
+  // Bias the PIR line LOW when no sensor is attached so the input does not float HIGH.
+  // Typical PIR modules drive the line actively, so INPUT_PULLDOWN is safe here.
+  pinMode(PIR_GPIO, INPUT_PULLDOWN);
+  Logger.Log("[GPIO] PIR mode applied on GPIO%d: INPUT_PULLDOWN\n", PIR_GPIO);
 }
 
 static void restoreInputPinsAfterSDInit() {
@@ -216,9 +216,9 @@ static void configureMotionWakeup(bool enabled) {
   }
 
   rtc_gpio_pullup_dis((gpio_num_t)PIR_GPIO);
-  rtc_gpio_pulldown_dis((gpio_num_t)PIR_GPIO);
+  rtc_gpio_pulldown_en((gpio_num_t)PIR_GPIO);
   motionWakeupExt1Enabled = true;
-  Logger.Log("[SLEEP] Wakeup source configured: motion GPIO%d HIGH\n", PIR_GPIO);
+  Logger.Log("[SLEEP] Wakeup source configured: motion GPIO%d HIGH (RTC pulldown enabled)\n", PIR_GPIO);
 }
 
 static void handleWakeupIndicator() {

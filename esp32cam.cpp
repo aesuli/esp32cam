@@ -54,8 +54,8 @@
 // ─── Pin definitions ──────────────────────────────────────────────────────────
 // PIR wiring: VCC -> 3.3, DATA -> GPIO13, GND -> GND.
 // Note: GPIO12/GPIO13 remain electrically tied to SD DAT2/DAT3 while the card is mounted.
-static constexpr int PIR_GPIO    = 13;
-static constexpr int LED_GPIO    = 33;  // Internal red LED on ESP32-CAM
+static constexpr int PIR_GPIO    = GPIO_NUM_13;
+static constexpr int LED_GPIO    = GPIO_NUM_33;  // Internal red LED on ESP32-CAM
 static constexpr unsigned long SLEEP_BLINK_ON_MS = 70;
 static constexpr unsigned long SLEEP_BLINK_OFF_MS = 70;
 static constexpr bool APP_UART_CONSOLE_ENABLED = true;
