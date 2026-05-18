@@ -3871,6 +3871,26 @@ static void initializeWakeupIndicator() {
   ledBootSequence();
 }
 
+static void disableUnusedBluetooth() {
+  // This firmware does not use BT/BLE features; release controller resources.
+  esp_err_t disableErr = esp_bt_controller_disable();
+  if (disableErr != ESP_OK && disableErr != ESP_ERR_INVALID_STATE) {
+    Logger.Log("[BT] Controller disable failed: 0x%x\n", disableErr);
+  }
+
+  esp_err_t deinitErr = esp_bt_controller_deinit();
+  if (deinitErr != ESP_OK && deinitErr != ESP_ERR_INVALID_STATE) {
+    Logger.Log("[BT] Controller deinit failed: 0x%x\n", deinitErr);
+  }
+
+  esp_err_t releaseErr = esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
+  if (releaseErr == ESP_OK) {
+    Logger.LogLine("[BT] BT/BLE memory released");
+  } else if (releaseErr != ESP_ERR_INVALID_STATE) {
+    Logger.Log("[BT] BT/BLE memory release failed: 0x%x\n", releaseErr);
+  }
+}
+
 static void initializeBootPins() {
   pinMode(LED_FLASH_GPIO_NUM, OUTPUT);
   digitalWrite(LED_FLASH_GPIO_NUM, LOW);
@@ -3966,6 +3986,7 @@ static void startInitialNetworkServices() {
 void setup() {
   Logger.begin(115200);
   Logger.LogLine("[BOOT] *** ESP32-CAM starting ***");
+  disableUnusedBluetooth();
   WiFi.onEvent(onWifiEvent);
 
   initializeWakeupIndicator();
