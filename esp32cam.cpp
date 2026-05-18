@@ -90,6 +90,7 @@ static constexpr uint32_t CAMERA_XCLK_FREQS_HZ[] = {
 
 // ─── SD configuration storage ──────────────────────────────────────────────────
 #define CONFIG_FILE_PATH "/config.enc"
+#define CONFIG_FILE_MAGIC "ESP32CAMCFG9"
 #define CAPTURE_COUNTER_FILE_PATH "/capture_counter.txt"
 #define SD_SORT_FILE_PATH "/.sort"
 
@@ -1257,6 +1258,73 @@ static void serviceNtpSync() {
   syncClockWithNtp();
 }
 
+static bool isHostnameLabelChar(char c) {
+  return (c >= 'a' && c <= 'z')
+      || (c >= '0' && c <= '9')
+      || c == '-';
+}
+
+static String buildNetworkHostname(const String &deviceName) {
+  String trimmed = deviceName;
+  trimmed.trim();
+
+  String hostname;
+  hostname.reserve(trimmed.length());
+
+  bool lastWasHyphen = false;
+  for (unsigned int i = 0; i < trimmed.length(); ++i) {
+    char c = trimmed[i];
+    if (c >= 'A' && c <= 'Z') {
+      c = (char)(c - 'A' + 'a');
+    }
+
+    if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+      hostname += c;
+      lastWasHyphen = false;
+      continue;
+    }
+
+    if (!lastWasHyphen && hostname.length() > 0) {
+      hostname += '-';
+      lastWasHyphen = true;
+    }
+  }
+
+  while (hostname.length() > 0 && hostname[hostname.length() - 1] == '-') {
+    hostname.remove(hostname.length() - 1);
+  }
+
+  if (hostname.isEmpty()) {
+    hostname = "esp32-cam";
+  }
+
+  if (!hostname.isEmpty() && !isHostnameLabelChar(hostname[0])) {
+    hostname = "esp32-cam";
+  }
+
+  if (hostname.length() > 63) {
+    hostname.remove(63);
+    while (hostname.length() > 0 && hostname[hostname.length() - 1] == '-') {
+      hostname.remove(hostname.length() - 1);
+    }
+  }
+
+  if (hostname.isEmpty()) {
+    hostname = "esp32-cam";
+  }
+
+  return hostname;
+}
+
+static String buildFallbackApSsid() {
+  String ssid = cfgDeviceName;
+  ssid.trim();
+  if (ssid.isEmpty()) {
+    ssid = AP_FALLBACK_SSID;
+  }
+  return ssid;
+}
+
 static bool connectToSavedStaNetworks(bool showLedFeedback, bool initializeCameraHttpServices) {
   if (runtimeConfig.wifiList.empty()) {
     Logger.LogLine("[WIFI] No saved STA networks");
@@ -1281,11 +1349,14 @@ static bool connectToSavedStaNetworks(bool showLedFeedback, bool initializeCamer
     delay(150);
     WiFi.setSleep(false);
 
-    if (!cfgDeviceName.isEmpty()) {
-      if (!WiFi.setHostname(cfgDeviceName.c_str())) {
+    String staHostname = buildNetworkHostname(cfgDeviceName);
+    if (!staHostname.isEmpty()) {
+      if (!WiFi.setHostname(staHostname.c_str())) {
         Logger.LogLine("[WIFI] Failed to set STA hostname");
       } else {
-        Logger.Log("[WIFI] STA hostname set to: %s\n", cfgDeviceName.c_str());
+        Logger.Log("[WIFI] STA hostname set to: %s (device name: %s)\n",
+          staHostname.c_str(),
+          cfgDeviceName.c_str());
       }
     }
 
@@ -2234,7 +2305,7 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
   return encryptPayload(plain, ivHex, cipherHex);
 }
 
-static bool decryptConfigV7(const String &ivHex, const String &cipherHex, StoredConfig &cfg) {
+static bool decryptConfig(const String &ivHex, const String &cipherHex, StoredConfig &cfg) {
   std::vector<uint8_t> plain;
   if (!decryptPayload(ivHex, cipherHex, plain)) {
     return false;
@@ -2265,20 +2336,12 @@ static bool decryptConfigV7(const String &ivHex, const String &cipherHex, Stored
     cfg.wifiList.push_back(wifi);
   }
   if (!readField(plain, offset, cfg.adminPass)) {
-    cfg.adminPass = "";
-    cfg.deviceName = "ESP32-CAM";
-    cfg.hasCameraSettings = false;
     return false;
   }
-  if (!readField(plain, offset, cfg.deviceName)) {
-    cfg.deviceName = "ESP32-CAM";
-  }
+  if (!readField(plain, offset, cfg.deviceName)) return false;
 
   uint8_t hasCameraSettings = 0;
-  if (!readU8(plain, offset, hasCameraSettings)) {
-    cfg.hasCameraSettings = false;
-    return false;
-  }
+  if (!readU8(plain, offset, hasCameraSettings)) return false;
 
   cfg.hasCameraSettings = (hasCameraSettings != 0);
   if (cfg.hasCameraSettings && !readCameraSettings(plain, offset, cfg.cameraSettings)) {
@@ -2286,112 +2349,36 @@ static bool decryptConfigV7(const String &ivHex, const String &cipherHex, Stored
   }
 
   uint8_t ledAccessBlink = 0;
-  if (!readU8(plain, offset, ledAccessBlink)) {
-    cfg.ledAccessBlink = false;
-    return false;
-  }
+  if (!readU8(plain, offset, ledAccessBlink)) return false;
   cfg.ledAccessBlink = (ledAccessBlink != 0);
 
-  cfg.logFileEnabled = true;
-  if (offset < plain.size()) {
-    uint8_t logEnabledOrFileEnabled = 1;
-    if (!readU8(plain, offset, logEnabledOrFileEnabled)) {
-      return false;
-    }
-    cfg.logFileEnabled = (logEnabledOrFileEnabled != 0);
-
-    // Backward compatibility:
-    // - Legacy payload: [loggingEnabled][txPowerSta][txPowerAp]...
-    // - Previous payload: [logSerialEnabled][logFileEnabled][txPowerSta][txPowerAp]...
-    if (offset < plain.size() && (plain[offset] == 0 || plain[offset] == 1)) {
-      uint8_t maybeLogFileEnabled = 1;
-      if (!readU8(plain, offset, maybeLogFileEnabled)) {
-        return false;
-      }
-      cfg.logFileEnabled = (maybeLogFileEnabled != 0);
-    }
-  }
+  uint8_t logFileEnabled = 1;
+  if (!readU8(plain, offset, logFileEnabled)) return false;
+  cfg.logFileEnabled = (logFileEnabled != 0);
 
   uint8_t txPowerSta = (uint8_t)DEFAULT_TX_POWER_STA;
-  if (offset >= plain.size()) {
-    cfg.txPowerSta = (int8_t)DEFAULT_TX_POWER_STA;
-    cfg.txPowerAp = (int8_t)DEFAULT_TX_POWER_AP;
-    clampMotionSettings(cfg.motionSettings);
-    return true;
-  }
-  if (!readU8(plain, offset, txPowerSta)) {
-    return false;
-  }
+  if (!readU8(plain, offset, txPowerSta)) return false;
   cfg.txPowerSta = (int8_t)txPowerSta;
 
   uint8_t txPowerAp = (uint8_t)DEFAULT_TX_POWER_AP;
-  if (offset >= plain.size()) {
-    cfg.txPowerAp = (int8_t)DEFAULT_TX_POWER_AP;
-    clampMotionSettings(cfg.motionSettings);
-    return true;
-  }
-  if (!readU8(plain, offset, txPowerAp)) {
-    return false;
-  }
+  if (!readU8(plain, offset, txPowerAp)) return false;
   cfg.txPowerAp = (int8_t)txPowerAp;
 
-  if (offset < plain.size()) {
-    uint8_t b = 0;
-    if (!readU8(plain, offset, b)) return false;
-    cfg.motionSettings.enabled = (b != 0);
+  uint8_t motionEnabled = 0;
+  uint8_t motionCaptureImage = 0;
+  uint8_t motionCaptureVideo = 0;
+  if (!readU8(plain, offset, motionEnabled)) return false;
+  if (!readU8(plain, offset, motionCaptureImage)) return false;
+  if (!readU8(plain, offset, cfg.motionSettings.imageCount)) return false;
+  if (!readU8(plain, offset, cfg.motionSettings.imageDelayDs)) return false;
+  if (!readU8(plain, offset, motionCaptureVideo)) return false;
+  if (!readU8(plain, offset, cfg.motionSettings.videoDurationSec)) return false;
+  if (!readU16(plain, offset, cfg.motionSettings.detectionIntervalSec)) return false;
+  if (!readField(plain, offset, cfg.motionSettings.notifyUrl)) return false;
 
-    if (offset < plain.size()) {
-      if (!readU8(plain, offset, b)) return false;
-      cfg.motionSettings.captureImage = (b != 0);
-    }
-    if (offset < plain.size()) {
-      if (!readU8(plain, offset, cfg.motionSettings.imageCount)) return false;
-    }
-    if (offset < plain.size()) {
-      if (!readU8(plain, offset, cfg.motionSettings.imageDelayDs)) return false;
-    }
-    if (offset < plain.size()) {
-      if (!readU8(plain, offset, b)) return false;
-      cfg.motionSettings.captureVideo = (b != 0);
-    }
-    if (offset < plain.size()) {
-      if (!readU8(plain, offset, cfg.motionSettings.videoDurationSec)) return false;
-    }
-    if (offset < plain.size()) {
-      uint8_t legacyWakeOnMotion = 0;
-      if (!readU8(plain, offset, legacyWakeOnMotion)) return false;
-    }
-    if (offset < plain.size()) {
-      uint8_t legacyAutoStandby = 0;
-      if (!readU8(plain, offset, legacyAutoStandby)) return false;
-    }
-    if (offset + 2 <= plain.size()) {
-      uint16_t legacyStandbyAfterSec = 0;
-      if (!readU16(plain, offset, legacyStandbyAfterSec)) return false;
-    }
-    if (offset + 2 <= plain.size()) {
-      if (!readU16(plain, offset, cfg.motionSettings.detectionIntervalSec)) return false;
-    }
-    size_t remaining = plain.size() - offset;
-    if (remaining == 1) {
-      uint8_t legacySensitivity = 0;
-      if (!readU8(plain, offset, legacySensitivity)) return false;
-    } else if (remaining == 2) {
-      uint8_t legacySensitivity = 0;
-      if (!readU8(plain, offset, legacySensitivity)) return false;
-      uint8_t legacyPirInputMode = 0;
-      if (!readU8(plain, offset, legacyPirInputMode)) return false;
-    } else if (remaining >= 2) {
-      if (!readField(plain, offset, cfg.motionSettings.notifyUrl)) return false;
-    }
-
-    // Backward compatibility: older payloads may include one trailing byte.
-    // Consume and ignore it.
-    if (offset < plain.size()) {
-      uint8_t legacyTrailingFlag = 1;
-      if (!readU8(plain, offset, legacyTrailingFlag)) return false;
-    }
-  }
+  cfg.motionSettings.enabled = (motionEnabled != 0);
+  cfg.motionSettings.captureImage = (motionCaptureImage != 0);
+  cfg.motionSettings.captureVideo = (motionCaptureVideo != 0);
 
   clampMotionSettings(cfg.motionSettings);
   return offset == plain.size() && !cfg.adminPass.isEmpty();
@@ -2416,13 +2403,19 @@ static bool saveConfigToSD(const StoredConfig &cfg) {
       return false;
     }
 
+    // FILE_WRITE may append on some FS implementations; remove first to keep one canonical config record.
+    if (SD_MMC.exists(CONFIG_FILE_PATH) && !SD_MMC.remove(CONFIG_FILE_PATH)) {
+      Logger.LogLine("[CFG] Failed to replace existing config file");
+      return false;
+    }
+
     File file = SD_MMC.open(CONFIG_FILE_PATH, FILE_WRITE);
     if (!file) {
       Logger.LogLine("[CFG] Failed to open config file for write");
       return false;
     }
 
-    file.println("ESP32CAMCFG9");
+    file.println(CONFIG_FILE_MAGIC);
     file.println(ivHex);
     file.println(cipherHex);
     file.close();
@@ -2463,13 +2456,13 @@ static bool loadConfigFromSD(StoredConfig &cfg) {
   ivHex.trim();
   cipherHex.trim();
 
-  if (magic == "ESP32CAMCFG7" || magic == "ESP32CAMCFG8" || magic == "ESP32CAMCFG9") {
-    if (!decryptConfigV7(ivHex, cipherHex, cfg)) {
-      Logger.Log("[CFG] Failed to decrypt %s config\n", magic.c_str());
-      return false;
-    }
-  } else {
+  if (magic != CONFIG_FILE_MAGIC) {
     Logger.Log("[CFG] Unsupported config magic: %s\n", magic.c_str());
+    return false;
+  }
+
+  if (!decryptConfig(ivHex, cipherHex, cfg)) {
+    Logger.Log("[CFG] Failed to decrypt %s config\n", magic.c_str());
     return false;
   }
 
@@ -2631,9 +2624,15 @@ static bool loadRuntimeConfigWithRetries(StoredConfig &cfg) {
 
 
 
-static bool startSoftAPWithRetries(const char *ssid, const char *password) {
+static bool startSoftAPWithRetries(const char *ssid, const char *password, const char *hostname = nullptr) {
   for (int attempt = 1; attempt <= AP_START_RETRIES; ++attempt) {
     WiFi.mode(WIFI_AP);
+    if (hostname && hostname[0] != '\0') {
+      if (!WiFi.softAPsetHostname(hostname)) {
+        Logger.Log("[WIFI] Failed to set AP hostname on attempt %d\n", attempt);
+      }
+    }
+
     bool started = false;
     if (password && password[0] != '\0') {
       started = WiFi.softAP(ssid, password, AP_CHANNEL, AP_HIDDEN, AP_MAX_CONNECTIONS);
@@ -3725,19 +3724,17 @@ static void startOtaRecoveryAPMode() {
 static void startCameraAPMode() {
   otaRecoveryModeActive = false;
   wifiModemSleepEnabled = false;
-  if (!cfgDeviceName.isEmpty()) {
-    if (!WiFi.softAPsetHostname(cfgDeviceName.c_str())) {
-      Logger.LogLine("[WIFI] Failed to set AP hostname");
-    } else {
-      Logger.Log("[WIFI] AP hostname set to: %s\n", cfgDeviceName.c_str());
-    }
-  }
-
-  bool ok = startSoftAPWithRetries(AP_FALLBACK_SSID, cfgAccessPass.c_str());
+  String apHostname = buildNetworkHostname(cfgDeviceName);
+  String apSsid = buildFallbackApSsid();
+  bool ok = startSoftAPWithRetries(apSsid.c_str(), cfgAccessPass.c_str(), apHostname.c_str());
   if (!ok) {
     Logger.LogLine("[WIFI] Fallback AP start failed (check password length >= 8)");
     return;
   }
+
+  Logger.Log("[WIFI] AP hostname set to: %s (device name: %s)\n",
+    apHostname.c_str(),
+    cfgDeviceName.c_str());
 
   // Reduce TX power — client is always nearby in fallback mode
   wifi_power_t apTxPower = validatedTxPowerValue((int)runtimeConfig.txPowerAp, DEFAULT_TX_POWER_AP, "AP");
@@ -3774,7 +3771,7 @@ static void startCameraAPMode() {
   ledFallbackAPSequence();
 
   Logger.Log("[WIFI] Fallback AP started — SSID: %s  IP: %s\n",
-    AP_FALLBACK_SSID, WiFi.softAPIP().toString().c_str());
+    apSsid.c_str(), WiFi.softAPIP().toString().c_str());
 
   registerCameraRoutes();
   server.begin();
