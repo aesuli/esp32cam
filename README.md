@@ -5,7 +5,7 @@ Firmware for AI-Thinker ESP32-CAM (OV3660) with web streaming, camera controls, 
 ## Hardware and pins
 
 - SD runs in 1-bit SD_MMC mode.
-- PIR sensor: DATA to GPIO13, VCC to 3.3V.
+- PIR sensor: DATA to RX (GPIO3), VCC to 3.3V.
 
 ## Configuration storage
 
@@ -55,13 +55,10 @@ The web interface is composed of four main pages:
 
 ### Motion page
 - Enable or disable motion detection
-- Optional wake on motion (when supported by the selected pin)
 - Optional capture of images on motion (count + interval)
 - Optional video recording on motion (duration)
 - Detection interval (cooldown) between motion events while the device is awake
 - Optional Notify URL (HTTP GET sent when motion is detected)
-- Optional auto-standby after inactivity; the first motion wake from stand-by triggers immediately and starts a new cooldown only after that wake event finishes
-- Manual standby button
 - Live motion graph page with current PIR readings
 
 ### SD Browser page
@@ -79,7 +76,7 @@ The web interface is composed of four main pages:
 - Change device name
 - Set or sync device time
 - Enable or disable LED URL-access blink
-- Enable or disable serial logging and `/log.txt` SD logging independently
+- Enable or disable `/log.txt` SD logging
 - Set WiFi TX power for STA and fallback AP
 - Upload firmware binary for OTA update
 - Restart device

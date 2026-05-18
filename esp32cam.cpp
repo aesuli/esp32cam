@@ -4,7 +4,7 @@
  * Hardware:
  *   - AI-Thinker ESP32-CAM with OV3660 camera sensor
  *   - microSD in 1-bit mode so SDMMC does not actively drive GPIO12/GPIO13
- *   - GPIO13 reserved for PIR input (shared with SD DAT3 pull network)
+ *   - PIR input wired to RX (GPIO3)
  *
  * First Boot (unconfigured or missing config file):
  *   Broadcasts protected WiFi AP "ESP32-CAM-Setup"
@@ -34,10 +34,8 @@
 #include <esp_bt.h>
 #include <esp_err.h>
 #include <esp_heap_caps.h>
-#include <esp_sleep.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
-#include <driver/rtc_io.h>
 #include <mbedtls/aes.h>
 #include <time.h>
 #include <sys/time.h>
@@ -52,13 +50,10 @@
 #endif
 
 // ─── Pin definitions ──────────────────────────────────────────────────────────
-// PIR wiring: VCC -> 3.3, DATA -> GPIO13, GND -> GND.
-// Note: GPIO12/GPIO13 remain electrically tied to SD DAT2/DAT3 while the card is mounted.
-static constexpr int PIR_GPIO    = GPIO_NUM_13;
+// PIR wiring: VCC -> 3.3, DATA -> RX (GPIO3), GND -> GND.
+// Note: RX (GPIO3) is now used for PIR input.
+static constexpr int PIR_GPIO    = GPIO_NUM_3;
 static constexpr int LED_GPIO    = GPIO_NUM_33;  // Internal red LED on ESP32-CAM
-static constexpr unsigned long SLEEP_BLINK_ON_MS = 70;
-static constexpr unsigned long SLEEP_BLINK_OFF_MS = 70;
-static constexpr bool APP_UART_CONSOLE_ENABLED = true;
 
 // ─── AP setup credentials ─────────────────────────────────────────────────────
 #define AP_SETUP_SSID   "ESP32-CAM-Setup"
@@ -164,7 +159,6 @@ static bool   staConnectedAtBoot = false;
 static bool   sdCardAvailableAtBoot = false;
 static bool   motionRawHigh = false;
 static bool   motionLatched = false;
-static bool   motionBootEventPending = false;
 static volatile bool motionEdgePending = false;
 static volatile uint32_t motionEdgeCount = 0;
 static uint8_t motionPendingImages = 0;
@@ -183,7 +177,6 @@ static unsigned long motionLastActivityAt = 0;
 static unsigned long motionNextImageAt = 0;
 static unsigned long motionRecordingStopAt = 0;
 static unsigned long motionIgnoreUntilAt = 0;
-static esp_sleep_wakeup_cause_t bootWakeCause = ESP_SLEEP_WAKEUP_UNDEFINED;
 static constexpr unsigned long LED_ACCESS_BLINK_INTERVAL_MS = 100;  // Minimum interval between access blinks
 static constexpr unsigned long STA_RECONNECT_INTERVAL_MS = 30000;
 static constexpr unsigned long STA_CONNECT_TIMEOUT_MS = 20000;
@@ -243,7 +236,6 @@ static bool gLogWriteInProgress = false;
 static bool gLogSdReady = false;
 static bool gLogSdFailureReported = false;
 static bool gLogFileFailureReported = false;
-static bool gLogSerialEnabled = true;
 static bool gLogFileEnabled = true;
 static bool gSdCardMounted = false;
 static volatile bool gSdOperationInProgress = false;
@@ -470,12 +462,7 @@ static void serviceLogFileFlush() {
 class AppLogger {
  public:
   void begin(unsigned long baud) {
-    if (APP_UART_CONSOLE_ENABLED) {
-      ::Serial.begin(baud);
-    } else {
-      (void)baud;
-      ::Serial.end();
-    }
+    (void)baud;
   }
 
   int Log(const char *format, ...) {
@@ -529,15 +516,10 @@ class AppLogger {
 
  private:
   size_t write(const uint8_t *buffer, size_t size) {
-    if (!buffer || size == 0 || (!gLogSerialEnabled && !gLogFileEnabled)) {
+    if (!buffer || size == 0 || !gLogFileEnabled) {
       return size;
     }
-    if (gLogFileEnabled) {
-      enqueueLogFileChunk(buffer, size);
-    }
-    if (gLogSerialEnabled && APP_UART_CONSOLE_ENABLED) {
-      return ::Serial.write(buffer, size);
-    }
+    enqueueLogFileChunk(buffer, size);
     return size;
   }
 
@@ -628,9 +610,6 @@ struct MotionSettings {
   uint8_t imageDelayDs = 1;          // deciseconds: 1..20 (0.1s..2.0s)
   bool captureVideo = false;
   uint8_t videoDurationSec = 5;      // 1..30
-  bool wakeOnMotion = false;
-  bool autoStandby = false;
-  uint16_t standbyAfterSec = 30;     // 5..120
   uint16_t detectionIntervalSec = 0; // 0,5,10,30,60,600
   String notifyUrl;
 };
@@ -643,7 +622,6 @@ struct StoredConfig {
   CameraSettings cameraSettings;
   MotionSettings motionSettings;
   bool ledAccessBlink = false;  // LED blink on URL access
-  bool logSerialEnabled = true;
   bool logFileEnabled = true;
   int8_t txPowerSta = (int8_t)DEFAULT_TX_POWER_STA;  // wifi_power_t cast to int8
   int8_t txPowerAp  = (int8_t)DEFAULT_TX_POWER_AP;
@@ -695,18 +673,14 @@ static bool applyWifiClientConfig(const WifiCredential &wifi);
 static void servicePendingFirmwareRestart();
 static void servicePendingAdminRestart();
 static void serviceLogFileFlush();
-static void configureMotionWakeup(bool enabled);
 static void applyPirInputMode();
-static void clearRtcGpioDControl();
 static void restoreInputPinsAfterSDInit();
 static void logSharedPinCaveats();
 static void updateSdLoggingState();
 static void IRAM_ATTR onPirEdgeInterrupt();
-static void handleWakeupIndicator();
 static void serviceMotionDetection();
 static void serviceMotionActions();
 static void serviceMotionNotifyRetry();
-static void serviceMotionAutoStandby();
 static void serviceDeferredNetworkStartup();
 static void triggerMotionEvent(const char *source);
 static void noteAuthenticatedWebActivity();
@@ -721,10 +695,7 @@ static void clampMotionSettings(MotionSettings &settings);
 static void handleMotionPage();
 static void handleMotionConfigGet();
 static void handleMotionConfigSet();
-static void handleMotionStandby();
 static bool sendMotionNotifyRequest(const String &url);
-static void prepareDeviceForDeepSleep();
-[[noreturn]] static void enterDeepSleepNow(const char *reason, int blinkCount, bool allowMotionWake);
 static bool isValidRuntimeTxPowerValue(int value);
 static wifi_power_t validatedTxPowerValue(int configuredValue, wifi_power_t fallback, const char *label);
 static void setWifiModemSleep(bool enabled, const char *reason = nullptr);
@@ -2247,7 +2218,6 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
     appendCameraSettings(plain, cfg.cameraSettings);
   }
   appendU8(plain, cfg.ledAccessBlink ? 1 : 0);
-  appendU8(plain, cfg.logSerialEnabled ? 1 : 0);
   appendU8(plain, cfg.logFileEnabled ? 1 : 0);
   appendU8(plain, (uint8_t)cfg.txPowerSta);
   appendU8(plain, (uint8_t)cfg.txPowerAp);
@@ -2258,9 +2228,6 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
   appendU8(plain, cfg.motionSettings.imageDelayDs);
   appendU8(plain, cfg.motionSettings.captureVideo ? 1 : 0);
   appendU8(plain, cfg.motionSettings.videoDurationSec);
-  appendU8(plain, cfg.motionSettings.wakeOnMotion ? 1 : 0);
-  appendU8(plain, cfg.motionSettings.autoStandby ? 1 : 0);
-  appendU16(plain, cfg.motionSettings.standbyAfterSec);
   appendU16(plain, cfg.motionSettings.detectionIntervalSec);
   appendField(plain, cfg.motionSettings.notifyUrl);
 
@@ -2325,25 +2292,23 @@ static bool decryptConfigV7(const String &ivHex, const String &cipherHex, Stored
   }
   cfg.ledAccessBlink = (ledAccessBlink != 0);
 
-  cfg.logSerialEnabled = true;
   cfg.logFileEnabled = true;
   if (offset < plain.size()) {
-    uint8_t logSerialEnabled = 1;
-    if (!readU8(plain, offset, logSerialEnabled)) {
+    uint8_t logEnabledOrFileEnabled = 1;
+    if (!readU8(plain, offset, logEnabledOrFileEnabled)) {
       return false;
     }
-    cfg.logSerialEnabled = (logSerialEnabled != 0);
-    cfg.logFileEnabled = cfg.logSerialEnabled;
+    cfg.logFileEnabled = (logEnabledOrFileEnabled != 0);
 
     // Backward compatibility:
     // - Legacy payload: [loggingEnabled][txPowerSta][txPowerAp]...
-    // - Current payload: [logSerialEnabled][logFileEnabled][txPowerSta][txPowerAp]...
+    // - Previous payload: [logSerialEnabled][logFileEnabled][txPowerSta][txPowerAp]...
     if (offset < plain.size() && (plain[offset] == 0 || plain[offset] == 1)) {
-      uint8_t logFileEnabled = 1;
-      if (!readU8(plain, offset, logFileEnabled)) {
+      uint8_t maybeLogFileEnabled = 1;
+      if (!readU8(plain, offset, maybeLogFileEnabled)) {
         return false;
       }
-      cfg.logFileEnabled = (logFileEnabled != 0);
+      cfg.logFileEnabled = (maybeLogFileEnabled != 0);
     }
   }
 
@@ -2393,15 +2358,16 @@ static bool decryptConfigV7(const String &ivHex, const String &cipherHex, Stored
       if (!readU8(plain, offset, cfg.motionSettings.videoDurationSec)) return false;
     }
     if (offset < plain.size()) {
-      if (!readU8(plain, offset, b)) return false;
-      cfg.motionSettings.wakeOnMotion = (b != 0);
+      uint8_t legacyWakeOnMotion = 0;
+      if (!readU8(plain, offset, legacyWakeOnMotion)) return false;
     }
     if (offset < plain.size()) {
-      if (!readU8(plain, offset, b)) return false;
-      cfg.motionSettings.autoStandby = (b != 0);
+      uint8_t legacyAutoStandby = 0;
+      if (!readU8(plain, offset, legacyAutoStandby)) return false;
     }
     if (offset + 2 <= plain.size()) {
-      if (!readU16(plain, offset, cfg.motionSettings.standbyAfterSec)) return false;
+      uint16_t legacyStandbyAfterSec = 0;
+      if (!readU16(plain, offset, legacyStandbyAfterSec)) return false;
     }
     if (offset + 2 <= plain.size()) {
       if (!readU16(plain, offset, cfg.motionSettings.detectionIntervalSec)) return false;
@@ -2760,7 +2726,7 @@ static bool hasSharedAccessToken(WebServer &srv) {
 }
 
 static void noteAuthenticatedWebActivity() {
-  if (!runtimeConfig.motionSettings.enabled || !runtimeConfig.motionSettings.autoStandby) {
+  if (!runtimeConfig.motionSettings.enabled) {
     return;
   }
 
@@ -3904,13 +3870,11 @@ static bool initializeRuntimeMutexes() {
 }
 
 static void initializeWakeupIndicator() {
-  bootWakeCause = esp_sleep_get_wakeup_cause();
   initLED();
-  handleWakeupIndicator();
+  ledBootSequence();
 }
 
 static void initializeBootPins() {
-  clearRtcGpioDControl();
   pinMode(LED_FLASH_GPIO_NUM, OUTPUT);
   digitalWrite(LED_FLASH_GPIO_NUM, LOW);
   powerDownCameraHardware();
@@ -3931,7 +3895,6 @@ static void resetMotionRuntimeState() {
   motionNotifyPending = false;
   motionNotifyLastAttemptAt = 0;
   motionIgnoreUntilAt = 0;
-  motionBootEventPending = false;
   deferredNetworkStartupPending = false;
 }
 
@@ -3940,7 +3903,6 @@ static void applyLoadedStartupConfig(const StoredConfig &cfg) {
   cfgAccessPass = cfg.adminPass;
   cfgDeviceName = cfg.deviceName;
   ledAccessBlinkEnabled = cfg.ledAccessBlink;
-  gLogSerialEnabled = cfg.logSerialEnabled;
   gLogFileEnabled = cfg.logFileEnabled;
   if (cfgDeviceName.isEmpty()) {
     cfgDeviceName = "ESP32-CAM";
@@ -3952,7 +3914,6 @@ static void applyDefaultStartupConfig() {
   runtimeConfig = StoredConfig();
   cfgDeviceName = "ESP32-CAM";
   ledAccessBlinkEnabled = false;
-  gLogSerialEnabled = true;
   gLogFileEnabled = true;
   isConfigured = false;
 }
@@ -3979,13 +3940,7 @@ static void finalizeMotionStartupConfig() {
   resetMotionDetectionState();
   applyPirInputMode();
   attachInterrupt(digitalPinToInterrupt(PIR_GPIO), onPirEdgeInterrupt, CHANGE);
-  configureMotionWakeup(runtimeConfig.motionSettings.wakeOnMotion);
   updateSdLoggingState();
-
-  if (bootWakeCause == ESP_SLEEP_WAKEUP_EXT1) {
-    uint64_t mask = esp_sleep_get_ext1_wakeup_status();
-    motionBootEventPending = ((mask & (1ULL << PIR_GPIO)) != 0ULL);
-  }
 }
 
 static void initializeRouteAccessToken() {
@@ -4003,11 +3958,7 @@ static void startInitialNetworkServices() {
     return;
   }
 
-  bool motionWakeBoot = motionBootEventPending && bootWakeCause == ESP_SLEEP_WAKEUP_EXT1;
-  if (motionWakeBoot) {
-    deferredNetworkStartupPending = true;
-    Logger.LogLine("[BOOT] Deferring network startup until motion capture completes");
-  } else if (isConfigured) {
+  if (isConfigured) {
     startSTAMode();
   } else {
     startSetupAPMode();
@@ -4051,7 +4002,6 @@ void loop() {
   serviceDeferredNetworkStartup();
   serviceMotionNotifyRetry();
   serviceCameraIdleTimeout();
-  serviceMotionAutoStandby();
   servicePendingFirmwareRestart();
   servicePendingAdminRestart();
   serviceLogFileFlush();

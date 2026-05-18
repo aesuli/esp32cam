@@ -90,7 +90,7 @@ static void handleFirmwareUploadWorker() {
   }
 
   if (firmwareUploadFailed) {
-    transferServer.send(HTTP_INTERNAL_ERROR, "text/plain", "Firmware update failed. Check serial log for details.");
+    transferServer.send(HTTP_INTERNAL_ERROR, "text/plain", "Firmware update failed. Check /log.txt for details.");
     firmwareUploadFailed = false;
     return;
   }

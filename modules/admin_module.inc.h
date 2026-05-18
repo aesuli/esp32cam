@@ -164,9 +164,8 @@ static void handleAdminLoggingGet() {
   if (!checkAuth()) return;
 
   String json = "{";
-  json += "\"loggingSerialEnabled\":" + String(gLogSerialEnabled ? "true" : "false") + ",";
   json += "\"loggingFileEnabled\":" + String(gLogFileEnabled ? "true" : "false") + ",";
-  json += "\"loggingEnabled\":" + String((gLogSerialEnabled || gLogFileEnabled) ? "true" : "false");
+  json += "\"loggingEnabled\":" + String(gLogFileEnabled ? "true" : "false");
   json += "}";
   server.send(HTTP_OK, "application/json", json);
 }
@@ -174,33 +173,21 @@ static void handleAdminLoggingGet() {
 static void handleAdminLoggingSet() {
   if (!checkAuth()) return;
 
-  bool hasSerial = server.hasArg("loggingSerialEnabled");
   bool hasFile = server.hasArg("loggingFileEnabled");
-  if (!hasSerial && !hasFile && !server.hasArg("loggingEnabled")) {
-    server.send(HTTP_BAD_REQUEST, "text/plain", "Missing loggingSerialEnabled/loggingFileEnabled parameter");
+  bool hasLegacy = server.hasArg("loggingEnabled");
+  if (!hasFile && !hasLegacy) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Missing loggingFileEnabled parameter");
     return;
   }
 
-  bool serialEnabled = runtimeConfig.logSerialEnabled;
   bool fileEnabled = runtimeConfig.logFileEnabled;
-
-  if (server.hasArg("loggingEnabled")) {
-    bool legacyValue = (server.arg("loggingEnabled") == "1" || server.arg("loggingEnabled") == "true");
-    serialEnabled = legacyValue;
-    fileEnabled = legacyValue;
+  if (hasLegacy) {
+    fileEnabled = (server.arg("loggingEnabled") == "1" || server.arg("loggingEnabled") == "true");
   }
-
-  if (hasSerial) {
-    String raw = server.arg("loggingSerialEnabled");
-    serialEnabled = (raw == "1" || raw == "true");
-  }
-
   if (hasFile) {
-    String raw = server.arg("loggingFileEnabled");
-    fileEnabled = (raw == "1" || raw == "true");
+    fileEnabled = (server.arg("loggingFileEnabled") == "1" || server.arg("loggingFileEnabled") == "true");
   }
 
-  runtimeConfig.logSerialEnabled = serialEnabled;
   runtimeConfig.logFileEnabled = fileEnabled;
   updateSdLoggingState();
 

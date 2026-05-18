@@ -39,14 +39,6 @@ __APP_NAV__
     <h3>Settings</h3>
     <div class="cg"><a href="/motion/graph" style="color:#7dd3fc;text-decoration:none">Open Motion Graph</a></div>
     <div class="cg"><label><input id="enabled" type="checkbox"> Enable motion detection</label></div>
-    <div class="cg"><label><input id="wake_on_motion" type="checkbox"> Wake up on motion</label></div>
-    <div class="cg"><label><input id="auto_standby" type="checkbox"> Automatic stand-by</label></div>
-    <div class="small">When the device enters stand-by, the next motion wake is handled immediately.</div>
-
-    <div class="cg row">
-      <label for="standby_after_sec">No activity before stand-by (seconds)</label>
-      <input id="standby_after_sec" type="number" min="5" max="120" step="1">
-    </div>
 
     <div class="cg"><label><input id="capture_image" type="checkbox"> Capture image(s) on motion</label></div>
     <div class="cg row">
@@ -75,7 +67,7 @@ __APP_NAV__
         <option value="600">+10 minutes</option>
       </select>
     </div>
-    <div class="small">This cooldown applies only while the device is awake. A motion wake from stand-by ignores the cooldown once, then the cooldown resumes after that event completes.</div>
+    <div class="small">This cooldown applies while the device is running.</div>
 
     <div class="cg row">
       <label for="notify_url">Notify URL (GET on motion detect)</label>
@@ -83,9 +75,6 @@ __APP_NAV__
     </div>
 
     <div class="small">Changes are saved automatically when you modify a setting.</div>
-    <div style="margin-top:10px">
-      <button class="btn" id="standby_btn" type="button">Go To Standby</button>
-    </div>
     <div class="status" id="status"></div>
   </div>
 </div>
@@ -102,9 +91,6 @@ var saveInFlight=false;
 function buildPayload(){
   return {
     enabled:id('enabled').checked?1:0,
-    wakeOnMotion:id('wake_on_motion').checked?1:0,
-    autoStandby:id('auto_standby').checked?1:0,
-    standbyAfterSec:asInt(id('standby_after_sec').value,30),
     captureImage:id('capture_image').checked?1:0,
     imageCount:asInt(id('image_count').value,1),
     imageDelayDs:Math.round((parseFloat(id('image_delay_ds').value)||0.1)*10),
@@ -152,26 +138,12 @@ function bindAutoSave(controlId){
   el.addEventListener('change',scheduleSave);
 }
 
-function wakeSourcesForDialog(){
-  var events=[];
-  if(id('wake_on_motion').checked){
-    events.push('Motion (PIR sensor)');
-  }
-  if(events.length===0){
-    events.push('None (manual reset/power cycle required)');
-  }
-  return events;
-}
-
 function loadConfig(){
   fetch('/motion/config').then(function(r){
     if(!r.ok){throw new Error('Failed to load motion config');}
     return r.json();
   }).then(function(c){
     id('enabled').checked=!!c.enabled;
-    id('wake_on_motion').checked=!!c.wakeOnMotion;
-    id('auto_standby').checked=!!c.autoStandby;
-    id('standby_after_sec').value=c.standbyAfterSec;
     id('capture_image').checked=!!c.captureImage;
     id('image_count').value=c.imageCount;
     id('image_delay_ds').value=((c.imageDelayDs||1)/10).toFixed(1);
@@ -181,24 +153,8 @@ function loadConfig(){
     id('notify_url').value=c.notifyUrl||'';
   }).catch(function(e){setStatus(e.message,true);});
 }
-id('standby_btn').addEventListener('click',function(){
-  var events=wakeSourcesForDialog();
-  var msg='Put device in standby now?\\n\\nActive wake-up events:\\n- '+events.join('\\n- ');
-  if(!confirm(msg)){return;}
-  setStatus('Entering standby...',false);
-  fetch('/motion/standby',{method:'POST'})
-    .then(function(r){
-      return r.text().then(function(t){
-        setStatus(t||'Standby requested',!r.ok);
-      });
-    })
-    .catch(function(e){setStatus(e.message||'Failed to enter standby',true);});
-});
 
 bindAutoSave('enabled');
-bindAutoSave('wake_on_motion');
-bindAutoSave('auto_standby');
-bindAutoSave('standby_after_sec');
 bindAutoSave('capture_image');
 bindAutoSave('image_count');
 bindAutoSave('image_delay_ds');

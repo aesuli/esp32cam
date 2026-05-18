@@ -1,9 +1,7 @@
 ﻿#pragma once
 
-// Motion, PIR, wake/sleep, and motion-route handlers.
+// Motion, PIR, and motion-route handlers.
 // Included directly by esp32cam.cpp so it can share existing static firmware state.
-
-static bool motionWakeupExt1Enabled = false;  // Track if EXT1 wakeup is currently enabled
 
 static bool isValidMotionIntervalSec(uint16_t seconds) {
   return seconds == 0 || seconds == 5 || seconds == 10 || seconds == 30 || seconds == 60 || seconds == 600;
@@ -16,8 +14,6 @@ static void clampMotionSettings(MotionSettings &settings) {
   if (settings.imageDelayDs > 20) settings.imageDelayDs = 20;
   if (settings.videoDurationSec < 1) settings.videoDurationSec = 1;
   if (settings.videoDurationSec > 30) settings.videoDurationSec = 30;
-  if (settings.standbyAfterSec < 5) settings.standbyAfterSec = 5;
-  if (settings.standbyAfterSec > 120) settings.standbyAfterSec = 120;
   if (!isValidMotionIntervalSec(settings.detectionIntervalSec)) {
     settings.detectionIntervalSec = 0;
   }
@@ -29,18 +25,9 @@ static void clampMotionSettings(MotionSettings &settings) {
   }
 }
 
-static void clearRtcGpioDControl() {
-  // After deep sleep with RTC GPIO config (rtc_gpio_pullup_en, etc), those settings
-  // persist and can block SD_MMC from using the shared PIR pin. Clear RTC claims.
-  rtc_gpio_deinit((gpio_num_t)PIR_GPIO);
-  Logger.Log("[GPIO] Cleared RTC control from GPIO%d after wake-up\n", PIR_GPIO);
-}
-
 static void applyPirInputMode() {
-  // Bias the PIR line LOW when no sensor is attached so the input does not float HIGH.
-  // Typical PIR modules drive the line actively, so INPUT_PULLDOWN is safe here.
-  pinMode(PIR_GPIO, INPUT_PULLDOWN);
-  Logger.Log("[GPIO] PIR mode applied on GPIO%d: INPUT_PULLDOWN\n", PIR_GPIO);
+  pinMode(PIR_GPIO, INPUT);
+  Logger.Log("[GPIO] PIR mode applied on GPIO%d: INPUT\n", PIR_GPIO);
 }
 
 static void restoreInputPinsAfterSDInit() {
@@ -51,7 +38,6 @@ static void restoreInputPinsAfterSDInit() {
 static void resetMotionDetectionState() {
   motionRawHigh = false;
   motionLatched = false;
-  motionBootEventPending = false;
   motionEdgePending = false;
   motionHighSinceAt = 0;
   motionLastDetectedAt = 0;
@@ -65,7 +51,6 @@ static void resetMotionDetectionState() {
 }
 
 static void updateSdLoggingState() {
-  gLogSerialEnabled = runtimeConfig.logSerialEnabled;
   gLogFileEnabled = runtimeConfig.logFileEnabled;
 }
 
@@ -136,9 +121,6 @@ static void handleMotionConfigGet() {
   json += "\"imageDelayDs\":" + String((int)m.imageDelayDs) + ",";
   json += "\"captureVideo\":" + String(m.captureVideo ? "true" : "false") + ",";
   json += "\"videoDurationSec\":" + String((int)m.videoDurationSec) + ",";
-  json += "\"wakeOnMotion\":" + String(m.wakeOnMotion ? "true" : "false") + ",";
-  json += "\"autoStandby\":" + String(m.autoStandby ? "true" : "false") + ",";
-  json += "\"standbyAfterSec\":" + String((int)m.standbyAfterSec) + ",";
   json += "\"detectionIntervalSec\":" + String((int)m.detectionIntervalSec) + ",";
   json += "\"notifyUrl\":\"" + notifyUrlEscaped + "\"";
   json += "}";
@@ -155,9 +137,6 @@ static void handleMotionConfigSet() {
   if (server.hasArg("imageDelayDs")) updated.imageDelayDs = (uint8_t)server.arg("imageDelayDs").toInt();
   if (server.hasArg("captureVideo")) updated.captureVideo = server.arg("captureVideo") == "1" || server.arg("captureVideo") == "true";
   if (server.hasArg("videoDurationSec")) updated.videoDurationSec = (uint8_t)server.arg("videoDurationSec").toInt();
-  if (server.hasArg("wakeOnMotion")) updated.wakeOnMotion = server.arg("wakeOnMotion") == "1" || server.arg("wakeOnMotion") == "true";
-  if (server.hasArg("autoStandby")) updated.autoStandby = server.arg("autoStandby") == "1" || server.arg("autoStandby") == "true";
-  if (server.hasArg("standbyAfterSec")) updated.standbyAfterSec = (uint16_t)server.arg("standbyAfterSec").toInt();
   if (server.hasArg("detectionIntervalSec")) updated.detectionIntervalSec = (uint16_t)server.arg("detectionIntervalSec").toInt();
   if (server.hasArg("notifyUrl")) updated.notifyUrl = server.arg("notifyUrl");
 
@@ -170,18 +149,9 @@ static void handleMotionConfigSet() {
   }
 
   resetMotionDetectionState();
-  configureMotionWakeup(runtimeConfig.motionSettings.wakeOnMotion);
   applyPirInputMode();
   attachInterrupt(digitalPinToInterrupt(PIR_GPIO), onPirEdgeInterrupt, CHANGE);
   server.send(HTTP_OK, "text/plain", "Motion configuration saved");
-}
-
-static void handleMotionStandby() {
-  if (!checkAuth()) return;
-
-  server.send(HTTP_OK, "text/plain", "Standby requested. Going to deep sleep now...");
-  delay(120);
-  enterDeepSleepNow("Standby requested from motion page", 0, true);
 }
 
 static void registerMotionRoutes() {
@@ -189,113 +159,10 @@ static void registerMotionRoutes() {
   server.on("/motion/graph", HTTP_GET, handleMotionGraphPage);
   server.on("/motion/config", HTTP_GET, handleMotionConfigGet);
   server.on("/motion/config", HTTP_POST, handleMotionConfigSet);
-  server.on("/motion/standby", HTTP_POST, handleMotionStandby);
   server.on("/motion/readings", HTTP_GET, handleMotionReadings);
 }
 
-// ─── Motion runtime and sleep handling ───────────────────────────────────────
-
-static void configureMotionWakeup(bool enabled) {
-  // Only attempt to disable EXT1 if it was previously enabled to avoid errors
-  // during initial configuration when the wakeup source hasn't been set up yet.
-  if (motionWakeupExt1Enabled) {
-    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
-  }
-  motionWakeupExt1Enabled = false;
-  
-  if (!enabled) {
-    Logger.LogLine("[SLEEP] Motion wakeup disabled");
-    return;
-  }
-
-  uint64_t mask = (1ULL << PIR_GPIO);
-  esp_err_t err = esp_sleep_enable_ext1_wakeup(mask, ESP_EXT1_WAKEUP_ANY_HIGH);
-  if (err != ESP_OK) {
-    Logger.Log("[SLEEP] Failed to enable EXT1 wakeup on GPIO%d (err=0x%x)\n", PIR_GPIO, err);
-    return;
-  }
-
-  rtc_gpio_pullup_dis((gpio_num_t)PIR_GPIO);
-  rtc_gpio_pulldown_en((gpio_num_t)PIR_GPIO);
-  motionWakeupExt1Enabled = true;
-  Logger.Log("[SLEEP] Wakeup source configured: motion GPIO%d HIGH (RTC pulldown enabled)\n", PIR_GPIO);
-}
-
-static void handleWakeupIndicator() {
-  if (bootWakeCause == ESP_SLEEP_WAKEUP_EXT1) {
-    uint64_t mask = esp_sleep_get_ext1_wakeup_status();
-    if ((mask & (1ULL << PIR_GPIO)) != 0ULL) {
-      Logger.Log("[BOOT] Wakeup from deep sleep via motion GPIO%d\n", PIR_GPIO);
-      motionBootEventPending = true;
-      ledQuickBlink();
-      return;
-    }
-  }
-
-  ledBootSequence();
-}
-
-static void prepareDeviceForDeepSleep() {
-  streamClientAbortRequested = true;
-
-  SemaphoreLock recordingLock(recordingMutex, pdMS_TO_TICKS(RECORDING_LONG_LOCK_TIMEOUT_MS));
-  if (recordingLock.locked()) {
-    if (recordingActive) {
-      Logger.LogLine("[SLEEP] Stopping active recording before deep sleep");
-      ScopedSdLock sdLock(pdMS_TO_TICKS(SD_LONG_LOCK_TIMEOUT_MS));
-      if (sdLock.locked()) {
-        stopRecordingSession(true);
-      } else {
-        Logger.LogLine("[SLEEP] SD card busy; recording may not be finalized");
-      }
-    }
-  }
-
-  digitalWrite(LED_FLASH_GPIO_NUM, LOW);
-  flashEnabled = false;
-
-  SemaphoreLock cameraLock(cameraMutex, pdMS_TO_TICKS(1500));
-  if (cameraLock.locked()) {
-    if (cameraInitialized) {
-      esp_err_t err = esp_camera_deinit();
-      if (err != ESP_OK) {
-        Logger.Log("[SLEEP] Camera deinit failed: 0x%x\n", err);
-      } else {
-        cameraInitialized = false;
-      }
-    }
-  }
-
-  powerDownCameraHardware();
-  setWifiModemSleep(false, "deep sleep");
-  WiFi.softAPdisconnect(true);
-  WiFi.disconnect(false, false);
-  WiFi.mode(WIFI_OFF);
-}
-
-[[noreturn]] static void enterDeepSleepNow(const char *reason, int blinkCount, bool allowMotionWake) {
-  Logger.Log("[SLEEP] %s\n", reason ? reason : "Entering deep sleep");
-  prepareDeviceForDeepSleep();
-
-  // Only disable EXT1 if it was previously enabled to avoid errors
-  if (motionWakeupExt1Enabled) {
-    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_EXT1);
-    motionWakeupExt1Enabled = false;
-  }
-  if (allowMotionWake && runtimeConfig.motionSettings.wakeOnMotion) {
-    configureMotionWakeup(true);
-  }
-
-  if (blinkCount > 0) {
-    ledBlinkCount(blinkCount, SLEEP_BLINK_ON_MS, SLEEP_BLINK_OFF_MS);
-  }
-  delay(20);
-  esp_deep_sleep_start();
-
-  for (;;) {
-    delay(1000);
-  }
-}
+// ─── Motion runtime handling ────────────────────────────────────────────────
 
 static void closeMotionActionWindow() {
   motionActionWindowActive = false;
@@ -450,11 +317,6 @@ static void serviceMotionDetection() {
 static void serviceMotionActions() {
   unsigned long now = millis();
 
-  if (motionBootEventPending) {
-    motionBootEventPending = false;
-    triggerMotionEvent("wake");
-  }
-
   if (motionPendingImages > 0 && now >= motionNextImageAt) {
     String path;
     if (captureImageToSD(path)) {
@@ -478,21 +340,6 @@ static void serviceMotionActions() {
 
   if (motionActionWindowActive && motionPendingImages == 0 && !motionVideoManagedRecording) {
     closeMotionActionWindow();
-  }
-}
-
-static void serviceMotionAutoStandby() {
-  if (!runtimeConfig.motionSettings.enabled || !runtimeConfig.motionSettings.autoStandby) {
-    return;
-  }
-
-  if (isDeviceBusy()) {
-    return;
-  }
-
-  unsigned long now = millis();
-  if ((now - motionLastActivityAt) >= ((unsigned long)runtimeConfig.motionSettings.standbyAfterSec * 1000UL)) {
-    enterDeepSleepNow("Auto stand-by timeout", 0, true);
   }
 }
 
