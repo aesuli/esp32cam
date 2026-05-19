@@ -26,8 +26,9 @@ static void clampMotionSettings(MotionSettings &settings) {
 }
 
 static void applyPirInputMode() {
-  pinMode(PIR_GPIO, INPUT);
-  Logger.Log("[GPIO] PIR mode applied on GPIO%d: INPUT\n", PIR_GPIO);
+  // Keep PIR line biased low while awake; deep sleep also applies RTC pulldown.
+  pinMode(PIR_GPIO, INPUT_PULLDOWN);
+  Logger.Log("[GPIO] PIR mode applied on GPIO%d: INPUT\n", PIR_GPIO); // PIR now on GPIO13
 }
 
 static void restoreInputPinsAfterSDInit() {
@@ -106,6 +107,13 @@ static void handleMotionReadings() {
   server.send(HTTP_OK, "application/json", json);
 }
 
+static void handleMotionStandbyNow() {
+  if (!checkAuth()) return;
+
+  server.send(HTTP_OK, "text/plain", "Standby requested. Entering deep sleep...");
+  requestDeepStandby("manual", true);
+}
+
 static void handleMotionConfigGet() {
   if (!checkAuth()) return;
 
@@ -122,7 +130,8 @@ static void handleMotionConfigGet() {
   json += "\"captureVideo\":" + String(m.captureVideo ? "true" : "false") + ",";
   json += "\"videoDurationSec\":" + String((int)m.videoDurationSec) + ",";
   json += "\"detectionIntervalSec\":" + String((int)m.detectionIntervalSec) + ",";
-  json += "\"notifyUrl\":\"" + notifyUrlEscaped + "\"";
+  json += "\"notifyUrl\":\"" + notifyUrlEscaped + "\",";
+  json += "\"standbyAfterInactivity\":" + String(m.standbyAfterInactivity ? "true" : "false");
   json += "}";
   server.send(HTTP_OK, "application/json", json);
 }
@@ -139,6 +148,9 @@ static void handleMotionConfigSet() {
   if (server.hasArg("videoDurationSec")) updated.videoDurationSec = (uint8_t)server.arg("videoDurationSec").toInt();
   if (server.hasArg("detectionIntervalSec")) updated.detectionIntervalSec = (uint16_t)server.arg("detectionIntervalSec").toInt();
   if (server.hasArg("notifyUrl")) updated.notifyUrl = server.arg("notifyUrl");
+  if (server.hasArg("standbyAfterInactivity")) {
+    updated.standbyAfterInactivity = server.arg("standbyAfterInactivity") == "1" || server.arg("standbyAfterInactivity") == "true";
+  }
 
   clampMotionSettings(updated);
   runtimeConfig.motionSettings = updated;
@@ -160,6 +172,7 @@ static void registerMotionRoutes() {
   server.on("/motion/config", HTTP_GET, handleMotionConfigGet);
   server.on("/motion/config", HTTP_POST, handleMotionConfigSet);
   server.on("/motion/readings", HTTP_GET, handleMotionReadings);
+  server.on("/motion/standby", HTTP_POST, handleMotionStandbyNow);
 }
 
 // ─── Motion runtime handling ────────────────────────────────────────────────
@@ -392,5 +405,20 @@ static void serviceMotionNotifyRetry() {
     motionNotifyPending = false;
     motionNotifyLastAttemptAt = 0;
     Logger.LogLine("[MOTION] Deferred notify delivered");
+  }
+}
+
+static void serviceAutoStandby() {
+  if (!runtimeConfig.motionSettings.standbyAfterInactivity || standbyPending) {
+    return;
+  }
+
+  if (motionActionWindowActive || motionPendingImages > 0 || motionVideoManagedRecording || recordingActive || streamClientConnected) {
+    return;
+  }
+
+  unsigned long now = millis();
+  if ((now - motionLastActivityAt) >= STANDBY_INACTIVITY_TIMEOUT_MS) {
+    requestDeepStandby("inactivity", false);
   }
 }

@@ -74,6 +74,13 @@ __APP_NAV__
       <input id="notify_url" type="url" placeholder="http://example.local/motion">
     </div>
 
+    <div class="cg"><label><input id="standby_after_inactivity" type="checkbox"> Enter standby after 2 minutes of inactivity</label></div>
+    <div class="small">Inactivity means no authenticated URL requests and no motion triggers. PIR wake uses GPIO13 HIGH with pulldown.</div>
+
+    <div class="cg" style="margin-top:14px">
+      <button id="standby_now" class="btn" type="button">Enter Standby Now</button>
+    </div>
+
     <div class="small">Changes are saved automatically when you modify a setting.</div>
     <div class="status" id="status"></div>
   </div>
@@ -97,8 +104,23 @@ function buildPayload(){
     captureVideo:id('capture_video').checked?1:0,
     videoDurationSec:asInt(id('video_duration_sec').value,5),
     detectionIntervalSec:asInt(id('detection_interval_sec').value,0),
-    notifyUrl:id('notify_url').value||''
+    notifyUrl:id('notify_url').value||'',
+    standbyAfterInactivity:id('standby_after_inactivity').checked?1:0
   };
+}
+
+function standbyNow(){
+  if(!confirm('Enter deep standby now? Device will wake only on PIR GPIO13 HIGH.')){
+    return;
+  }
+  setStatus('Requesting standby...',false);
+  fetch('/motion/standby',{method:'POST'})
+    .then(function(r){
+      return r.text().then(function(t){
+        setStatus(t||'Standby requested',!r.ok);
+      });
+    })
+    .catch(function(e){setStatus(e.message,true);});
 }
 
 function saveConfig(){
@@ -151,6 +173,7 @@ function loadConfig(){
     id('video_duration_sec').value=c.videoDurationSec;
     id('detection_interval_sec').value=String(c.detectionIntervalSec||0);
     id('notify_url').value=c.notifyUrl||'';
+    id('standby_after_inactivity').checked=!!c.standbyAfterInactivity;
   }).catch(function(e){setStatus(e.message,true);});
 }
 
@@ -162,6 +185,8 @@ bindAutoSave('capture_video');
 bindAutoSave('video_duration_sec');
 bindAutoSave('detection_interval_sec');
 bindAutoSave('notify_url');
+bindAutoSave('standby_after_inactivity');
+id('standby_now').addEventListener('click',standbyNow);
 loadConfig();
 </script>
 </body>

@@ -4,7 +4,7 @@
  * Hardware:
  *   - AI-Thinker ESP32-CAM with OV3660 camera sensor
  *   - microSD in 1-bit mode so SDMMC does not actively drive GPIO12/GPIO13
- *   - PIR input wired to RX (GPIO3)
+ *   - PIR input wired to GPIO13
  *
  * First Boot (unconfigured or missing config file):
  *   Broadcasts protected WiFi AP "ESP32-CAM-Setup"
@@ -31,11 +31,12 @@
 #include <FS.h>
 #include <SD_MMC.h>
 #include <Update.h>
-#include <esp_bt.h>
 #include <esp_err.h>
 #include <esp_heap_caps.h>
+#include <esp_sleep.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
+#include <driver/gpio.h>
 #include <mbedtls/aes.h>
 #include <time.h>
 #include <sys/time.h>
@@ -50,9 +51,9 @@
 #endif
 
 // ─── Pin definitions ──────────────────────────────────────────────────────────
-// PIR wiring: VCC -> 3.3, DATA -> RX (GPIO3), GND -> GND.
-// Note: RX (GPIO3) is now used for PIR input.
-static constexpr int PIR_GPIO    = GPIO_NUM_3;
+// PIR wiring: VCC -> 3.3, DATA -> GPIO13, GND -> GND.
+// Note: GPIO13 is now used for PIR input.
+static constexpr int PIR_GPIO    = GPIO_NUM_13;
 static constexpr int LED_GPIO    = GPIO_NUM_33;  // Internal red LED on ESP32-CAM
 
 // ─── AP setup credentials ─────────────────────────────────────────────────────
@@ -168,6 +169,10 @@ static bool   motionActionWindowActive = false;
 static bool   motionNotifyPending = false;
 static unsigned long motionNotifyLastAttemptAt = 0;
 static bool   deferredNetworkStartupPending = false;
+static bool   standbyPending = false;
+static unsigned long standbyPendingAt = 0;
+static const char *standbyPendingReason = nullptr;
+static bool   wokeFromPirDeepSleep = false;
 static volatile bool staLinkUp = false;
 static unsigned long lastUrlAccessBlink = 0;
 static unsigned long lastCameraActivityAt = 0;
@@ -182,6 +187,8 @@ static constexpr unsigned long LED_ACCESS_BLINK_INTERVAL_MS = 100;  // Minimum i
 static constexpr unsigned long STA_RECONNECT_INTERVAL_MS = 30000;
 static constexpr unsigned long STA_CONNECT_TIMEOUT_MS = 20000;
 static constexpr unsigned long MOTION_NOTIFY_RETRY_INTERVAL_MS = 5000;
+static constexpr unsigned long STANDBY_INACTIVITY_TIMEOUT_MS = 120000;
+static constexpr unsigned long STANDBY_RESPONSE_GRACE_MS = 200;
 static unsigned long cameraIdleTimeoutMs = 3000;
 static unsigned long recordingStartTime = 0;
 static uint32_t recordingDurationMs = 0;
@@ -613,6 +620,7 @@ struct MotionSettings {
   uint8_t videoDurationSec = 5;      // 1..30
   uint16_t detectionIntervalSec = 0; // 0,5,10,30,60,600
   String notifyUrl;
+  bool standbyAfterInactivity = false;
 };
 
 struct StoredConfig {
@@ -683,6 +691,10 @@ static void serviceMotionDetection();
 static void serviceMotionActions();
 static void serviceMotionNotifyRetry();
 static void serviceDeferredNetworkStartup();
+static void serviceAutoStandby();
+[[noreturn]] static void enterDeepStandbyNow(const char *reason);
+static void requestDeepStandby(const char *reason, bool immediate);
+static void servicePendingStandby();
 static void triggerMotionEvent(const char *source);
 static void noteAuthenticatedWebActivity();
 static void closeMotionActionWindow();
@@ -2301,6 +2313,7 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
   appendU8(plain, cfg.motionSettings.videoDurationSec);
   appendU16(plain, cfg.motionSettings.detectionIntervalSec);
   appendField(plain, cfg.motionSettings.notifyUrl);
+  appendU8(plain, cfg.motionSettings.standbyAfterInactivity ? 1 : 0);
 
   return encryptPayload(plain, ivHex, cipherHex);
 }
@@ -2375,6 +2388,12 @@ static bool decryptConfig(const String &ivHex, const String &cipherHex, StoredCo
   if (!readU8(plain, offset, cfg.motionSettings.videoDurationSec)) return false;
   if (!readU16(plain, offset, cfg.motionSettings.detectionIntervalSec)) return false;
   if (!readField(plain, offset, cfg.motionSettings.notifyUrl)) return false;
+
+  uint8_t standbyAfterInactivity = 0;
+  if (offset < plain.size()) {
+    if (!readU8(plain, offset, standbyAfterInactivity)) return false;
+  }
+  cfg.motionSettings.standbyAfterInactivity = (standbyAfterInactivity != 0);
 
   cfg.motionSettings.enabled = (motionEnabled != 0);
   cfg.motionSettings.captureImage = (motionCaptureImage != 0);
@@ -2725,10 +2744,6 @@ static bool hasSharedAccessToken(WebServer &srv) {
 }
 
 static void noteAuthenticatedWebActivity() {
-  if (!runtimeConfig.motionSettings.enabled) {
-    return;
-  }
-
   motionLastActivityAt = millis();
 }
 
@@ -3868,26 +3883,13 @@ static bool initializeRuntimeMutexes() {
 
 static void initializeWakeupIndicator() {
   initLED();
-  ledBootSequence();
-}
-
-static void disableUnusedBluetooth() {
-  // This firmware does not use BT/BLE features; release controller resources.
-  esp_err_t disableErr = esp_bt_controller_disable();
-  if (disableErr != ESP_OK && disableErr != ESP_ERR_INVALID_STATE) {
-    Logger.Log("[BT] Controller disable failed: 0x%x\n", disableErr);
-  }
-
-  esp_err_t deinitErr = esp_bt_controller_deinit();
-  if (deinitErr != ESP_OK && deinitErr != ESP_ERR_INVALID_STATE) {
-    Logger.Log("[BT] Controller deinit failed: 0x%x\n", deinitErr);
-  }
-
-  esp_err_t releaseErr = esp_bt_controller_mem_release(ESP_BT_MODE_BTDM);
-  if (releaseErr == ESP_OK) {
-    Logger.LogLine("[BT] BT/BLE memory released");
-  } else if (releaseErr != ESP_ERR_INVALID_STATE) {
-    Logger.Log("[BT] BT/BLE memory release failed: 0x%x\n", releaseErr);
+  esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
+  wokeFromPirDeepSleep = (wakeCause == ESP_SLEEP_WAKEUP_EXT1);
+  if (wokeFromPirDeepSleep) {
+    ledQuickBlink();
+    Logger.Log("[BOOT] Wake cause: EXT1 (GPIO%d PIR)\n", PIR_GPIO);
+  } else {
+    ledBootSequence();
   }
 }
 
@@ -3900,6 +3902,7 @@ static void initializeBootPins() {
 static void logInputPinConfiguration() {
   Logger.Log("[GPIO] PIR DATA: GPIO%d\n", PIR_GPIO);
   Logger.LogLine("[GPIO] PIR power: VCC -> 3.3V (or compatible rail), GND -> GND");
+  Logger.LogLine("[GPIO] PIR DATA is now on GPIO13");
 }
 
 static void resetMotionRuntimeState() {
@@ -3957,7 +3960,91 @@ static void finalizeMotionStartupConfig() {
   resetMotionDetectionState();
   applyPirInputMode();
   attachInterrupt(digitalPinToInterrupt(PIR_GPIO), onPirEdgeInterrupt, CHANGE);
+  if (wokeFromPirDeepSleep) {
+    motionEdgePending = true;
+    ++motionEdgeCount;
+    motionRawHigh = true;
+    motionLastActivityAt = millis();
+  }
   updateSdLoggingState();
+}
+
+static void requestDeepStandby(const char *reason, bool immediate) {
+  if (standbyPending) {
+    return;
+  }
+
+  standbyPending = true;
+  standbyPendingReason = (reason && reason[0] != '\0') ? reason : "standby";
+  standbyPendingAt = millis() + (immediate ? STANDBY_RESPONSE_GRACE_MS : 0);
+  Logger.Log("[STANDBY] Requested (%s)%s\n",
+    standbyPendingReason,
+    immediate ? "" : " after inactivity");
+}
+
+static void servicePendingStandby() {
+  if (!standbyPending) {
+    return;
+  }
+
+  if ((long)(millis() - standbyPendingAt) < 0) {
+    return;
+  }
+
+  enterDeepStandbyNow(standbyPendingReason);
+}
+
+[[noreturn]] static void enterDeepStandbyNow(const char *reason) {
+  Logger.Log("[STANDBY] Entering deep sleep (%s), wake on PIR GPIO%d HIGH\n",
+    reason ? reason : "standby",
+    PIR_GPIO);
+
+  streamClientAbortRequested = true;
+  detachInterrupt(digitalPinToInterrupt(PIR_GPIO));
+
+  if (recordingActive) {
+    String stopMessage;
+    if (stopRecordingSessionInternal(stopMessage)) {
+      Logger.Log("[STANDBY] %s\n", stopMessage.c_str());
+    }
+  }
+
+  if (cameraInitialized) {
+    esp_err_t camErr = esp_camera_deinit();
+    if (camErr != ESP_OK) {
+      Logger.Log("[STANDBY] Camera deinit failed: 0x%x\n", camErr);
+    } else {
+      cameraInitialized = false;
+      powerDownCameraHardware();
+    }
+  } else {
+    powerDownCameraHardware();
+  }
+
+  serviceLogFileFlush();
+
+  WiFi.setSleep(false);
+  WiFi.disconnect(false, false);
+  WiFi.mode(WIFI_OFF);
+
+  pinMode(PIR_GPIO, INPUT_PULLDOWN);
+  gpio_hold_dis(static_cast<gpio_num_t>(PIR_GPIO));
+  gpio_hold_en(static_cast<gpio_num_t>(PIR_GPIO));
+  gpio_deep_sleep_hold_en();
+
+  uint64_t wakeMask = (1ULL << PIR_GPIO);
+  esp_err_t wakeErr = esp_sleep_enable_ext1_wakeup(wakeMask, ESP_EXT1_WAKEUP_ANY_HIGH);
+  if (wakeErr != ESP_OK) {
+    Logger.Log("[STANDBY] Failed to enable EXT0 wake on GPIO%d: 0x%x\n", PIR_GPIO, wakeErr);
+    delay(100);
+    ESP.restart();
+  }
+
+  delay(50);
+  esp_deep_sleep_start();
+  for (;;) {
+    delay(1000);
+  }
 }
 
 static void initializeRouteAccessToken() {
@@ -3986,7 +4073,6 @@ static void startInitialNetworkServices() {
 void setup() {
   Logger.begin(115200);
   Logger.LogLine("[BOOT] *** ESP32-CAM starting ***");
-  disableUnusedBluetooth();
   WiFi.onEvent(onWifiEvent);
 
   initializeWakeupIndicator();
@@ -4019,6 +4105,8 @@ void loop() {
   serviceMotionActions();
   serviceDeferredNetworkStartup();
   serviceMotionNotifyRetry();
+  serviceAutoStandby();
+  servicePendingStandby();
   serviceCameraIdleTimeout();
   servicePendingFirmwareRestart();
   servicePendingAdminRestart();

@@ -5,7 +5,8 @@ Firmware for AI-Thinker ESP32-CAM (OV3660) with web streaming, camera controls, 
 ## Hardware and pins
 
 - SD runs in 1-bit SD_MMC mode.
-- PIR sensor: DATA to RX (GPIO3), VCC to 3.3V.
+- PIR sensor: DATA to GPIO13, VCC to 3.3V.
+- PIR input uses pulldown while awake and during deep sleep wake setup (RTC pulldown), so idle should remain LOW.
 
 ## Configuration storage
 
@@ -60,6 +61,8 @@ The web interface is composed of four main pages:
 - Detection interval (cooldown) between motion events while the device is awake
 - Optional Notify URL (HTTP GET sent when motion is detected)
 - Live motion graph page with current PIR readings
+- Optional standby after 2 minutes of inactivity (no authenticated URL requests and no motion triggers)
+- Manual "Enter Standby Now" button (confirmation required); wake source is PIR GPIO13 HIGH
 
 ### SD Browser page
 - Browse files and folders on SD
