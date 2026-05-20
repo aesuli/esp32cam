@@ -55,6 +55,7 @@
 // Note: GPIO13 is now used for PIR input.
 static constexpr int PIR_GPIO    = GPIO_NUM_13;
 static constexpr int LED_GPIO    = GPIO_NUM_33;  // Internal red LED on ESP32-CAM
+static constexpr int MOTION_TOGGLE_BUTTON_GPIO = GPIO_NUM_3;  // RX pin
 
 // ─── AP setup credentials ─────────────────────────────────────────────────────
 #define AP_SETUP_SSID   "ESP32-CAM-Setup"
@@ -161,6 +162,8 @@ static bool   staConnectedAtBoot = false;
 static bool   sdCardAvailableAtBoot = false;
 static bool   motionRawHigh = false;
 static bool   motionLatched = false;
+static bool   motionToggleButtonStableHigh = false;
+static bool   motionToggleButtonLastReadingHigh = false;
 static volatile bool motionEdgePending = false;
 static volatile uint32_t motionEdgeCount = 0;
 static uint8_t motionPendingImages = 0;
@@ -180,6 +183,7 @@ static unsigned long lastStaReconnectAttemptAt = 0;
 static unsigned long motionHighSinceAt = 0;
 static unsigned long motionLastDetectedAt = 0;
 static unsigned long motionLastActivityAt = 0;
+static unsigned long motionToggleButtonLastChangeAt = 0;
 static unsigned long motionNextImageAt = 0;
 static unsigned long motionRecordingStopAt = 0;
 static unsigned long motionIgnoreUntilAt = 0;
@@ -187,6 +191,7 @@ static constexpr unsigned long LED_ACCESS_BLINK_INTERVAL_MS = 100;  // Minimum i
 static constexpr unsigned long STA_RECONNECT_INTERVAL_MS = 30000;
 static constexpr unsigned long STA_CONNECT_TIMEOUT_MS = 20000;
 static constexpr unsigned long MOTION_NOTIFY_RETRY_INTERVAL_MS = 5000;
+static constexpr unsigned long MOTION_TOGGLE_DEBOUNCE_MS = 40;
 static constexpr unsigned long STANDBY_INACTIVITY_TIMEOUT_MS = 120000;
 static constexpr unsigned long STANDBY_RESPONSE_GRACE_MS = 200;
 static unsigned long cameraIdleTimeoutMs = 3000;
@@ -692,6 +697,8 @@ static void serviceMotionActions();
 static void serviceMotionNotifyRetry();
 static void serviceDeferredNetworkStartup();
 static void serviceAutoStandby();
+static void applyMotionToggleButtonInputMode();
+static void serviceMotionToggleButton();
 [[noreturn]] static void enterDeepStandbyNow(const char *reason);
 static void requestDeepStandby(const char *reason, bool immediate);
 static void servicePendingStandby();
@@ -3903,6 +3910,7 @@ static void logInputPinConfiguration() {
   Logger.Log("[GPIO] PIR DATA: GPIO%d\n", PIR_GPIO);
   Logger.LogLine("[GPIO] PIR power: VCC -> 3.3V (or compatible rail), GND -> GND");
   Logger.LogLine("[GPIO] PIR DATA is now on GPIO13");
+  Logger.Log("[GPIO] Motion toggle button: GPIO%d (RX), active HIGH\n", MOTION_TOGGLE_BUTTON_GPIO);
 }
 
 static void resetMotionRuntimeState() {
@@ -3959,6 +3967,7 @@ static void finalizeMotionStartupConfig() {
   clampMotionSettings(runtimeConfig.motionSettings);
   resetMotionDetectionState();
   applyPirInputMode();
+  applyMotionToggleButtonInputMode();
   attachInterrupt(digitalPinToInterrupt(PIR_GPIO), onPirEdgeInterrupt, CHANGE);
   if (wokeFromPirDeepSleep) {
     motionEdgePending = true;
@@ -3967,6 +3976,61 @@ static void finalizeMotionStartupConfig() {
     motionLastActivityAt = millis();
   }
   updateSdLoggingState();
+}
+
+static void applyMotionToggleButtonInputMode() {
+  // Button is wired between RX pin and 3.3V; keep a pulldown so idle state is LOW.
+  pinMode(MOTION_TOGGLE_BUTTON_GPIO, INPUT_PULLDOWN);
+  bool initialHigh = (digitalRead(MOTION_TOGGLE_BUTTON_GPIO) == HIGH);
+  motionToggleButtonStableHigh = initialHigh;
+  motionToggleButtonLastReadingHigh = initialHigh;
+  motionToggleButtonLastChangeAt = millis();
+}
+
+static void serviceMotionToggleButton() {
+  unsigned long now = millis();
+  bool readingHigh = (digitalRead(MOTION_TOGGLE_BUTTON_GPIO) == HIGH);
+
+  if (readingHigh != motionToggleButtonLastReadingHigh) {
+    motionToggleButtonLastReadingHigh = readingHigh;
+    motionToggleButtonLastChangeAt = now;
+  }
+
+  if ((now - motionToggleButtonLastChangeAt) < MOTION_TOGGLE_DEBOUNCE_MS) {
+    return;
+  }
+
+  if (readingHigh == motionToggleButtonStableHigh) {
+    return;
+  }
+
+  motionToggleButtonStableHigh = readingHigh;
+  if (!motionToggleButtonStableHigh) {
+    return;
+  }
+
+  MotionSettings updated = runtimeConfig.motionSettings;
+  updated.enabled = !updated.enabled;
+  clampMotionSettings(updated);
+  runtimeConfig.motionSettings = updated;
+
+  if (!persistRuntimeConfig(runtimeConfig)) {
+    Logger.LogLine("[MOTION] Failed to persist RX button toggle");
+    return;
+  }
+
+  resetMotionDetectionState();
+  applyPirInputMode();
+  attachInterrupt(digitalPinToInterrupt(PIR_GPIO), onPirEdgeInterrupt, CHANGE);
+  motionLastActivityAt = now;
+
+  if (runtimeConfig.motionSettings.enabled) {
+    Logger.LogLine("[MOTION] Enabled by RX button");
+    ledBlinkCount(2, 100, 100);
+  } else {
+    Logger.LogLine("[MOTION] Disabled by RX button");
+    ledBlinkCount(1, 100, 100);
+  }
 }
 
 static void requestDeepStandby(const char *reason, bool immediate) {
@@ -4101,6 +4165,7 @@ void loop() {
   serviceNtpSync();
   serviceStaReconnect();
   serviceRecording();
+  serviceMotionToggleButton();
   serviceMotionDetection();
   serviceMotionActions();
   serviceDeferredNetworkStartup();
