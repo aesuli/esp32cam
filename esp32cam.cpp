@@ -92,7 +92,7 @@ static constexpr uint32_t CAMERA_XCLK_FREQS_HZ[] = {
 
 // ─── SD configuration storage ──────────────────────────────────────────────────
 #define CONFIG_FILE_PATH "/config.enc"
-#define CONFIG_FILE_MAGIC "ESP32CAMCFG9"
+#define CONFIG_FILE_MAGIC "ESP32CAMCFG10"
 #define CAPTURE_COUNTER_FILE_PATH "/capture_counter.txt"
 #define SD_SORT_FILE_PATH "/.sort"
 
@@ -614,6 +614,7 @@ struct CameraSettings {
   int16_t vflip = 0;
   int16_t lenc = 0;
   int16_t streamVisible = 1;
+  int16_t viewRotate90 = 0;
 };
 
 struct MotionSettings {
@@ -1827,8 +1828,9 @@ static bool readCameraSettings(const std::vector<uint8_t> &buf, size_t &offset, 
       && readI16(buf, offset, settings.aec)
       && readI16(buf, offset, settings.hmirror)
       && readI16(buf, offset, settings.vflip)
-  && readI16(buf, offset, settings.lenc)
-  && readI16(buf, offset, settings.streamVisible);
+      && readI16(buf, offset, settings.lenc)
+      && readI16(buf, offset, settings.streamVisible)
+      && readI16(buf, offset, settings.viewRotate90);
 }
 
 static void appendCameraSettings(std::vector<uint8_t> &buf, const CameraSettings &settings) {
@@ -1845,6 +1847,7 @@ static void appendCameraSettings(std::vector<uint8_t> &buf, const CameraSettings
   appendI16(buf, settings.vflip);
   appendI16(buf, settings.lenc);
   appendI16(buf, settings.streamVisible);
+  appendI16(buf, settings.viewRotate90);
 }
 
 static bool updateStoredCameraSetting(StoredConfig &cfg, const String &varName, int val) {
@@ -1861,6 +1864,7 @@ static bool updateStoredCameraSetting(StoredConfig &cfg, const String &varName, 
   else if (varName == "vflip") cfg.cameraSettings.vflip = val;
   else if (varName == "lenc") cfg.cameraSettings.lenc = val;
   else if (varName == "stream_visible") cfg.cameraSettings.streamVisible = val ? 1 : 0;
+  else if (varName == "view_rotate_90") cfg.cameraSettings.viewRotate90 = val ? 1 : 0;
   else return false;
 
   cfg.hasCameraSettings = true;
@@ -3424,10 +3428,10 @@ static void handleControl() {
         return;
     }
 
-      if (varName == "stream_visible") {
+      if (varName == "stream_visible" || varName == "view_rotate_90") {
         updateStoredCameraSetting(runtimeConfig, varName, val);
         if (persist && !persistRuntimeConfig(runtimeConfig)) {
-          server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to persist stream visibility");
+          server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to persist view setting");
           return;
         }
         server.send(HTTP_OK, "text/plain", "OK");
@@ -3560,6 +3564,7 @@ static void handleStatus() {
         "\"dcw\":%u,"
         "\"colorbar\":%u,"
         "\"stream_visible\":%u,"
+        "\"view_rotate_90\":%u,"
         "\"recording_active\":%u"
         "}",
         s->status.framesize,   s->status.quality,
@@ -3576,6 +3581,7 @@ static void handleStatus() {
         s->status.vflip,       s->status.dcw,
         s->status.colorbar,
         runtimeConfig.cameraSettings.streamVisible ? 1U : 0U,
+        runtimeConfig.cameraSettings.viewRotate90 ? 1U : 0U,
         recordingActive ? 1U : 0U
     );
 

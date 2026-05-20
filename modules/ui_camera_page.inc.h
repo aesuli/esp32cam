@@ -20,6 +20,7 @@ header span{font-size:.85em;color:#888}
 .main{display:flex;flex-wrap:wrap;gap:12px;padding:12px}
 .stream-panel{flex:1 1 400px;text-align:center}
 .stream-panel img{width:100%;max-width:800px;border:2px solid #0f3460;border-radius:6px;background:#111;min-height:200px}
+.stream-panel img.rot90{transform:rotate(90deg);transform-origin:center center}
 .stream-panel img.hidden{display:none}
 .stream-placeholder{display:none;width:100%;max-width:800px;min-height:200px;margin:0 auto;border:2px dashed #234573;border-radius:6px;background:#111827;color:#7dd3fc;align-items:center;justify-content:center;padding:24px;font-size:.95em}
 .stream-placeholder.visible{display:flex}
@@ -114,12 +115,16 @@ __APP_NAV__
     <div class="cg">
       <label><input type="checkbox" id="lenc"> Lens Correction</label>
     </div>
+    <div class="cg">
+      <label><input type="checkbox" id="view_rotate_90"> Rotate View 90°</label>
+    </div>
   </div>
 </div>
 __APP_FOOTER__
 <script>
 var recordingMode=false;
 var streamVisible=true;
+var viewRotate90=false;
 var streamUrl='http://'+window.location.hostname+':81/stream?t='+encodeURIComponent('__ROUTE_TOKEN__');
 function id(n){return document.getElementById(n);}
 function chk(el){return el.checked?1:0;}
@@ -171,6 +176,11 @@ function setRecordingState(isRecording,statusText){
   btn.textContent=recordingMode?'⏹️ Stop':'⏺️ Record';
   if(statusText!==undefined){status.textContent=statusText;}
 }
+function setViewRotation(isRotated){
+  var img=id('stream');
+  viewRotate90=!!isRotated;
+  img.classList.toggle('rot90',viewRotate90);
+}
 function bindFrameSizeControl(){
   var el=id('framesize');
   if(!el)return;
@@ -216,6 +226,11 @@ function applyStatus(s){
     if(s[k]!==undefined){var e=id(k);if(e)e.value=s[k];var v=id(k+'_v');if(v)v.innerText=s[k];}
   });
   ['awb','aec','hmirror','vflip','lenc'].forEach(function(k){if(s[k]!==undefined){var e=id(k);if(e)e.checked=!!s[k];}});
+  if(s.view_rotate_90!==undefined){
+    var rotateCb=id('view_rotate_90');
+    if(rotateCb)rotateCb.checked=!!s.view_rotate_90;
+    setViewRotation(!!s.view_rotate_90);
+  }
   setStreamVisibility(s.stream_visible!==undefined?!!s.stream_visible:true);
   if(s.recording_active!==undefined){setRecordingState(!!s.recording_active,s.recording_active?'Recording...':'');}
 }
@@ -228,7 +243,8 @@ function loadStatus(){
 bindFrameSizeControl();
 ['special_effect','wb_mode'].forEach(bindSelectControl);
 ['brightness','contrast','saturation','quality'].forEach(bindRangeControl);
-['awb','aec','hmirror','vflip','lenc'].forEach(bindCheckboxControl);
+['awb','aec','hmirror','vflip','lenc','view_rotate_90'].forEach(bindCheckboxControl);
+id('view_rotate_90').addEventListener('change',function(){setViewRotation(chk(id('view_rotate_90')));});
 id('stream_toggle_btn').addEventListener('click',function(){
   var nextVisible=!streamVisible;
   setStreamVisibility(nextVisible);
