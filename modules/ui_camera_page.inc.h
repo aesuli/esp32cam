@@ -19,10 +19,11 @@ header h1{color:#e94560;font-size:1.3em}
 header span{font-size:.85em;color:#888}
 .main{display:flex;flex-wrap:wrap;gap:12px;padding:12px}
 .stream-panel{flex:1 1 400px;text-align:center}
-.stream-panel img{width:100%;max-width:800px;border:2px solid #0f3460;border-radius:6px;background:#111;min-height:200px}
+.stream-shell{position:relative;width:100%;max-width:800px;min-height:200px;margin:0 auto;border:2px solid #0f3460;border-radius:6px;background:#111;overflow:hidden}
+.stream-panel img{position:absolute;left:0;top:0;width:100%;height:100%;object-fit:contain;background:#111}
 .stream-panel img.rot90{transform:rotate(90deg);transform-origin:center center}
 .stream-panel img.hidden{display:none}
-.stream-placeholder{display:none;width:100%;max-width:800px;min-height:200px;margin:0 auto;border:2px dashed #234573;border-radius:6px;background:#111827;color:#7dd3fc;align-items:center;justify-content:center;padding:24px;font-size:.95em}
+.stream-placeholder{display:none;position:absolute;inset:0;background:#111827;color:#7dd3fc;align-items:center;justify-content:center;padding:24px;font-size:.95em}
 .stream-placeholder.visible{display:flex}
 .btn{display:inline-block;margin-top:8px;padding:8px 20px;background:#e94560;color:#fff;border:none;border-radius:4px;cursor:pointer;text-decoration:none;font-size:.9em}
 .btn:hover{background:#c73652}
@@ -47,8 +48,10 @@ __APP_NAV__
 </header>
 <div class="main">
   <div class="stream-panel">
-    <img id="stream" alt="Loading stream...">
-    <div id="stream_placeholder" class="stream-placeholder">Stream hidden</div>
+    <div id="stream_shell" class="stream-shell">
+      <img id="stream" alt="Loading stream...">
+      <div id="stream_placeholder" class="stream-placeholder">Stream hidden</div>
+    </div>
     <br>
     <button class="btn" id="stream_toggle_btn">🙈 Hide Stream</button>
     <button class="btn" id="cap_btn">📸 Capture</button>
@@ -176,10 +179,23 @@ function setRecordingState(isRecording,statusText){
   btn.textContent=recordingMode?'⏹️ Stop':'⏺️ Record';
   if(statusText!==undefined){status.textContent=statusText;}
 }
+function updateStreamLayout(){
+  var shell=id('stream_shell');
+  var img=id('stream');
+  if(!shell||!img)return;
+  var w=shell.clientWidth||800;
+  var nw=img.naturalWidth||640;
+  var nh=img.naturalHeight||480;
+  if(nw<=0||nh<=0){nw=640;nh=480;}
+  var ratio=viewRotate90?(nw/nh):(nh/nw);
+  var h=Math.max(200,Math.round(w*ratio));
+  shell.style.height=h+'px';
+}
 function setViewRotation(isRotated){
   var img=id('stream');
   viewRotate90=!!isRotated;
   img.classList.toggle('rot90',viewRotate90);
+  updateStreamLayout();
 }
 function bindFrameSizeControl(){
   var el=id('framesize');
@@ -282,10 +298,13 @@ id('flash_btn').addEventListener('click',function(){
 });
 var h=window.location.hostname;
 id('stream').dataset.src=streamUrl;
+id('stream').addEventListener('load',updateStreamLayout);
 id('ip_label').innerText=h;
+window.addEventListener('resize',updateStreamLayout);
 window.addEventListener('pagehide',function(){releaseStream(true);});
 window.addEventListener('beforeunload',function(){releaseStream(true);});
 setStreamVisibility(false);
+updateStreamLayout();
 loadStatus().catch(function(){
   setStreamVisibility(true);
 });
