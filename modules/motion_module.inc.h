@@ -46,9 +46,28 @@ static void resetMotionDetectionState() {
   motionNotifyPending = false;
   motionNotifyLastAttemptAt = 0;
   motionIgnoreUntilAt = 0;
+  motionEnableActivationAt = 0;
   motionPendingImages = 0;
   motionVideoManagedRecording = false;
   motionRecordingStopAt = 0;
+}
+
+static void scheduleMotionActivationDelay(const char *reason) {
+  if (!runtimeConfig.motionSettings.enabled) {
+    motionEnableActivationAt = 0;
+    return;
+  }
+
+  motionEnableActivationAt = millis() + MOTION_ENABLE_ACTIVATION_DELAY_MS;
+  motionLatched = false;
+  motionHighSinceAt = 0;
+  noInterrupts();
+  motionEdgePending = false;
+  interrupts();
+
+  Logger.Log("[MOTION] Activation delay started (%lus) after %s\n",
+             (unsigned long)(MOTION_ENABLE_ACTIVATION_DELAY_MS / 1000UL),
+             reason ? reason : "enable");
 }
 
 static void updateSdLoggingState() {
@@ -131,6 +150,7 @@ static void handleMotionConfigGet() {
   json += "\"videoDurationSec\":" + String((int)m.videoDurationSec) + ",";
   json += "\"detectionIntervalSec\":" + String((int)m.detectionIntervalSec) + ",";
   json += "\"notifyUrl\":\"" + notifyUrlEscaped + "\",";
+  json += "\"notifyEnabled\":" + String(m.notifyEnabled ? "true" : "false") + ",";
   json += "\"standbyAfterInactivity\":" + String(m.standbyAfterInactivity ? "true" : "false");
   json += "}";
   server.send(HTTP_OK, "application/json", json);
@@ -139,6 +159,7 @@ static void handleMotionConfigGet() {
 static void handleMotionConfigSet() {
   if (!checkAuth()) return;
 
+  bool wasEnabled = runtimeConfig.motionSettings.enabled;
   MotionSettings updated = runtimeConfig.motionSettings;
   if (server.hasArg("enabled")) updated.enabled = server.arg("enabled") == "1" || server.arg("enabled") == "true";
   if (server.hasArg("captureImage")) updated.captureImage = server.arg("captureImage") == "1" || server.arg("captureImage") == "true";
@@ -148,6 +169,7 @@ static void handleMotionConfigSet() {
   if (server.hasArg("videoDurationSec")) updated.videoDurationSec = (uint8_t)server.arg("videoDurationSec").toInt();
   if (server.hasArg("detectionIntervalSec")) updated.detectionIntervalSec = (uint16_t)server.arg("detectionIntervalSec").toInt();
   if (server.hasArg("notifyUrl")) updated.notifyUrl = server.arg("notifyUrl");
+  if (server.hasArg("notifyEnabled")) updated.notifyEnabled = server.arg("notifyEnabled") == "1" || server.arg("notifyEnabled") == "true";
   if (server.hasArg("standbyAfterInactivity")) {
     updated.standbyAfterInactivity = server.arg("standbyAfterInactivity") == "1" || server.arg("standbyAfterInactivity") == "true";
   }
@@ -163,6 +185,9 @@ static void handleMotionConfigSet() {
   resetMotionDetectionState();
   applyPirInputMode();
   attachInterrupt(digitalPinToInterrupt(PIR_GPIO), onPirEdgeInterrupt, CHANGE);
+  if (!wasEnabled && runtimeConfig.motionSettings.enabled) {
+    scheduleMotionActivationDelay("web-config");
+  }
   server.send(HTTP_OK, "text/plain", "Motion configuration saved");
 }
 
@@ -236,7 +261,7 @@ static void triggerMotionEvent(const char *source) {
   motionPendingImages = 0;
   motionVideoManagedRecording = false;
   motionRecordingStopAt = 0;
-  motionNotifyPending = !runtimeConfig.motionSettings.notifyUrl.isEmpty();
+  motionNotifyPending = runtimeConfig.motionSettings.notifyEnabled && !runtimeConfig.motionSettings.notifyUrl.isEmpty();
   motionNotifyLastAttemptAt = 0;
   Logger.Log("[MOTION] Triggered (%s)\n", source ? source : "runtime");
 
@@ -285,6 +310,36 @@ static void serviceMotionDetection() {
   }
 
   unsigned long now = millis();
+  if (recordingActive) {
+    motionRawHigh = (digitalRead(PIR_GPIO) == HIGH);
+    if (motionRawHigh) {
+      if (motionHighSinceAt == 0) {
+        motionHighSinceAt = now;
+      }
+    } else {
+      motionHighSinceAt = 0;
+    }
+
+    noInterrupts();
+    motionEdgePending = false;
+    interrupts();
+    return;
+  }
+
+  if (motionEnableActivationAt != 0) {
+    if ((long)(now - motionEnableActivationAt) < 0) {
+      motionRawHigh = (digitalRead(PIR_GPIO) == HIGH);
+      motionLatched = false;
+      noInterrupts();
+      motionEdgePending = false;
+      interrupts();
+      return;
+    }
+
+    motionEnableActivationAt = 0;
+    Logger.LogLine("[MOTION] Activation delay elapsed; detection armed");
+  }
+
   if (motionIgnoreUntilAt != 0 && (long)(now - motionIgnoreUntilAt) >= 0) {
     motionIgnoreUntilAt = 0;
   }
@@ -385,6 +440,12 @@ static void serviceMotionNotifyRetry() {
   }
 
   if (runtimeConfig.motionSettings.notifyUrl.isEmpty()) {
+    motionNotifyPending = false;
+    motionNotifyLastAttemptAt = 0;
+    return;
+  }
+
+  if (!runtimeConfig.motionSettings.notifyEnabled) {
     motionNotifyPending = false;
     motionNotifyLastAttemptAt = 0;
     return;

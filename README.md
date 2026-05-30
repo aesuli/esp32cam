@@ -52,10 +52,12 @@ The web interface is composed of four main pages:
 - Flash on/off button
 - **Capture button**: saves a JPEG to `/capture/SEQUENCE-YYYYMMDD_HHMMSS.jpg`
 - **Record button**: starts/stops MJPEG AVI recording to `/capture/SEQUENCE-YYYYMMDD_HHMMSS.avi`
+- **RX button integration**: short press toggles motion detection when idle; long press starts recording; any short press while recording stops the recording
 - Stream visibility toggle (show/hide stream)
 
 ### Motion page
 - Enable or disable motion detection
+- Fixed 10-second activation delay after motion detection is enabled
 - Optional capture of images on motion (count + interval)
 - Optional video recording on motion (duration)
 - Detection interval (cooldown) between motion events while the device is awake

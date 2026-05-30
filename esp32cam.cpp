@@ -164,6 +164,7 @@ static bool   motionRawHigh = false;
 static bool   motionLatched = false;
 static bool   motionToggleButtonStableHigh = false;
 static bool   motionToggleButtonLastReadingHigh = false;
+static bool   motionToggleButtonLongPressHandled = false;
 static volatile bool motionEdgePending = false;
 static volatile uint32_t motionEdgeCount = 0;
 static uint8_t motionPendingImages = 0;
@@ -184,14 +185,18 @@ static unsigned long motionHighSinceAt = 0;
 static unsigned long motionLastDetectedAt = 0;
 static unsigned long motionLastActivityAt = 0;
 static unsigned long motionToggleButtonLastChangeAt = 0;
+static unsigned long motionToggleButtonPressedAt = 0;
 static unsigned long motionNextImageAt = 0;
 static unsigned long motionRecordingStopAt = 0;
 static unsigned long motionIgnoreUntilAt = 0;
+static unsigned long motionEnableActivationAt = 0;
 static constexpr unsigned long LED_ACCESS_BLINK_INTERVAL_MS = 100;  // Minimum interval between access blinks
 static constexpr unsigned long STA_RECONNECT_INTERVAL_MS = 30000;
 static constexpr unsigned long STA_CONNECT_TIMEOUT_MS = 20000;
 static constexpr unsigned long MOTION_NOTIFY_RETRY_INTERVAL_MS = 5000;
+static constexpr unsigned long MOTION_ENABLE_ACTIVATION_DELAY_MS = 10000;
 static constexpr unsigned long MOTION_TOGGLE_DEBOUNCE_MS = 40;
+static constexpr unsigned long MOTION_TOGGLE_LONG_PRESS_MS = 1000;
 static constexpr unsigned long STANDBY_INACTIVITY_TIMEOUT_MS = 120000;
 static constexpr unsigned long STANDBY_RESPONSE_GRACE_MS = 200;
 static unsigned long cameraIdleTimeoutMs = 3000;
@@ -626,6 +631,7 @@ struct MotionSettings {
   uint8_t videoDurationSec = 5;      // 1..30
   uint16_t detectionIntervalSec = 0; // 0,5,10,30,60,600
   String notifyUrl;
+  bool notifyEnabled = false;
   bool standbyAfterInactivity = false;
 };
 
@@ -709,6 +715,7 @@ static void closeMotionActionWindow();
 static bool captureImageToSD(String &savedPath);
 static bool startRecordingSessionInternal(String &message);
 static bool stopRecordingSessionInternal(String &message);
+static bool stopRecordingSessionWithOverride(String &message);
 static void handleMotionGraphPage();
 static void handleMotionReadings();
 static bool isValidMotionIntervalSec(uint16_t seconds);
@@ -2325,6 +2332,7 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
   appendU16(plain, cfg.motionSettings.detectionIntervalSec);
   appendField(plain, cfg.motionSettings.notifyUrl);
   appendU8(plain, cfg.motionSettings.standbyAfterInactivity ? 1 : 0);
+  appendU8(plain, cfg.motionSettings.notifyEnabled ? 1 : 0);
 
   return encryptPayload(plain, ivHex, cipherHex);
 }
@@ -2405,6 +2413,10 @@ static bool decryptConfig(const String &ivHex, const String &cipherHex, StoredCo
     if (!readU8(plain, offset, standbyAfterInactivity)) return false;
   }
   cfg.motionSettings.standbyAfterInactivity = (standbyAfterInactivity != 0);
+
+  uint8_t notifyEnabled = 0;
+  if (!readU8(plain, offset, notifyEnabled)) return false;
+  cfg.motionSettings.notifyEnabled = (notifyEnabled != 0);
 
   cfg.motionSettings.enabled = (motionEnabled != 0);
   cfg.motionSettings.captureImage = (motionCaptureImage != 0);
@@ -3929,6 +3941,7 @@ static void resetMotionRuntimeState() {
   motionNotifyPending = false;
   motionNotifyLastAttemptAt = 0;
   motionIgnoreUntilAt = 0;
+  motionEnableActivationAt = 0;
   deferredNetworkStartupPending = false;
 }
 
@@ -3975,6 +3988,9 @@ static void finalizeMotionStartupConfig() {
   applyPirInputMode();
   applyMotionToggleButtonInputMode();
   attachInterrupt(digitalPinToInterrupt(PIR_GPIO), onPirEdgeInterrupt, CHANGE);
+  if (runtimeConfig.motionSettings.enabled && !wokeFromPirDeepSleep) {
+    scheduleMotionActivationDelay("startup");
+  }
   if (wokeFromPirDeepSleep) {
     motionEdgePending = true;
     ++motionEdgeCount;
@@ -3990,6 +4006,8 @@ static void applyMotionToggleButtonInputMode() {
   bool initialHigh = (digitalRead(MOTION_TOGGLE_BUTTON_GPIO) == HIGH);
   motionToggleButtonStableHigh = initialHigh;
   motionToggleButtonLastReadingHigh = initialHigh;
+  motionToggleButtonLongPressHandled = false;
+  motionToggleButtonPressedAt = initialHigh ? millis() : 0;
   motionToggleButtonLastChangeAt = millis();
 }
 
@@ -4006,36 +4024,72 @@ static void serviceMotionToggleButton() {
     return;
   }
 
-  if (readingHigh == motionToggleButtonStableHigh) {
+  if (readingHigh != motionToggleButtonStableHigh) {
+    motionToggleButtonStableHigh = readingHigh;
+    if (motionToggleButtonStableHigh) {
+      motionToggleButtonPressedAt = now;
+      motionToggleButtonLongPressHandled = false;
+      return;
+    }
+
+    motionToggleButtonPressedAt = 0;
+    if (motionToggleButtonLongPressHandled) {
+      motionToggleButtonLongPressHandled = false;
+      return;
+    }
+
+    motionLastActivityAt = now;
+    if (recordingActive) {
+      String message;
+      if (stopRecordingSessionWithOverride(message)) {
+        Logger.Log("[REC] %s (RX button)\n", message.c_str());
+        ledBlink(500, 200);
+      } else {
+        Logger.Log("[REC] RX button stop failed: %s\n", message.c_str());
+      }
+      return;
+    }
+
+    MotionSettings updated = runtimeConfig.motionSettings;
+    updated.enabled = !updated.enabled;
+    clampMotionSettings(updated);
+    runtimeConfig.motionSettings = updated;
+
+    if (!persistRuntimeConfig(runtimeConfig)) {
+      Logger.LogLine("[MOTION] Failed to persist RX button toggle");
+      return;
+    }
+
+    resetMotionDetectionState();
+    applyPirInputMode();
+    attachInterrupt(digitalPinToInterrupt(PIR_GPIO), onPirEdgeInterrupt, CHANGE);
+
+    if (runtimeConfig.motionSettings.enabled) {
+      scheduleMotionActivationDelay("rx-toggle");
+      Logger.LogLine("[MOTION] Enabled by RX button");
+      ledBlinkCount(2, 100, 100);
+    } else {
+      Logger.LogLine("[MOTION] Disabled by RX button");
+      ledBlinkCount(1, 100, 100);
+    }
     return;
   }
 
-  motionToggleButtonStableHigh = readingHigh;
-  if (!motionToggleButtonStableHigh) {
+  if (!motionToggleButtonStableHigh || motionToggleButtonLongPressHandled || recordingActive || motionToggleButtonPressedAt == 0) {
     return;
   }
 
-  MotionSettings updated = runtimeConfig.motionSettings;
-  updated.enabled = !updated.enabled;
-  clampMotionSettings(updated);
-  runtimeConfig.motionSettings = updated;
+  if ((now - motionToggleButtonPressedAt) >= MOTION_TOGGLE_LONG_PRESS_MS) {
+    motionToggleButtonLongPressHandled = true;
+    motionLastActivityAt = now;
 
-  if (!persistRuntimeConfig(runtimeConfig)) {
-    Logger.LogLine("[MOTION] Failed to persist RX button toggle");
-    return;
-  }
-
-  resetMotionDetectionState();
-  applyPirInputMode();
-  attachInterrupt(digitalPinToInterrupt(PIR_GPIO), onPirEdgeInterrupt, CHANGE);
-  motionLastActivityAt = now;
-
-  if (runtimeConfig.motionSettings.enabled) {
-    Logger.LogLine("[MOTION] Enabled by RX button");
-    ledBlinkCount(2, 100, 100);
-  } else {
-    Logger.LogLine("[MOTION] Disabled by RX button");
-    ledBlinkCount(1, 100, 100);
+    String message;
+    if (startRecordingSessionInternal(message)) {
+      Logger.Log("[REC] %s (RX button)\n", message.c_str());
+      ledBlinkCount(3, 60, 60);
+    } else {
+      Logger.Log("[REC] RX button start failed: %s\n", message.c_str());
+    }
   }
 }
 

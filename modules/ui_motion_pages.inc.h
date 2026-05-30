@@ -39,6 +39,7 @@ __APP_NAV__
     <h3>Settings</h3>
     <div class="cg"><a href="/motion/graph" style="color:#7dd3fc;text-decoration:none">Open Motion Graph</a></div>
     <div class="cg"><label><input id="enabled" type="checkbox"> Enable motion detection</label></div>
+    <div class="small">After enabling, motion detection arms after a fixed 10-second delay.</div>
 
     <div class="cg"><label><input id="capture_image" type="checkbox"> Capture image(s) on motion</label></div>
     <div class="cg row">
@@ -73,6 +74,7 @@ __APP_NAV__
       <label for="notify_url">Notify URL (GET on motion detect)</label>
       <input id="notify_url" type="url" placeholder="http://example.local/motion">
     </div>
+    <div class="cg"><label><input id="notify_enabled" type="checkbox"> Enable notify URL request</label></div>
 
     <div class="cg"><label><input id="standby_after_inactivity" type="checkbox"> Enter standby after 2 minutes of inactivity</label></div>
     <div class="small">Inactivity means no authenticated URL requests and no motion triggers. PIR wake uses GPIO13 HIGH with pulldown.</div>
@@ -105,6 +107,7 @@ function buildPayload(){
     videoDurationSec:asInt(id('video_duration_sec').value,5),
     detectionIntervalSec:asInt(id('detection_interval_sec').value,0),
     notifyUrl:id('notify_url').value||'',
+    notifyEnabled:id('notify_enabled').checked?1:0,
     standbyAfterInactivity:id('standby_after_inactivity').checked?1:0
   };
 }
@@ -173,6 +176,7 @@ function loadConfig(){
     id('video_duration_sec').value=c.videoDurationSec;
     id('detection_interval_sec').value=String(c.detectionIntervalSec||0);
     id('notify_url').value=c.notifyUrl||'';
+    id('notify_enabled').checked=!!c.notifyEnabled;
     id('standby_after_inactivity').checked=!!c.standbyAfterInactivity;
   }).catch(function(e){setStatus(e.message,true);});
 }
@@ -185,6 +189,7 @@ bindAutoSave('capture_video');
 bindAutoSave('video_duration_sec');
 bindAutoSave('detection_interval_sec');
 bindAutoSave('notify_url');
+bindAutoSave('notify_enabled');
 bindAutoSave('standby_after_inactivity');
 id('standby_now').addEventListener('click',standbyNow);
 loadConfig();

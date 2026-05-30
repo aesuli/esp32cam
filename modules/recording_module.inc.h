@@ -463,6 +463,15 @@ static bool stopRecordingSessionInternal(String &message) {
   return ok;
 }
 
+static bool stopRecordingSessionWithOverride(String &message) {
+  bool ok = stopRecordingSessionInternal(message);
+  if (ok) {
+    motionVideoManagedRecording = false;
+    motionRecordingStopAt = 0;
+  }
+  return ok;
+}
+
 static void handleRecordStart() {
   if (!checkAuth()) return;
 
@@ -475,7 +484,7 @@ static void handleRecordStop() {
   if (!checkAuth()) return;
 
   String message;
-  bool ok = stopRecordingSessionInternal(message);
+  bool ok = stopRecordingSessionWithOverride(message);
   server.send(ok ? 200 : 400, "text/plain", message);
 }
 
