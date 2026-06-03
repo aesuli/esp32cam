@@ -165,6 +165,7 @@ static bool   motionLatched = false;
 static bool   motionToggleButtonStableHigh = false;
 static bool   motionToggleButtonLastReadingHigh = false;
 static bool   motionToggleButtonLongPressHandled = false;
+static uint8_t motionToggleButtonClickCount = 0;
 static volatile bool motionEdgePending = false;
 static volatile uint32_t motionEdgeCount = 0;
 static uint8_t motionPendingImages = 0;
@@ -186,6 +187,7 @@ static unsigned long motionLastDetectedAt = 0;
 static unsigned long motionLastActivityAt = 0;
 static unsigned long motionToggleButtonLastChangeAt = 0;
 static unsigned long motionToggleButtonPressedAt = 0;
+static unsigned long motionToggleButtonClickDeadlineAt = 0;
 static unsigned long motionNextImageAt = 0;
 static unsigned long motionRecordingStopAt = 0;
 static unsigned long motionIgnoreUntilAt = 0;
@@ -197,6 +199,7 @@ static constexpr unsigned long MOTION_NOTIFY_RETRY_INTERVAL_MS = 5000;
 static constexpr unsigned long MOTION_ENABLE_ACTIVATION_DELAY_MS = 10000;
 static constexpr unsigned long MOTION_TOGGLE_DEBOUNCE_MS = 40;
 static constexpr unsigned long MOTION_TOGGLE_LONG_PRESS_MS = 1000;
+static constexpr unsigned long MOTION_TOGGLE_DOUBLE_CLICK_GAP_MS = 550;
 static constexpr unsigned long STANDBY_INACTIVITY_TIMEOUT_MS = 120000;
 static constexpr unsigned long STANDBY_RESPONSE_GRACE_MS = 200;
 static unsigned long cameraIdleTimeoutMs = 3000;
@@ -639,6 +642,7 @@ struct StoredConfig {
   std::vector<WifiCredential> wifiList;
   String adminPass;
   String deviceName;
+  bool wifiEnabled = true;
   bool hasCameraSettings = false;
   CameraSettings cameraSettings;
   MotionSettings motionSettings;
@@ -727,6 +731,8 @@ static bool sendMotionNotifyRequest(const String &url);
 static bool isValidRuntimeTxPowerValue(int value);
 static wifi_power_t validatedTxPowerValue(int configuredValue, wifi_power_t fallback, const char *label);
 static void setWifiModemSleep(bool enabled, const char *reason = nullptr);
+static bool applyWifiEnabledRuntimeState(bool enabled, bool showLedFeedback);
+static bool persistWifiEnabledAndApply(bool enabled, const char *reason);
 static void registerCameraRoutes();
 static void startAuxHttpServers();
 static void startOtaRecoveryAPMode();
@@ -1464,6 +1470,10 @@ static bool connectToSavedStaNetworks(bool showLedFeedback, bool initializeCamer
 }
 
 static void serviceStaReconnect() {
+  if (!runtimeConfig.wifiEnabled) {
+    return;
+  }
+
   if (!staConnectedAtBoot) {
     return;
   }
@@ -2333,6 +2343,7 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
   appendField(plain, cfg.motionSettings.notifyUrl);
   appendU8(plain, cfg.motionSettings.standbyAfterInactivity ? 1 : 0);
   appendU8(plain, cfg.motionSettings.notifyEnabled ? 1 : 0);
+  appendU8(plain, cfg.wifiEnabled ? 1 : 0);
 
   return encryptPayload(plain, ivHex, cipherHex);
 }
@@ -2417,6 +2428,12 @@ static bool decryptConfig(const String &ivHex, const String &cipherHex, StoredCo
   uint8_t notifyEnabled = 0;
   if (!readU8(plain, offset, notifyEnabled)) return false;
   cfg.motionSettings.notifyEnabled = (notifyEnabled != 0);
+
+  uint8_t wifiEnabled = 1;
+  if (offset < plain.size()) {
+    if (!readU8(plain, offset, wifiEnabled)) return false;
+  }
+  cfg.wifiEnabled = (wifiEnabled != 0);
 
   cfg.motionSettings.enabled = (motionEnabled != 0);
   cfg.motionSettings.captureImage = (motionCaptureImage != 0);
@@ -3858,6 +3875,112 @@ static void startSTAMode() {
   startCameraAPMode();
 }
 
+static bool applyWifiEnabledRuntimeState(bool enabled, bool showLedFeedback) {
+  if (!enabled) {
+    setWifiModemSleep(false, "wifi-disabled");
+    WiFi.setSleep(false);
+    WiFi.disconnect(true, false);
+    WiFi.softAPdisconnect(true);
+    WiFi.mode(WIFI_OFF);
+    staLinkUp = false;
+    staConnectedAtBoot = false;
+    lastStaReconnectAttemptAt = 0;
+    Logger.LogLine("[WIFI] Disabled by RX double-click");
+    return true;
+  }
+
+  if (otaRecoveryModeActive) {
+    bool ok = startSoftAPWithRetries(AP_OTA_RECOVERY_SSID, nullptr);
+    if (!ok) {
+      Logger.LogLine("[WIFI] Failed to enable OTA recovery AP");
+      return false;
+    }
+    WiFi.setSleep(false);
+    wifiModemSleepEnabled = false;
+    Logger.Log("[WIFI] OTA recovery AP re-enabled — SSID: %s  IP: %s\n",
+      AP_OTA_RECOVERY_SSID,
+      WiFi.softAPIP().toString().c_str());
+    return true;
+  }
+
+  if (!isConfigured) {
+    bool ok = startSoftAPWithRetries(AP_SETUP_SSID, AP_SETUP_PASS);
+    if (!ok) {
+      Logger.LogLine("[WIFI] Failed to enable setup AP");
+      return false;
+    }
+    wifiModemSleepEnabled = false;
+    if (showLedFeedback) {
+      ledSetupAPSequence();
+    }
+    Logger.Log("[WIFI] Setup AP re-enabled — SSID: %s  IP: %s\n",
+      AP_SETUP_SSID,
+      WiFi.softAPIP().toString().c_str());
+    return true;
+  }
+
+  if (connectToSavedStaNetworks(showLedFeedback, false)) {
+    staConnectedAtBoot = true;
+    lastStaReconnectAttemptAt = millis();
+    Logger.LogLine("[WIFI] Enabled by RX double-click (STA)");
+    return true;
+  }
+
+  staConnectedAtBoot = false;
+  String apHostname = buildNetworkHostname(cfgDeviceName);
+  String apSsid = buildFallbackApSsid();
+  bool apStarted = startSoftAPWithRetries(apSsid.c_str(), cfgAccessPass.c_str(), apHostname.c_str());
+  if (!apStarted) {
+    Logger.LogLine("[WIFI] Failed to enable fallback AP");
+    return false;
+  }
+
+  wifi_power_t apTxPower = validatedTxPowerValue((int)runtimeConfig.txPowerAp, DEFAULT_TX_POWER_AP, "AP");
+  WiFi.setTxPower(apTxPower);
+  if (AP_FALLBACK_MODEM_SLEEP_ENABLED) {
+    WiFi.setSleep(true);
+    wifiModemSleepEnabled = true;
+  } else {
+    WiFi.setSleep(false);
+    wifiModemSleepEnabled = false;
+  }
+
+  if (showLedFeedback) {
+    ledFallbackAPSequence();
+  }
+
+  Logger.Log("[WIFI] Fallback AP re-enabled — SSID: %s  IP: %s\n",
+    apSsid.c_str(), WiFi.softAPIP().toString().c_str());
+  return true;
+}
+
+static bool persistWifiEnabledAndApply(bool enabled, const char *reason) {
+  if (!sdCardAvailableAtBoot) {
+    Logger.LogLine("[WIFI] Cannot persist WiFi state without SD card");
+    return false;
+  }
+
+  if (runtimeConfig.wifiEnabled != enabled) {
+    StoredConfig updated = runtimeConfig;
+    updated.wifiEnabled = enabled;
+    if (!persistRuntimeConfig(updated)) {
+      Logger.LogLine("[WIFI] Failed to persist WiFi enabled state");
+      return false;
+    }
+  }
+
+  if (!applyWifiEnabledRuntimeState(enabled, true)) {
+    Logger.Log("[WIFI] Runtime apply failed after %s; state will apply on reboot\n",
+      reason ? reason : "toggle");
+    return false;
+  }
+
+  Logger.Log("[WIFI] WiFi %s (%s)\n",
+    enabled ? "enabled" : "disabled",
+    reason ? reason : "toggle");
+  return true;
+}
+
 static void servicePendingFirmwareRestart() {
   if (!firmwareUploadSuccess || firmwareRestartAt == 0) {
     return;
@@ -4009,6 +4132,8 @@ static void applyMotionToggleButtonInputMode() {
   motionToggleButtonLongPressHandled = false;
   motionToggleButtonPressedAt = initialHigh ? millis() : 0;
   motionToggleButtonLastChangeAt = millis();
+  motionToggleButtonClickCount = 0;
+  motionToggleButtonClickDeadlineAt = 0;
 }
 
 static void serviceMotionToggleButton() {
@@ -4035,6 +4160,8 @@ static void serviceMotionToggleButton() {
     motionToggleButtonPressedAt = 0;
     if (motionToggleButtonLongPressHandled) {
       motionToggleButtonLongPressHandled = false;
+      motionToggleButtonClickCount = 0;
+      motionToggleButtonClickDeadlineAt = 0;
       return;
     }
 
@@ -4046,6 +4173,35 @@ static void serviceMotionToggleButton() {
         ledBlink(500, 200);
       } else {
         Logger.Log("[REC] RX button stop failed: %s\n", message.c_str());
+      }
+      motionToggleButtonClickCount = 0;
+      motionToggleButtonClickDeadlineAt = 0;
+      return;
+    }
+
+    if (motionToggleButtonClickCount < UINT8_MAX) {
+      ++motionToggleButtonClickCount;
+    }
+    motionToggleButtonClickDeadlineAt = now + MOTION_TOGGLE_DOUBLE_CLICK_GAP_MS;
+    return;
+  }
+
+  if (motionToggleButtonClickCount == 0 || motionToggleButtonClickDeadlineAt == 0) {
+    // No pending single/double-click action.
+  } else if ((long)(now - motionToggleButtonClickDeadlineAt) >= 0) {
+    uint8_t clickCount = motionToggleButtonClickCount;
+    motionToggleButtonClickCount = 0;
+    motionToggleButtonClickDeadlineAt = 0;
+
+    if (clickCount >= 2) {
+      bool enableWifi = !runtimeConfig.wifiEnabled;
+      if (persistWifiEnabledAndApply(enableWifi, "rx-double-click")) {
+        if (!enableWifi) {
+          ledBlink(500, 200);
+        }
+      } else {
+        Logger.LogLine("[WIFI] RX double-click failed");
+        ledBlinkCount(4, 40, 40);
       }
       return;
     }
@@ -4081,6 +4237,8 @@ static void serviceMotionToggleButton() {
 
   if ((now - motionToggleButtonPressedAt) >= MOTION_TOGGLE_LONG_PRESS_MS) {
     motionToggleButtonLongPressHandled = true;
+    motionToggleButtonClickCount = 0;
+    motionToggleButtonClickDeadlineAt = 0;
     motionLastActivityAt = now;
 
     String message;
@@ -4183,6 +4341,12 @@ static void startInitialNetworkServices() {
   if (!sdCardAvailableAtBoot) {
     Logger.LogLine("[BOOT] SD missing at boot - starting OTA recovery AP mode");
     startOtaRecoveryAPMode();
+    return;
+  }
+
+  if (!runtimeConfig.wifiEnabled) {
+    Logger.LogLine("[WIFI] Startup skipped: WiFi is disabled in persisted config");
+    applyWifiEnabledRuntimeState(false, false);
     return;
   }
 

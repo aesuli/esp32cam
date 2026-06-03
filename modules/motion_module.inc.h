@@ -416,6 +416,12 @@ static void serviceDeferredNetworkStartup() {
     return;
   }
 
+  if (!runtimeConfig.wifiEnabled) {
+    deferredNetworkStartupPending = false;
+    Logger.LogLine("[BOOT] Deferred network startup skipped: WiFi disabled");
+    return;
+  }
+
   if (motionActionWindowActive || motionPendingImages > 0 || motionVideoManagedRecording || recordingActive) {
     return;
   }
