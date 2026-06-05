@@ -218,24 +218,6 @@ static uint8_t *recordingWriteBuffer = nullptr;
 static size_t recordingWriteBufferCapacity = 0;
 static size_t recordingWriteBufferLen = 0;
 static unsigned long recordingLastFileSyncAt = 0;
-struct RecordingDurationStats {
-  uint32_t samples = 0;
-  uint32_t totalMs = 0;
-  uint32_t maxMs = 0;
-};
-struct RecordingTimingStats {
-  RecordingDurationStats capture;
-  RecordingDurationStats copy;
-  RecordingDurationStats write;
-  RecordingDurationStats fileWrite;
-  RecordingDurationStats sync;
-  RecordingDurationStats preview;
-  uint32_t previewPublished = 0;
-  uint32_t previewSkipped = 0;
-  uint64_t frameBytesTotal = 0;
-  uint64_t fileWriteBytes = 0;
-};
-static RecordingTimingStats recordingTimingStats;
 static File   sdUploadFile;
 static bool   sdUploadFailed = false;
 static bool   sdUploadBlocked = false;
@@ -722,8 +704,6 @@ static bool ensureCameraReady(TickType_t timeoutTicks = pdMS_TO_TICKS(5000));
 static void serviceCameraIdleTimeout();
 static bool isRecordingFrameDue(unsigned long now);
 static bool isDeviceBusy();
-static void noteRecordingDuration(RecordingDurationStats &stats, unsigned long elapsedMs);
-static uint32_t averageRecordingDurationMs(const RecordingDurationStats &stats);
 static bool recordFrameIfDue(const OwnedJpegFrame &frame, unsigned long now);
 static bool appendRecordingFrame(const OwnedJpegFrame &frame);
 static void stopRecordingSession(bool keepFile);
@@ -753,6 +733,7 @@ static void noteAuthenticatedWebActivity();
 static void closeMotionActionWindow();
 static bool captureImageToSD(String &savedPath);
 static bool startRecordingSessionInternal(String &message);
+static bool startManualRecordingSession(String &message);
 static bool stopRecordingSessionInternal(String &message);
 static bool stopRecordingSessionWithOverride(String &message);
 static void handleMotionGraphPage();
@@ -1738,10 +1719,7 @@ static bool flushRecordingWriteBuffer() {
   }
 
   size_t len = recordingWriteBufferLen;
-  unsigned long fileWriteStart = millis();
   size_t written = recordingFile.write(recordingWriteBuffer, len);
-  noteRecordingDuration(recordingTimingStats.fileWrite, millis() - fileWriteStart);
-  recordingTimingStats.fileWriteBytes += (uint64_t)written;
   if (written != len) {
     recordingWriteBufferLen = 0;
     return false;
@@ -1760,19 +1738,13 @@ static bool writeRecordingBytes(const uint8_t *data, size_t len) {
   }
 
   if (!recordingWriteBuffer || recordingWriteBufferCapacity == 0U) {
-    unsigned long fileWriteStart = millis();
     size_t written = recordingFile.write(data, len);
-    noteRecordingDuration(recordingTimingStats.fileWrite, millis() - fileWriteStart);
-    recordingTimingStats.fileWriteBytes += (uint64_t)written;
     return written == len;
   }
 
   while (len > 0U) {
     if (recordingWriteBufferLen == 0U && len >= recordingWriteBufferCapacity) {
-      unsigned long fileWriteStart = millis();
       size_t written = recordingFile.write(data, len);
-      noteRecordingDuration(recordingTimingStats.fileWrite, millis() - fileWriteStart);
-      recordingTimingStats.fileWriteBytes += (uint64_t)written;
       return written == len;
     }
 
@@ -1917,28 +1889,6 @@ static uint32_t gcdU32(uint32_t a, uint32_t b) {
   return a == 0U ? 1U : a;
 }
 
-static void resetRecordingTimingStats() {
-  recordingTimingStats = RecordingTimingStats();
-}
-
-static void noteRecordingDuration(RecordingDurationStats &stats, unsigned long elapsedMs) {
-  uint32_t elapsed = (uint32_t)elapsedMs;
-  ++stats.samples;
-
-  uint64_t total = (uint64_t)stats.totalMs + (uint64_t)elapsed;
-  stats.totalMs = total > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : (uint32_t)total;
-  if (elapsed > stats.maxMs) {
-    stats.maxMs = elapsed;
-  }
-}
-
-static uint32_t averageRecordingDurationMs(const RecordingDurationStats &stats) {
-  if (stats.samples == 0U) {
-    return 0U;
-  }
-  return (uint32_t)(((uint64_t)stats.totalMs + (stats.samples / 2U)) / stats.samples);
-}
-
 static void resetRecordingState() {
   recordingActive = false;
   recordingStartTime = 0;
@@ -1952,7 +1902,6 @@ static void resetRecordingState() {
   recordingIndexEnabled = true;
   recordingPath = "";
   std::vector<AviIndexEntry>().swap(recordingIndex);
-  resetRecordingTimingStats();
   releaseRecordingWriteBuffer();
 }
 
@@ -3986,7 +3935,7 @@ static void handleStatus() {
         return;
     }
 
-    char json[512];
+    char json[640];
     snprintf(json, sizeof(json),
         "{"
         "\"framesize\":%u,"
@@ -4016,7 +3965,8 @@ static void handleStatus() {
         "\"colorbar\":%u,"
         "\"stream_visible\":%u,"
         "\"view_rotate_90\":%u,"
-        "\"recording_active\":%u"
+        "\"recording_active\":%u,"
+        "\"recording_motion\":%u"
         "}",
         s->status.framesize,   s->status.quality,
         s->status.brightness,  s->status.contrast,
@@ -4033,7 +3983,8 @@ static void handleStatus() {
         s->status.colorbar,
         runtimeConfig.cameraSettings.streamVisible ? 1U : 0U,
         runtimeConfig.cameraSettings.viewRotate90 ? 1U : 0U,
-        recordingActive ? 1U : 0U
+        recordingActive ? 1U : 0U,
+        motionVideoManagedRecording ? 1U : 0U
     );
 
     server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -4542,6 +4493,8 @@ static void finalizeMotionStartupConfig() {
     ++motionEdgeCount;
     motionRawHigh = true;
     motionLastActivityAt = millis();
+    deferredNetworkStartupPending = true;
+    Logger.LogLine("[BOOT] PIR wake detected - deferring network startup until motion actions complete");
   }
   updateSdLoggingState();
 }
@@ -4660,14 +4613,23 @@ static void serviceMotionToggleButton() {
 
     String message;
     if (recordingActive) {
-      if (stopRecordingSessionWithOverride(message)) {
-        Logger.Log("[REC] %s (RX button)\n", message.c_str());
-        ledBlinkCount(4, 60, 60);
+      if (motionVideoManagedRecording) {
+        if (startManualRecordingSession(message)) {
+          Logger.Log("[REC] %s (RX button takeover)\n", message.c_str());
+          ledBlinkCount(3, 60, 60);
+        } else {
+          Logger.Log("[REC] RX button takeover failed: %s\n", message.c_str());
+        }
       } else {
-        Logger.Log("[REC] RX button stop failed: %s\n", message.c_str());
+        if (stopRecordingSessionWithOverride(message)) {
+          Logger.Log("[REC] %s (RX button)\n", message.c_str());
+          ledBlinkCount(4, 60, 60);
+        } else {
+          Logger.Log("[REC] RX button stop failed: %s\n", message.c_str());
+        }
       }
     } else {
-      if (startRecordingSessionInternal(message)) {
+      if (startManualRecordingSession(message)) {
         Logger.Log("[REC] %s (RX button)\n", message.c_str());
         ledBlinkCount(3, 60, 60);
       } else {
@@ -4773,6 +4735,11 @@ static void startInitialNetworkServices() {
   if (!runtimeConfig.wifiEnabled) {
     Logger.LogLine("[WIFI] Startup skipped: WiFi is disabled in persisted config");
     applyWifiEnabledRuntimeState(false, false);
+    return;
+  }
+
+  if (deferredNetworkStartupPending) {
+    Logger.LogLine("[BOOT] Network startup deferred");
     return;
   }
 

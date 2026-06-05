@@ -23,12 +23,20 @@ header h1{color:#e94560;font-size:1.3em}
 .form input,.form select{width:100%;padding:10px;box-sizing:border-box;background:#0f3460;color:#eee;border:1px solid #234573;border-radius:4px}
 .form button{background:#e94560;color:#fff;border:none;border-radius:4px;padding:8px 12px;cursor:pointer}
 .form button:hover{background:#c73652}
+.btn{background:#e94560;color:#fff;border:none;border-radius:4px;padding:8px 12px;cursor:pointer}
+.btn:hover{background:#c73652}
+.btn:disabled{opacity:.55;cursor:not-allowed}
 .status{min-height:20px;font-size:.85em;margin-top:10px;color:#7dd3fc}
 .status.error{color:#ff8a8a}
+.scan-row{display:grid;grid-template-columns:1fr auto;gap:8px;margin:10px 0 12px}
 .list{display:flex;flex-direction:column;gap:10px;margin-top:12px}
 .item{display:flex;justify-content:space-between;align-items:center;gap:10px;background:#0f3460;border-radius:6px;padding:10px 12px}
 .item button{background:#e94560;color:#fff;border:none;border-radius:4px;padding:6px 10px;cursor:pointer;font-size:.8em}
 .item button:hover{background:#c73652}
+.item-main{display:flex;flex-direction:column;gap:4px;min-width:0}
+.wifi-meta{font-size:.8em;color:#bbb}
+.wifi-actions{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.wifi-toggle{display:flex;align-items:center;gap:5px;font-size:.82em;color:#bbb}
 .empty{font-size:.85em;color:#bbb}
 @media (max-width:640px){.panel{margin:12px 0}.item{flex-direction:column;align-items:flex-start}}
 </style>
@@ -79,9 +87,9 @@ __APP_NAV__
       </div>
       <button type="submit">Add / Update</button>
     </form>
-    <div style="display:grid;grid-template-columns:1fr auto;gap:8px;margin:10px 0 12px">
+    <div class="scan-row">
       <select id="wifi_scan_list"><option value="">Scan & select</option></select>
-      <button onclick="scanWiFi()">Scan</button>
+      <button class="btn" onclick="scanWiFi()">Scan</button>
     </div>
     <div id="wifi_status" class="status"></div>
     <div class="list" id="wifi_list"></div>
@@ -349,7 +357,7 @@ function renderWiFiList(items){
       staticSummary=' • IP: '+item.ip;
     }
     var enabledChecked=item.enabled===false?'':' checked';
-    return '<div class="item"><div><strong>'+(i+1)+'. '+item.ssid+'</strong><span style="font-size:.8em;color:#bbb">'+(item.hasPassword?'Protected':'Open')+' • '+modeLabel+staticSummary+'</span></div><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><label style="display:flex;align-items:center;gap:5px;font-size:.82em;color:#bbb"><input type="checkbox" onchange="setWiFiEnabled('+i+',this.checked)"'+enabledChecked+'> Enabled</label><button onclick="editWiFi('+i+')">Edit</button><button onclick="moveWiFi('+i+',\'up\')"'+(i===0?' disabled':'')+'>↑</button><button onclick="moveWiFi('+i+',\'down\')"'+(i===items.length-1?' disabled':'')+'>↓</button><button onclick="deleteWiFi('+i+')">✕</button></div></div>';
+    return '<div class="item"><div class="item-main"><strong>'+(i+1)+'. '+item.ssid+'</strong>\n<span class="wifi-meta">'+(item.hasPassword?'Protected':'Open')+' • '+modeLabel+staticSummary+'</span></div><div class="wifi-actions"><button class="btn" onclick="editWiFi('+i+')">Edit</button><button class="btn" onclick="moveWiFi('+i+',\'up\')"'+(i===0?' disabled':'')+'>↑</button><button class="btn" onclick="moveWiFi('+i+',\'down\')"'+(i===items.length-1?' disabled':'')+'>↓</button><button class="btn" onclick="deleteWiFi('+i+')">✕</button>\n<label class="wifi-toggle"><input type="checkbox" onchange="setWiFiEnabled('+i+',this.checked)"'+enabledChecked+'> Enabled</label></div></div>';
   }).join('');
 }
 function setWiFiEnabled(i,enabled){

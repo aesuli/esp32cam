@@ -326,16 +326,11 @@ static bool recordFrameIfDue(const OwnedJpegFrame &frame, unsigned long now) {
       (recordingLastFrameAt == 0 || (now - recordingLastFrameAt) >= RECORDING_FRAME_INTERVAL_MS)) {
     ScopedSdLock sdLock(pdMS_TO_TICKS(SD_SHORT_LOCK_TIMEOUT_MS));
     if (sdLock.locked()) {
-      unsigned long writeStart = millis();
       ok = appendRecordingFrame(frame);
-      noteRecordingDuration(recordingTimingStats.write, millis() - writeStart);
       if (ok) {
-        recordingTimingStats.frameBytesTotal += (uint64_t)frame.len;
         recordingLastFrameAt = now;
         ++recordingFrameCount;
-        unsigned long syncStart = millis();
         bool synced = syncRecordingFileIfDue(now);
-        noteRecordingDuration(recordingTimingStats.sync, millis() - syncStart);
         if (!synced) {
           ok = false;
           Logger.LogLine("[REC] Failed to sync buffered frame data; aborting recording");
@@ -365,17 +360,13 @@ static void serviceRecording() {
     return;
   }
 
-  unsigned long captureStart = millis();
   camera_fb_t *fb = lockAndCaptureFrame(pdMS_TO_TICKS(40));
-  noteRecordingDuration(recordingTimingStats.capture, millis() - captureStart);
   if (!fb) {
     return;
   }
 
   OwnedJpegFrame frame;
-  unsigned long copyStart = millis();
   bool copied = copyCameraFrame(fb, frame);
-  noteRecordingDuration(recordingTimingStats.copy, millis() - copyStart);
   unlockCameraFrame(fb);
   if (!copied) {
     return;
@@ -383,14 +374,7 @@ static void serviceRecording() {
 
   recordFrameIfDue(frame, now);
   if (recordingActive && streamClientConnected) {
-    unsigned long previewStart = millis();
-    bool published = publishStreamPreviewFrame(frame);
-    noteRecordingDuration(recordingTimingStats.preview, millis() - previewStart);
-    if (published) {
-      ++recordingTimingStats.previewPublished;
-    } else {
-      ++recordingTimingStats.previewSkipped;
-    }
+    publishStreamPreviewFrame(frame);
   }
 }
 
@@ -506,11 +490,24 @@ static bool stopRecordingSessionWithOverride(String &message) {
   return ok;
 }
 
+static bool startManualRecordingSession(String &message) {
+  if (recordingActive && motionVideoManagedRecording) {
+    String stopMessage;
+    if (!stopRecordingSessionWithOverride(stopMessage)) {
+      message = String("Failed to stop motion recording: ") + stopMessage;
+      return false;
+    }
+    Logger.Log("[REC] Motion recording stopped for manual takeover: %s\n", stopMessage.c_str());
+  }
+
+  return startRecordingSessionInternal(message);
+}
+
 static void handleRecordStart() {
   if (!checkAuth()) return;
 
   String message;
-  bool ok = startRecordingSessionInternal(message);
+  bool ok = startManualRecordingSession(message);
   server.send(ok ? 200 : 400, "text/plain", message);
 }
 

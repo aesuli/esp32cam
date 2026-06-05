@@ -126,6 +126,7 @@ __APP_NAV__
 __APP_FOOTER__
 <script>
 var recordingMode=false;
+var motionRecordingMode=false;
 var streamVisible=true;
 var viewRotate90=false;
 var streamUrl='http://'+window.location.hostname+':81/stream?t='+encodeURIComponent('__ROUTE_TOKEN__');
@@ -171,12 +172,14 @@ function setStreamVisibility(isVisible){
     releaseStream(true);
   }
 }
-function setRecordingState(isRecording,statusText){
+function setRecordingState(isRecording,statusText,isMotionRecording){
   var btn=id('rec_btn');
   var status=id('rec_status');
   recordingMode=!!isRecording;
+  if(isMotionRecording!==undefined){motionRecordingMode=!!isMotionRecording;}
+  else if(!recordingMode){motionRecordingMode=false;}
   btn.classList.toggle('recording',recordingMode);
-  btn.textContent=recordingMode?'⏹️ Stop':'⏺️ Record';
+  btn.textContent=recordingMode?(motionRecordingMode?'⏺️ Manual Record':'⏹️ Stop'):'⏺️ Record';
   if(statusText!==undefined){status.textContent=statusText;}
 }
 function updateStreamLayout(){
@@ -248,7 +251,7 @@ function applyStatus(s){
     setViewRotation(!!s.view_rotate_90);
   }
   setStreamVisibility(s.stream_visible!==undefined?!!s.stream_visible:true);
-  if(s.recording_active!==undefined){setRecordingState(!!s.recording_active,s.recording_active?'Recording...':'');}
+  if(s.recording_active!==undefined){setRecordingState(!!s.recording_active,s.recording_active?(s.recording_motion?'Motion recording...':'Recording...'):'',!!s.recording_motion);}
 }
 function loadStatus(){
   return fetch('/status').then(function(r){return r.json();}).then(function(s){
@@ -268,7 +271,7 @@ id('stream_toggle_btn').addEventListener('click',function(){
 });
 id('cap_btn').addEventListener('click',function(){fetch('/capture').then(function(r){if(r.ok)id('rec_status').textContent='Capture saved to /capture folder';});});
 id('rec_btn').addEventListener('click',function(){
-  if(recordingMode){
+  if(recordingMode&&!motionRecordingMode){
     fetch('/record/stop',{method:'POST'}).then(function(r){
       return r.text().then(function(msg){
         if(r.ok){setRecordingState(false,msg||'Recording saved.');}
@@ -277,7 +280,7 @@ id('rec_btn').addEventListener('click',function(){
   }else{
     fetch('/record/start',{method:'POST'}).then(function(r){
       return r.text().then(function(msg){
-        if(r.ok){setRecordingState(true,msg||'Recording...');}
+        if(r.ok){setRecordingState(true,msg||'Recording...',false);}
       });
     });
   }

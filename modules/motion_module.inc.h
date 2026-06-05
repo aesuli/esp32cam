@@ -249,12 +249,29 @@ static bool sendMotionNotifyRequest(const String &url) {
   return status > 0;
 }
 
+static void extendMotionRecording(unsigned long now, const char *source) {
+  motionVideoManagedRecording = true;
+  motionRecordingStopAt = now + ((unsigned long)runtimeConfig.motionSettings.videoDurationSec * 1000UL);
+  motionLastDetectedAt = now;
+  motionLastActivityAt = now;
+  Logger.Log("[MOTION] Extended recording stop deadline by %s to %lus\n",
+             source ? source : "motion",
+             (unsigned long)runtimeConfig.motionSettings.videoDurationSec);
+}
+
 static void triggerMotionEvent(const char *source) {
   if (!runtimeConfig.motionSettings.enabled) {
     return;
   }
 
   unsigned long now = millis();
+  if (recordingActive) {
+    if (motionVideoManagedRecording && runtimeConfig.motionSettings.captureVideo) {
+      extendMotionRecording(now, source);
+    }
+    return;
+  }
+
   motionActionWindowActive = true;
   motionLastDetectedAt = now;
   motionLastActivityAt = now;
@@ -272,11 +289,7 @@ static void triggerMotionEvent(const char *source) {
 
   if (runtimeConfig.motionSettings.captureVideo) {
     String message;
-    if (recordingActive) {
-      motionVideoManagedRecording = true;
-      motionRecordingStopAt = now + ((unsigned long)runtimeConfig.motionSettings.videoDurationSec * 1000UL);
-      Logger.Log("[MOTION] Extended recording stop deadline by motion to %lus\n", (unsigned long)runtimeConfig.motionSettings.videoDurationSec);
-    } else if (startRecordingSessionInternal(message)) {
+    if (startRecordingSessionInternal(message)) {
       motionVideoManagedRecording = true;
       motionRecordingStopAt = now + ((unsigned long)runtimeConfig.motionSettings.videoDurationSec * 1000UL);
       Logger.Log("[MOTION] %s\n", message.c_str());
@@ -310,7 +323,7 @@ static void serviceMotionDetection() {
   }
 
   unsigned long now = millis();
-  if (recordingActive) {
+  if (recordingActive && !motionVideoManagedRecording) {
     motionRawHigh = (digitalRead(PIR_GPIO) == HIGH);
     if (motionRawHigh) {
       if (motionHighSinceAt == 0) {
@@ -351,6 +364,14 @@ static void serviceMotionDetection() {
     edgeTriggered = true;
   }
   interrupts();
+
+  if (edgeTriggered && recordingActive && motionVideoManagedRecording &&
+      runtimeConfig.motionSettings.captureVideo) {
+    motionLatched = true;
+    motionHighSinceAt = now;
+    triggerMotionEvent("pir-edge");
+    return;
+  }
 
   if (edgeTriggered && !motionActionWindowActive && motionIgnoreUntilAt == 0) {
     motionLatched = true;
