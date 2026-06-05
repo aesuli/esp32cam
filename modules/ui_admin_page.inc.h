@@ -344,9 +344,21 @@ function renderWiFiList(items){
   if(!items.length){list.innerHTML='<div class="empty">No networks saved.</div>';return;}
   list.innerHTML=items.map(function(item,i){
     var modeLabel=item.netmode==='static'?'Static':'DHCP';
-    var dnsSummary=(item.dns1||item.dns2)?(' DNS: '+[(item.dns1||''),(item.dns2||'')].filter(Boolean).join(', ')):' DNS: auto';
-    return '<div class="item"><div><strong>'+(i+1)+'. '+item.ssid+'</strong><span style="font-size:.8em;color:#bbb">'+(item.hasPassword?'Protected':'Open')+' • '+modeLabel+dnsSummary+'</span></div><div style="display:flex;gap:6px"><button onclick="editWiFi('+i+')">Edit</button><button onclick="moveWiFi('+i+',\'up\')"'+(i===0?' disabled':'')+'>↑</button><button onclick="moveWiFi('+i+',\'down\')"'+(i===items.length-1?' disabled':'')+'>↓</button><button onclick="deleteWiFi('+i+')">✕</button></div></div>';
+    var staticSummary='';
+    if(item.netmode==='static'&&item.ip){
+      staticSummary=' • IP: '+item.ip;
+    }
+    var enabledChecked=item.enabled===false?'':' checked';
+    return '<div class="item"><div><strong>'+(i+1)+'. '+item.ssid+'</strong><span style="font-size:.8em;color:#bbb">'+(item.hasPassword?'Protected':'Open')+' • '+modeLabel+staticSummary+'</span></div><div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap"><label style="display:flex;align-items:center;gap:5px;font-size:.82em;color:#bbb"><input type="checkbox" onchange="setWiFiEnabled('+i+',this.checked)"'+enabledChecked+'> Enabled</label><button onclick="editWiFi('+i+')">Edit</button><button onclick="moveWiFi('+i+',\'up\')"'+(i===0?' disabled':'')+'>↑</button><button onclick="moveWiFi('+i+',\'down\')"'+(i===items.length-1?' disabled':'')+'>↓</button><button onclick="deleteWiFi('+i+')">✕</button></div></div>';
   }).join('');
+}
+function setWiFiEnabled(i,enabled){
+  fetch('/wifi/enabled',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({index:i,enabled:enabled?'1':'0'})}).then(function(r){
+    return r.text().then(function(msg){
+      setWiFiStatus(msg||'Saved',!r.ok);
+      if(r.ok){refreshWiFiList();}
+    });
+  }).catch(function(e){setWiFiStatus(e.message||'Failed to update network state',true);});
 }
 function editWiFi(i){
   var item=wifiCache[i];

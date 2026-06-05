@@ -631,6 +631,9 @@ video,img{width:100%;max-height:75vh;background:#000;border:1px solid #234573;bo
 .actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
 .actions a{background:#e94560;color:#fff;text-decoration:none;padding:8px 12px;border-radius:4px}
 .actions a:hover{background:#c73652}
+.actions button{background:#2f7fc3;color:#fff;border:0;padding:8px 12px;border-radius:4px;cursor:pointer}
+.actions button:hover{background:#25669c}
+.hidden{display:none}
 </style>
 </head>
 <body>
@@ -642,6 +645,7 @@ __APP_NAV__
     <div class="meta">File: __FILENAME__</div>
     __PLAYER_MEDIA__
     <div class="actions">
+      <button id="playAgain" class="hidden" type="button">Play again</button>
       <a href="__MEDIA_URL__">Open Raw</a>
       <a href="__DOWNLOAD_URL__">Download</a>
     </div>
@@ -649,6 +653,72 @@ __APP_NAV__
   </div>
 </div>
 __APP_FOOTER__
+<script>
+(function(){
+  const video = document.querySelector('video');
+  const image = document.querySelector('img');
+  const replay = document.getElementById('playAgain');
+  if(!replay || (!video && !image)){
+    return;
+  }
+
+  if(image){
+    const baseSrc = image.currentSrc || image.src;
+    replay.classList.remove('hidden');
+    replay.addEventListener('click', function(){
+      const separator = baseSrc.indexOf('?') >= 0 ? '&' : '?';
+      image.src = baseSrc + separator + '_r=' + Date.now();
+    });
+    return;
+  }
+
+  function atEnd(){
+    if(!Number.isFinite(video.duration) || video.duration <= 0){
+      return false;
+    }
+    return (video.duration - video.currentTime) <= 0.2;
+  }
+
+  function syncReplayVisibility(){
+    if(video.ended || (video.paused && atEnd())){
+      replay.classList.remove('hidden');
+    } else {
+      replay.classList.add('hidden');
+    }
+  }
+
+  video.addEventListener('ended', function(){
+    syncReplayVisibility();
+  });
+
+  video.addEventListener('play', function(){
+    syncReplayVisibility();
+  });
+
+  video.addEventListener('pause', function(){
+    syncReplayVisibility();
+  });
+
+  video.addEventListener('timeupdate', function(){
+    syncReplayVisibility();
+  });
+
+  video.addEventListener('seeked', function(){
+    syncReplayVisibility();
+  });
+
+  video.addEventListener('loadedmetadata', function(){
+    syncReplayVisibility();
+  });
+
+  replay.addEventListener('click', function(){
+    video.currentTime = 0;
+    video.play();
+  });
+
+  syncReplayVisibility();
+})();
+</script>
 </body>
 </html>)html";
 

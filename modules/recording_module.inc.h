@@ -199,6 +199,10 @@ static bool finalizeRecordingFile() {
     durationMs = elapsedMs == 0UL ? 1U : (uint32_t)elapsedMs;
   }
 
+  if (!flushRecordingWriteBuffer()) {
+    return false;
+  }
+
   bool writeIndex = recordingIndexEnabled && recordingIndex.size() == recordingFrameCount;
   if (writeIndex) {
     uint32_t indexSize = (uint32_t)recordingIndex.size() * 16UL;
@@ -248,6 +252,10 @@ static void stopRecordingSession(bool keepFile) {
   }
 
   resetRecordingState();
+  resetStreamPreviewFrame();
+  if (!streamClientConnected) {
+    setWifiModemSleep(true, "idle");
+  }
 }
 
 static bool appendRecordingFrame(const OwnedJpegFrame &frame) {
@@ -277,16 +285,16 @@ static bool appendRecordingFrame(const OwnedJpegFrame &frame) {
     return false;
   }
 
-  if (!writeAviChunkHeader(recordingFile, AVI_VIDEO_CHUNK_ID, entry.size)) {
+  if (!writeRecordingAviChunkHeader(AVI_VIDEO_CHUNK_ID, entry.size)) {
     return false;
   }
-  if (!writeMjpegFramePayload(recordingFile, frame.data, frame.len)) {
+  if (!writeRecordingMjpegFramePayload(frame.data, frame.len)) {
     return false;
   }
 
   if (padding != 0U) {
     uint8_t zero = 0;
-    if (recordingFile.write(&zero, 1) != 1) {
+    if (!writeRecordingBytes(&zero, 1)) {
       return false;
     }
   }
@@ -318,12 +326,20 @@ static bool recordFrameIfDue(const OwnedJpegFrame &frame, unsigned long now) {
       (recordingLastFrameAt == 0 || (now - recordingLastFrameAt) >= RECORDING_FRAME_INTERVAL_MS)) {
     ScopedSdLock sdLock(pdMS_TO_TICKS(SD_SHORT_LOCK_TIMEOUT_MS));
     if (sdLock.locked()) {
+      unsigned long writeStart = millis();
       ok = appendRecordingFrame(frame);
+      noteRecordingDuration(recordingTimingStats.write, millis() - writeStart);
       if (ok) {
+        recordingTimingStats.frameBytesTotal += (uint64_t)frame.len;
         recordingLastFrameAt = now;
         ++recordingFrameCount;
-        if ((recordingFrameCount % 10U) == 0U) {
-          recordingFile.flush();
+        unsigned long syncStart = millis();
+        bool synced = syncRecordingFileIfDue(now);
+        noteRecordingDuration(recordingTimingStats.sync, millis() - syncStart);
+        if (!synced) {
+          ok = false;
+          Logger.LogLine("[REC] Failed to sync buffered frame data; aborting recording");
+          stopRecordingSession(false);
         }
       } else {
         Logger.LogLine("[REC] Failed to write frame; aborting recording");
@@ -336,7 +352,7 @@ static bool recordFrameIfDue(const OwnedJpegFrame &frame, unsigned long now) {
 }
 
 static void serviceRecording() {
-  if (!recordingActive || streamClientConnected) {
+  if (!recordingActive) {
     return;
   }
 
@@ -345,23 +361,37 @@ static void serviceRecording() {
     return;
   }
 
-  if (!ensureCameraReady(pdMS_TO_TICKS(1000))) {
+  if (!ensureCameraReady(pdMS_TO_TICKS(40))) {
     return;
   }
 
-  camera_fb_t *fb = lockAndCaptureFrame(pdMS_TO_TICKS(1000));
+  unsigned long captureStart = millis();
+  camera_fb_t *fb = lockAndCaptureFrame(pdMS_TO_TICKS(40));
+  noteRecordingDuration(recordingTimingStats.capture, millis() - captureStart);
   if (!fb) {
     return;
   }
 
   OwnedJpegFrame frame;
+  unsigned long copyStart = millis();
   bool copied = copyCameraFrame(fb, frame);
+  noteRecordingDuration(recordingTimingStats.copy, millis() - copyStart);
   unlockCameraFrame(fb);
   if (!copied) {
     return;
   }
 
   recordFrameIfDue(frame, now);
+  if (recordingActive && streamClientConnected) {
+    unsigned long previewStart = millis();
+    bool published = publishStreamPreviewFrame(frame);
+    noteRecordingDuration(recordingTimingStats.preview, millis() - previewStart);
+    if (published) {
+      ++recordingTimingStats.previewPublished;
+    } else {
+      ++recordingTimingStats.previewSkipped;
+    }
+  }
 }
 
 static bool startRecordingSessionInternal(String &message) {
@@ -418,6 +448,10 @@ static bool startRecordingSessionInternal(String &message) {
     }
   }
 
+  recordingLock.release();
+  if (ok) {
+    setWifiModemSleep(false, "active recording");
+  }
   return ok;
 }
 

@@ -92,7 +92,7 @@ static constexpr uint32_t CAMERA_XCLK_FREQS_HZ[] = {
 
 // ─── SD configuration storage ──────────────────────────────────────────────────
 #define CONFIG_FILE_PATH "/config.enc"
-#define CONFIG_FILE_MAGIC "ESP32CAMCFG10"
+#define CONFIG_FILE_MAGIC "ESP32CAMCFG11"
 #define CAPTURE_COUNTER_FILE_PATH "/capture_counter.txt"
 #define SD_SORT_FILE_PATH "/.sort"
 
@@ -214,6 +214,28 @@ static uint32_t recordingMoviListSize = 4;
 static bool recordingIndexEnabled = true;
 static File   recordingFile;
 static String recordingPath;
+static uint8_t *recordingWriteBuffer = nullptr;
+static size_t recordingWriteBufferCapacity = 0;
+static size_t recordingWriteBufferLen = 0;
+static unsigned long recordingLastFileSyncAt = 0;
+struct RecordingDurationStats {
+  uint32_t samples = 0;
+  uint32_t totalMs = 0;
+  uint32_t maxMs = 0;
+};
+struct RecordingTimingStats {
+  RecordingDurationStats capture;
+  RecordingDurationStats copy;
+  RecordingDurationStats write;
+  RecordingDurationStats fileWrite;
+  RecordingDurationStats sync;
+  RecordingDurationStats preview;
+  uint32_t previewPublished = 0;
+  uint32_t previewSkipped = 0;
+  uint64_t frameBytesTotal = 0;
+  uint64_t fileWriteBytes = 0;
+};
+static RecordingTimingStats recordingTimingStats;
 static File   sdUploadFile;
 static bool   sdUploadFailed = false;
 static bool   sdUploadBlocked = false;
@@ -228,14 +250,16 @@ static bool captureSequenceLoaded = false;
 static SemaphoreHandle_t cameraMutex = nullptr;
 static SemaphoreHandle_t recordingMutex = nullptr;
 static SemaphoreHandle_t sdMutex = nullptr;
+static SemaphoreHandle_t streamPreviewMutex = nullptr;
 static TaskHandle_t streamServerTaskHandle = nullptr;
 static TaskHandle_t transferServerTaskHandle = nullptr;
 static constexpr unsigned long SD_SHORT_LOCK_TIMEOUT_MS = 100;
 static constexpr unsigned long SD_LONG_LOCK_TIMEOUT_MS = 1500;
 static constexpr unsigned long RECORDING_SHORT_LOCK_TIMEOUT_MS = 100;
 static constexpr unsigned long RECORDING_LONG_LOCK_TIMEOUT_MS = 1500;
-static constexpr unsigned long STREAM_FRAME_INTERVAL_MS = 100;
-static constexpr unsigned long RECORDING_FRAME_INTERVAL_MS = 100;
+static constexpr unsigned long STREAM_FRAME_INTERVAL_MS = 33;
+static constexpr unsigned long STREAM_CLOSE_WAIT_MS = 600;
+static constexpr unsigned long RECORDING_FRAME_INTERVAL_MS = 33;
 static constexpr unsigned long FIRMWARE_RESTART_DELAY_MS = 1500;
 // Keep short recordings seekable, but do not let manual-recording metadata
 // consume internal heap indefinitely.
@@ -245,6 +269,8 @@ static constexpr uint32_t AVI_HAS_INDEX_FLAG = 0x00000010UL;
 static constexpr uint32_t AVI_KEYFRAME_FLAG = 0x00000010UL;
 static constexpr size_t AVI_HEADER_SIZE = 224;
 static constexpr uint32_t AVI_MOVI_LIST_HEADER_SIZE = 4;
+static constexpr size_t RECORDING_WRITE_BUFFER_BYTES = 64U * 1024U;
+static constexpr unsigned long RECORDING_FILE_SYNC_INTERVAL_MS = 3000;
 static constexpr const char *CAPTURE_DIRECTORY = "/capture";
 static constexpr const char *AVI_VIDEO_CHUNK_ID = "00dc";
 static constexpr const char *SERIAL_LOG_FILE_PATH = "/log.txt";
@@ -597,9 +623,14 @@ struct OwnedJpegFrame {
   }
 };
 
+static OwnedJpegFrame streamPreviewFrame;
+static uint32_t streamPreviewSequence = 0;
+static bool streamPreviewPending = false;
+
 struct WifiCredential {
   String ssid;
   String wifiPass;
+  bool enabled = true;
   bool useStaticIp = false;
   String staticIp;
   String gateway;
@@ -685,10 +716,14 @@ static bool syncClockWithNtp();
 static camera_fb_t *lockAndCaptureFrame(TickType_t timeoutTicks = pdMS_TO_TICKS(1000));
 static void unlockCameraFrame(camera_fb_t *fb);
 static bool copyCameraFrame(camera_fb_t *fb, OwnedJpegFrame &frame);
+static bool publishStreamPreviewFrame(const OwnedJpegFrame &frame);
+static void resetStreamPreviewFrame();
 static bool ensureCameraReady(TickType_t timeoutTicks = pdMS_TO_TICKS(5000));
 static void serviceCameraIdleTimeout();
 static bool isRecordingFrameDue(unsigned long now);
 static bool isDeviceBusy();
+static void noteRecordingDuration(RecordingDurationStats &stats, unsigned long elapsedMs);
+static uint32_t averageRecordingDurationMs(const RecordingDurationStats &stats);
 static bool recordFrameIfDue(const OwnedJpegFrame &frame, unsigned long now);
 static bool appendRecordingFrame(const OwnedJpegFrame &frame);
 static void stopRecordingSession(bool keepFile);
@@ -1035,29 +1070,111 @@ static uint8_t *allocateFrameCopyBuffer(size_t len) {
   return buffer;
 }
 
-static bool copyCameraFrame(camera_fb_t *fb, OwnedJpegFrame &frame) {
+static bool copyJpegBufferToFrame(const uint8_t *data, size_t len, uint16_t width, uint16_t height, OwnedJpegFrame &frame) {
   frame.len = 0;
   frame.width = 0;
   frame.height = 0;
-  if (!fb || fb->format != PIXFORMAT_JPEG || !fb->buf || fb->len == 0U) {
+  if (!data || len == 0U) {
     return false;
   }
 
-  if (!frame.data || frame.capacity < fb->len) {
-    uint8_t *copy = allocateFrameCopyBuffer(fb->len);
+  if (!frame.data || frame.capacity < len) {
+    uint8_t *copy = allocateFrameCopyBuffer(len);
     if (!copy) {
       return false;
     }
     frame.release();
     frame.data = copy;
-    frame.capacity = fb->len;
+    frame.capacity = len;
   }
 
-  memcpy(frame.data, fb->buf, fb->len);
-  frame.len = fb->len;
-  frame.width = fb->width;
-  frame.height = fb->height;
+  memcpy(frame.data, data, len);
+  frame.len = len;
+  frame.width = width;
+  frame.height = height;
   return true;
+}
+
+static bool copyCameraFrame(camera_fb_t *fb, OwnedJpegFrame &frame) {
+  if (!fb || fb->format != PIXFORMAT_JPEG) {
+    frame.len = 0;
+    frame.width = 0;
+    frame.height = 0;
+    return false;
+  }
+  return copyJpegBufferToFrame(fb->buf, fb->len, fb->width, fb->height, frame);
+}
+
+static bool publishStreamPreviewFrame(const OwnedJpegFrame &frame) {
+  if (!streamClientConnected || !streamPreviewMutex || !frame.data || frame.len == 0U) {
+    return false;
+  }
+
+  SemaphoreLock previewLock(streamPreviewMutex, 0);
+  if (!previewLock.locked()) {
+    return false;
+  }
+
+  if (streamPreviewPending) {
+    return false;
+  }
+
+  if (!copyJpegBufferToFrame(frame.data, frame.len, frame.width, frame.height, streamPreviewFrame)) {
+    return false;
+  }
+
+  ++streamPreviewSequence;
+  streamPreviewPending = true;
+  return true;
+}
+
+static bool copyLatestStreamPreviewFrame(OwnedJpegFrame &frame, uint32_t &lastSeenSequence) {
+  if (!streamPreviewMutex) {
+    return false;
+  }
+
+  SemaphoreLock previewLock(streamPreviewMutex, 0);
+  if (!previewLock.locked()) {
+    return false;
+  }
+
+  if (streamPreviewFrame.len == 0U || streamPreviewSequence == lastSeenSequence) {
+    return false;
+  }
+
+  if (!copyJpegBufferToFrame(streamPreviewFrame.data,
+                             streamPreviewFrame.len,
+                             streamPreviewFrame.width,
+                             streamPreviewFrame.height,
+                             frame)) {
+    return false;
+  }
+
+  lastSeenSequence = streamPreviewSequence;
+  streamPreviewPending = false;
+  return true;
+}
+
+static void resetStreamPreviewFrame() {
+  if (!streamPreviewMutex) {
+    streamPreviewFrame.len = 0;
+    streamPreviewFrame.width = 0;
+    streamPreviewFrame.height = 0;
+    ++streamPreviewSequence;
+    streamPreviewPending = false;
+    return;
+  }
+
+  SemaphoreLock previewLock(streamPreviewMutex, pdMS_TO_TICKS(50));
+  if (!previewLock.locked()) {
+    return;
+  }
+
+  streamPreviewFrame.len = 0;
+  streamPreviewFrame.width = 0;
+  streamPreviewFrame.height = 0;
+  ++streamPreviewSequence;
+  streamPreviewPending = false;
 }
 
 static bool ensureCameraReady(TickType_t timeoutTicks) {
@@ -1364,13 +1481,32 @@ static bool connectToSavedStaNetworks(bool showLedFeedback, bool initializeCamer
     return false;
   }
 
+  size_t enabledCount = 0;
+  for (size_t i = 0; i < runtimeConfig.wifiList.size(); ++i) {
+    if (runtimeConfig.wifiList[i].enabled) {
+      ++enabledCount;
+    }
+  }
+
+  if (enabledCount == 0) {
+    Logger.LogLine("[WIFI] No enabled STA networks");
+    return false;
+  }
+
   WiFi.persistent(false);
   wifiModemSleepEnabled = false;
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(false);
 
+  size_t attemptIndex = 0;
   for (size_t i = 0; i < runtimeConfig.wifiList.size(); ++i) {
     const WifiCredential &wifi = runtimeConfig.wifiList[i];
+    if (!wifi.enabled) {
+      Logger.Log("[WIFI] Skipping disabled network: %s\n", wifi.ssid.c_str());
+      continue;
+    }
+
+    ++attemptIndex;
 
     // Hard reset STA state between credential attempts so each SSID starts
     // from a clean state machine and scan context.
@@ -1413,8 +1549,8 @@ static bool connectToSavedStaNetworks(bool showLedFeedback, bool initializeCamer
     }
 
     Logger.Log("[WIFI] Trying network %u/%u: %s\n",
-      (unsigned int)(i + 1),
-      (unsigned int)runtimeConfig.wifiList.size(),
+      (unsigned int)attemptIndex,
+      (unsigned int)enabledCount,
       wifi.ssid.c_str());
 
     int result = (int)WiFi.waitForConnectResult(STA_CONNECT_TIMEOUT_MS);
@@ -1566,6 +1702,161 @@ static String bytesToHex(const uint8_t *data, size_t len) {
   return out;
 }
 
+static void releaseRecordingWriteBuffer() {
+  if (recordingWriteBuffer) {
+    heap_caps_free(recordingWriteBuffer);
+    recordingWriteBuffer = nullptr;
+  }
+  recordingWriteBufferCapacity = 0;
+  recordingWriteBufferLen = 0;
+  recordingLastFileSyncAt = 0;
+}
+
+static void initRecordingWriteBuffer() {
+  releaseRecordingWriteBuffer();
+
+  if (RECORDING_WRITE_BUFFER_BYTES == 0U) {
+    return;
+  }
+
+  if (psramFound()) {
+    recordingWriteBuffer = (uint8_t *)heap_caps_malloc(RECORDING_WRITE_BUFFER_BYTES,
+                                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  }
+
+  if (recordingWriteBuffer) {
+    recordingWriteBufferCapacity = RECORDING_WRITE_BUFFER_BYTES;
+    Logger.Log("[REC] SD write buffer allocated: %u bytes\n", (unsigned int)recordingWriteBufferCapacity);
+  } else {
+    Logger.LogLine("[REC] SD write buffer unavailable; using direct writes");
+  }
+}
+
+static bool flushRecordingWriteBuffer() {
+  if (!recordingFile || recordingWriteBufferLen == 0U) {
+    return true;
+  }
+
+  size_t len = recordingWriteBufferLen;
+  unsigned long fileWriteStart = millis();
+  size_t written = recordingFile.write(recordingWriteBuffer, len);
+  noteRecordingDuration(recordingTimingStats.fileWrite, millis() - fileWriteStart);
+  recordingTimingStats.fileWriteBytes += (uint64_t)written;
+  if (written != len) {
+    recordingWriteBufferLen = 0;
+    return false;
+  }
+
+  recordingWriteBufferLen = 0;
+  return true;
+}
+
+static bool writeRecordingBytes(const uint8_t *data, size_t len) {
+  if (len == 0U) {
+    return true;
+  }
+  if (!data || !recordingFile) {
+    return false;
+  }
+
+  if (!recordingWriteBuffer || recordingWriteBufferCapacity == 0U) {
+    unsigned long fileWriteStart = millis();
+    size_t written = recordingFile.write(data, len);
+    noteRecordingDuration(recordingTimingStats.fileWrite, millis() - fileWriteStart);
+    recordingTimingStats.fileWriteBytes += (uint64_t)written;
+    return written == len;
+  }
+
+  while (len > 0U) {
+    if (recordingWriteBufferLen == 0U && len >= recordingWriteBufferCapacity) {
+      unsigned long fileWriteStart = millis();
+      size_t written = recordingFile.write(data, len);
+      noteRecordingDuration(recordingTimingStats.fileWrite, millis() - fileWriteStart);
+      recordingTimingStats.fileWriteBytes += (uint64_t)written;
+      return written == len;
+    }
+
+    size_t space = recordingWriteBufferCapacity - recordingWriteBufferLen;
+    if (space == 0U) {
+      if (!flushRecordingWriteBuffer()) {
+        return false;
+      }
+      continue;
+    }
+
+    size_t chunkLen = len < space ? len : space;
+    memcpy(recordingWriteBuffer + recordingWriteBufferLen, data, chunkLen);
+    recordingWriteBufferLen += chunkLen;
+    data += chunkLen;
+    len -= chunkLen;
+
+    if (recordingWriteBufferLen == recordingWriteBufferCapacity && !flushRecordingWriteBuffer()) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static bool syncRecordingFileIfDue(unsigned long now) {
+  if (!recordingFile) {
+    return false;
+  }
+
+  if (recordingLastFileSyncAt == 0UL) {
+    recordingLastFileSyncAt = now;
+    return true;
+  }
+
+  if ((now - recordingLastFileSyncAt) < RECORDING_FILE_SYNC_INTERVAL_MS) {
+    return true;
+  }
+
+  if (!flushRecordingWriteBuffer()) {
+    return false;
+  }
+  recordingFile.flush();
+  recordingLastFileSyncAt = now;
+  return true;
+}
+
+static bool writeRecordingFourCC(const char *fourcc) {
+  return writeRecordingBytes((const uint8_t *)fourcc, 4);
+}
+
+static bool writeRecordingU32LE(uint32_t value) {
+  uint8_t bytes[4] = {
+    (uint8_t)(value & 0xFF),
+    (uint8_t)((value >> 8) & 0xFF),
+    (uint8_t)((value >> 16) & 0xFF),
+    (uint8_t)((value >> 24) & 0xFF)
+  };
+  return writeRecordingBytes(bytes, sizeof(bytes));
+}
+
+static bool writeRecordingAviChunkHeader(const char *chunkId, uint32_t chunkSize) {
+  return writeRecordingFourCC(chunkId) && writeRecordingU32LE(chunkSize);
+}
+
+static bool writeRecordingMjpegFramePayload(const uint8_t *data, size_t len) {
+  if (!data || len == 0U) {
+    return false;
+  }
+
+  bool patchApp0 = len >= 10U
+    && data[0] == 0xFF && data[1] == 0xD8
+    && data[2] == 0xFF && data[3] == 0xE0
+    && data[6] == 'J' && data[7] == 'F' && data[8] == 'I' && data[9] == 'F';
+  if (!patchApp0) {
+    return writeRecordingBytes(data, len);
+  }
+
+  static const uint8_t avi1[4] = {'A', 'V', 'I', '1'};
+  return writeRecordingBytes(data, 6)
+      && writeRecordingBytes(avi1, sizeof(avi1))
+      && writeRecordingBytes(data + 10, len - 10U);
+}
+
 static bool writeFourCC(File &file, const char *fourcc) {
   return file.write((const uint8_t *)fourcc, 4) == 4;
 }
@@ -1626,6 +1917,28 @@ static uint32_t gcdU32(uint32_t a, uint32_t b) {
   return a == 0U ? 1U : a;
 }
 
+static void resetRecordingTimingStats() {
+  recordingTimingStats = RecordingTimingStats();
+}
+
+static void noteRecordingDuration(RecordingDurationStats &stats, unsigned long elapsedMs) {
+  uint32_t elapsed = (uint32_t)elapsedMs;
+  ++stats.samples;
+
+  uint64_t total = (uint64_t)stats.totalMs + (uint64_t)elapsed;
+  stats.totalMs = total > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : (uint32_t)total;
+  if (elapsed > stats.maxMs) {
+    stats.maxMs = elapsed;
+  }
+}
+
+static uint32_t averageRecordingDurationMs(const RecordingDurationStats &stats) {
+  if (stats.samples == 0U) {
+    return 0U;
+  }
+  return (uint32_t)(((uint64_t)stats.totalMs + (stats.samples / 2U)) / stats.samples);
+}
+
 static void resetRecordingState() {
   recordingActive = false;
   recordingStartTime = 0;
@@ -1639,6 +1952,8 @@ static void resetRecordingState() {
   recordingIndexEnabled = true;
   recordingPath = "";
   std::vector<AviIndexEntry>().swap(recordingIndex);
+  resetRecordingTimingStats();
+  releaseRecordingWriteBuffer();
 }
 
 static void disableRecordingIndex(const char *reason) {
@@ -1687,6 +2002,7 @@ static bool beginRecordingFile(const String &path) {
   }
 
   resetRecordingState();
+  resetStreamPreviewFrame();
 
   recordingFile = SD_MMC.open(path, FILE_WRITE);
   if (!recordingFile) {
@@ -1700,6 +2016,7 @@ static bool beginRecordingFile(const String &path) {
     return false;
   }
 
+  initRecordingWriteBuffer();
   recordingPath = path;
   recordingActive = true;
   recordingStartTime = millis();
@@ -1972,6 +2289,21 @@ static bool parseWifiNetworkMode(const String &rawMode, bool &useStaticIp) {
   }
   if (mode == "static") {
     useStaticIp = true;
+    return true;
+  }
+  return false;
+}
+
+static bool parseBoolString(const String &raw, bool &valueOut) {
+  String value = raw;
+  value.trim();
+  value.toLowerCase();
+  if (value == "1" || value == "true" || value == "on") {
+    valueOut = true;
+    return true;
+  }
+  if (value == "0" || value == "false" || value == "off") {
+    valueOut = false;
     return true;
   }
   return false;
@@ -2315,6 +2647,7 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
   for (size_t i = 0; i < cfg.wifiList.size(); ++i) {
     appendField(plain, cfg.wifiList[i].ssid);
     appendField(plain, cfg.wifiList[i].wifiPass);
+    appendU8(plain, cfg.wifiList[i].enabled ? 1 : 0);
     appendU8(plain, cfg.wifiList[i].useStaticIp ? 1 : 0);
     appendField(plain, cfg.wifiList[i].staticIp);
     appendField(plain, cfg.wifiList[i].gateway);
@@ -2366,9 +2699,12 @@ static bool decryptConfig(const String &ivHex, const String &cipherHex, StoredCo
   cfg.wifiList.reserve(wifiCount);
   for (uint16_t i = 0; i < wifiCount; ++i) {
     WifiCredential wifi;
+    uint8_t enabled = 1;
     uint8_t useStaticIp = 0;
     if (!readField(plain, offset, wifi.ssid)) return false;
     if (!readField(plain, offset, wifi.wifiPass)) return false;
+    if (!readU8(plain, offset, enabled)) return false;
+    wifi.enabled = (enabled != 0);
     if (!readU8(plain, offset, useStaticIp)) return false;
     wifi.useStaticIp = (useStaticIp != 0);
     if (!readField(plain, offset, wifi.staticIp)) return false;
@@ -2838,6 +3174,51 @@ static String buildLocalUrl(uint16_t port, const String &path, bool withToken) {
   return url;
 }
 
+static bool writeMjpegStreamFrame(WiFiClient &client, const uint8_t *data, size_t len) {
+  if (!data || len == 0U) {
+    return false;
+  }
+
+  char partHeader[128];
+  int hlen = snprintf(partHeader, sizeof(partHeader),
+      "--jpgbound\r\n"
+      "Content-Type: image/jpeg\r\n"
+      "Content-Length: %u\r\n"
+      "\r\n",
+      (unsigned int)len);
+  if (hlen <= 0 || (size_t)hlen >= sizeof(partHeader)) {
+    return false;
+  }
+
+  bool ok = (client.write((const uint8_t *)partHeader, (size_t)hlen) == (size_t)hlen);
+  if (ok) ok = (client.write(data, len) == len);
+  if (ok) ok = (client.print("\r\n") > 0);
+  return ok;
+}
+
+static bool streamCameraFramebufferDirect(WiFiClient &client) {
+  camera_fb_t *fb = lockAndCaptureFrame(pdMS_TO_TICKS(1000));
+  if (!fb) {
+    return true;
+  }
+
+  bool ok = fb->format == PIXFORMAT_JPEG && writeMjpegStreamFrame(client, fb->buf, fb->len);
+  unlockCameraFrame(fb);
+  return ok;
+}
+
+static void requestStreamClientCloseAndWait() {
+    if (!streamClientConnected) {
+      return;
+    }
+
+    streamClientAbortRequested = true;
+    unsigned long startedAt = millis();
+    while (streamClientConnected && (millis() - startedAt) < STREAM_CLOSE_WAIT_MS) {
+      delay(10);
+    }
+}
+
 static void handleStreamWorker() {
     if (!checkAuth(streamServer, true)) return;
 
@@ -2849,11 +3230,14 @@ static void handleStreamWorker() {
     setWifiModemSleep(false, "active stream");
 
     WiFiClient client = streamServer.client();
+    client.setNoDelay(true);
+    client.setTimeout(1000);
     Logger.LogLine("[STREAM] Client connected");
     streamClientAbortRequested = false;
     streamClientConnected = true;
     unsigned long lastFrameAt = 0;
     OwnedJpegFrame frame;
+    uint32_t lastPreviewSequence = 0;
 
     client.print(
         "HTTP/1.1 200 OK\r\n"
@@ -2878,50 +3262,44 @@ static void handleStreamWorker() {
             }
         }
 
-        camera_fb_t *fb = lockAndCaptureFrame(pdMS_TO_TICKS(1000));
-        if (!fb) {
-            delay(10);
-            continue;
+        bool ok = true;
+        if (recordingActive) {
+            if (!copyLatestStreamPreviewFrame(frame, lastPreviewSequence)) {
+                delay(5);
+                continue;
+            }
+            now = millis();
+            ok = writeMjpegStreamFrame(client, frame.data, frame.len);
+        } else {
+            now = millis();
+            ok = streamCameraFramebufferDirect(client);
         }
-
-        bool copied = copyCameraFrame(fb, frame);
-        unlockCameraFrame(fb);
-        if (!copied) {
-            delay(10);
-            continue;
-        }
-
-        now = millis();
-        recordFrameIfDue(frame, now);
-
-        char partHeader[128];
-        int hlen = snprintf(partHeader, sizeof(partHeader),
-            "--jpgbound\r\n"
-            "Content-Type: image/jpeg\r\n"
-            "Content-Length: %u\r\n"
-            "\r\n",
-            (unsigned int)frame.len);
-
-        bool ok = (client.write((const uint8_t *)partHeader, (size_t)hlen) == (size_t)hlen);
-        if (ok) ok = (client.write(frame.data, frame.len) == frame.len);
-        if (ok) ok = (client.print("\r\n") > 0);
 
         lastFrameAt = now;
 
         if (!ok) break;
+        lastCameraActivityAt = millis();
     }
 
     streamClientAbortRequested = false;
     streamClientConnected = false;
+    lastCameraActivityAt = millis();
     noteAuthenticatedWebActivity();
     client.stop();
-    setWifiModemSleep(true, "idle");
+    if (!recordingActive) {
+      setWifiModemSleep(true, "idle");
+    }
     Logger.LogLine("[STREAM] Client disconnected");
 }
 
 static void handleStreamMain() {
   if (!checkAuth(server)) {
     return;
+  }
+
+  if (streamClientConnected) {
+    Logger.LogLine("[STREAM] Replacing active stream client");
+    requestStreamClientCloseAndWait();
   }
 
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
@@ -2936,7 +3314,7 @@ static void handleStreamClose() {
   }
 
   if (streamClientConnected) {
-    streamClientAbortRequested = true;
+    requestStreamClientCloseAndWait();
     Logger.LogLine("[STREAM] Close requested by UI");
   }
 
@@ -3098,6 +3476,7 @@ static void handleSave() {
     WifiCredential wifi;
     wifi.ssid = newSSID;
     wifi.wifiPass = newWPass;
+    wifi.enabled = true;
     String wifiNetworkError;
     if (!parseWifiNetworkArgs(wifi, wifiNetworkError)) {
       server.send(HTTP_BAD_REQUEST, "text/plain", wifiNetworkError);
@@ -3230,6 +3609,9 @@ static void handleWifiList() {
   for (size_t i = 0; i < runtimeConfig.wifiList.size(); ++i) {
     if (i > 0) json += ',';
     json += "{\"ssid\":\"" + jsonEscape(runtimeConfig.wifiList[i].ssid) + "\",";
+    json += "\"enabled\":";
+    json += runtimeConfig.wifiList[i].enabled ? "true" : "false";
+    json += ",";
     json += "\"hasPassword\":";
     json += runtimeConfig.wifiList[i].wifiPass.isEmpty() ? "false" : "true";
     json += ",\"netmode\":\"";
@@ -3272,6 +3654,14 @@ static void handleWifiAdd() {
   incoming.ssid = newSSID;
   incoming.wifiPass = newWPass;
 
+  bool hasEnabledArg = server.hasArg("enabled");
+  bool requestedEnabled = true;
+  if (hasEnabledArg && !parseBoolString(server.arg("enabled"), requestedEnabled)) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Invalid enabled value");
+    return;
+  }
+  incoming.enabled = requestedEnabled;
+
   String wifiNetworkError;
   if (!parseWifiNetworkArgs(incoming, wifiNetworkError)) {
     server.send(HTTP_BAD_REQUEST, "text/plain", wifiNetworkError);
@@ -3282,6 +3672,9 @@ static void handleWifiAdd() {
   bool replaced = false;
   for (size_t i = 0; i < updated.wifiList.size(); ++i) {
     if (updated.wifiList[i].ssid == newSSID) {
+      if (!hasEnabledArg) {
+        incoming.enabled = updated.wifiList[i].enabled;
+      }
       updated.wifiList[i] = incoming;
       replaced = true;
       break;
@@ -3298,6 +3691,35 @@ static void handleWifiAdd() {
   }
 
   server.send(HTTP_OK, "text/plain", replaced ? "WiFi credential updated" : "WiFi credential added");
+}
+
+static void handleWifiSetEnabled() {
+  if (!checkAuth()) return;
+  if (!server.hasArg(PARAM_INDEX) || !server.hasArg("enabled")) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Index and enabled are required");
+    return;
+  }
+
+  int index = server.arg(PARAM_INDEX).toInt();
+  if (index < 0 || (size_t)index >= runtimeConfig.wifiList.size()) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Invalid WiFi index");
+    return;
+  }
+
+  bool enabled = false;
+  if (!parseBoolString(server.arg("enabled"), enabled)) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", "Invalid enabled value");
+    return;
+  }
+
+  StoredConfig updated = runtimeConfig;
+  updated.wifiList[index].enabled = enabled;
+  if (!persistRuntimeConfig(updated)) {
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to save configuration");
+    return;
+  }
+
+  server.send(HTTP_OK, "text/plain", enabled ? "WiFi credential enabled" : "WiFi credential disabled");
 }
 
 static void handleWifiDelete() {
@@ -4026,7 +4448,8 @@ static bool initializeRuntimeMutexes() {
   cameraMutex = xSemaphoreCreateMutex();
   recordingMutex = xSemaphoreCreateMutex();
   sdMutex = xSemaphoreCreateMutex();
-  return cameraMutex && recordingMutex && sdMutex;
+  streamPreviewMutex = xSemaphoreCreateMutex();
+  return cameraMutex && recordingMutex && sdMutex && streamPreviewMutex;
 }
 
 static void initializeWakeupIndicator() {
@@ -4167,13 +4590,7 @@ static void serviceMotionToggleButton() {
 
     motionLastActivityAt = now;
     if (recordingActive) {
-      String message;
-      if (stopRecordingSessionWithOverride(message)) {
-        Logger.Log("[REC] %s (RX button)\n", message.c_str());
-        ledBlink(500, 200);
-      } else {
-        Logger.Log("[REC] RX button stop failed: %s\n", message.c_str());
-      }
+      // While recording, reserve button control for long-press stop only.
       motionToggleButtonClickCount = 0;
       motionToggleButtonClickDeadlineAt = 0;
       return;
@@ -4231,7 +4648,7 @@ static void serviceMotionToggleButton() {
     return;
   }
 
-  if (!motionToggleButtonStableHigh || motionToggleButtonLongPressHandled || recordingActive || motionToggleButtonPressedAt == 0) {
+  if (!motionToggleButtonStableHigh || motionToggleButtonLongPressHandled || motionToggleButtonPressedAt == 0) {
     return;
   }
 
@@ -4242,11 +4659,20 @@ static void serviceMotionToggleButton() {
     motionLastActivityAt = now;
 
     String message;
-    if (startRecordingSessionInternal(message)) {
-      Logger.Log("[REC] %s (RX button)\n", message.c_str());
-      ledBlinkCount(3, 60, 60);
+    if (recordingActive) {
+      if (stopRecordingSessionWithOverride(message)) {
+        Logger.Log("[REC] %s (RX button)\n", message.c_str());
+        ledBlinkCount(4, 60, 60);
+      } else {
+        Logger.Log("[REC] RX button stop failed: %s\n", message.c_str());
+      }
     } else {
-      Logger.Log("[REC] RX button start failed: %s\n", message.c_str());
+      if (startRecordingSessionInternal(message)) {
+        Logger.Log("[REC] %s (RX button)\n", message.c_str());
+        ledBlinkCount(3, 60, 60);
+      } else {
+        Logger.Log("[REC] RX button start failed: %s\n", message.c_str());
+      }
     }
   }
 }
@@ -4388,8 +4814,8 @@ void loop() {
   server.handleClient();
   serviceNtpSync();
   serviceStaReconnect();
-  serviceRecording();
   serviceMotionToggleButton();
+  serviceRecording();
   serviceMotionDetection();
   serviceMotionActions();
   serviceDeferredNetworkStartup();

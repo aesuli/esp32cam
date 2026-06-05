@@ -329,6 +329,7 @@ static void registerAdminRoutes() {
   server.on("/admin/factory-reset", HTTP_POST, handleAdminFactoryReset);
   server.on("/wifi/list", HTTP_GET, handleWifiList);
   server.on("/wifi/add", HTTP_POST, handleWifiAdd);
+  server.on("/wifi/enabled", HTTP_POST, handleWifiSetEnabled);
   server.on("/wifi/delete", HTTP_POST, handleWifiDelete);
   server.on("/wifi/move", HTTP_POST, handleWifiMove);
 }

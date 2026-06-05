@@ -52,7 +52,7 @@ The web interface is composed of four main pages:
 - Flash on/off button
 - **Capture button**: saves a JPEG to `/capture/SEQUENCE-YYYYMMDD_HHMMSS.jpg`
 - **Record button**: starts/stops MJPEG AVI recording to `/capture/SEQUENCE-YYYYMMDD_HHMMSS.avi`
-- **RX button integration**: short press toggles motion detection when idle; long press starts recording; any short press while recording stops the recording
+- **RX button integration**: short press toggles motion detection when idle; long press starts/stops recording; double press toggles WiFi when not recording
 - Stream visibility toggle (show/hide stream)
 
 ### Motion page
