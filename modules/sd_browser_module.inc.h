@@ -95,7 +95,10 @@ static bool validateNewSDName(const String &name) {
 }
 
 static bool isProtectedSDPath(const String &path) {
-  return path == CONFIG_FILE_PATH || path == CAPTURE_COUNTER_FILE_PATH || path == SD_SORT_FILE_PATH;
+  return path == CONFIG_FILE_PATH
+      || path == CAPTURE_COUNTER_FILE_PATH
+      || path == TIMELAPSE_COUNTER_FILE_PATH
+      || path == SD_SORT_FILE_PATH;
 }
 
 static bool isHiddenSDPath(const String &path) {
@@ -158,7 +161,7 @@ static bool removeSDDirectoryRecursive(const String &dirPath, bool &blockedProte
 
 static void handleSDPage() {
   if (!checkAuth()) return;
-  sendAppHtmlWithToken(SD_HTML, AppPage::Sd);
+  sendAppHtmlWithToken(SD_HTML, AppPage::Sd, "SD Browser");
 }
 
 static void handleSDList() {
@@ -613,7 +616,7 @@ static void handleSDPlayerMain() {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32-CAM - SD Video</title>
+<title>__PAGE_TITLE__</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;min-height:100vh}
@@ -732,7 +735,7 @@ __APP_FOOTER__
     page.replace("__PLAYER_MEDIA__", "<video controls playsinline preload=\"metadata\" src=\"" + mediaUrl + "\" type=\"" + mime + "\"></video>");
     page.replace("__PLAYER_HINT__", "If playback does not start, your browser likely does not support this container/codec and may require download instead.");
   }
-  applyAppChrome(page, AppPage::Sd);
+  applyAppChrome(page, AppPage::Sd, "SD Browser");
   server.send(HTTP_OK, "text/html", page);
 }
 

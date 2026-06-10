@@ -7,7 +7,7 @@ static const char SETUP_HTML[] PROGMEM = R"html(<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32-CAM Setup</title>
+<title>__PAGE_TITLE__</title>
 <style>
 body{font-family:Arial,sans-serif;max-width:420px;margin:60px auto;
   background:#1a1a2e;color:#eee;padding:0 20px}

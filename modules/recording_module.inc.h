@@ -3,8 +3,38 @@
 // Still capture and MJPEG AVI recording implementation.
 // Included directly by esp32cam.cpp so it can share existing static firmware state.
 
-static bool captureImageToSD(String &savedPath) {
-  savedPath = "";
+static bool writeCapturedJpegToPath(const OwnedJpegFrame &frame, const String &path) {
+  if (!frame.data || frame.len == 0 || path.isEmpty()) {
+    return false;
+  }
+
+  ScopedSdLock sdLock(pdMS_TO_TICKS(SD_LONG_LOCK_TIMEOUT_MS));
+  if (!sdLock.locked()) {
+    return false;
+  }
+
+  if (!initSDCard()) {
+    return false;
+  }
+
+  File file = SD_MMC.open(path, FILE_WRITE);
+  if (!file) {
+    return false;
+  }
+
+  bool ok = file.write(frame.data, frame.len) == frame.len;
+  file.close();
+  if (!ok) {
+    SD_MMC.remove(path);
+  }
+
+  return ok;
+}
+
+static bool captureImageToPath(const String &path) {
+  if (path.isEmpty()) {
+    return false;
+  }
 
   {
     ScopedSdLock sdLock(pdMS_TO_TICKS(SD_LONG_LOCK_TIMEOUT_MS));
@@ -12,7 +42,7 @@ static bool captureImageToSD(String &savedPath) {
       return false;
     }
 
-    if (!initSDCard() || !ensureCaptureDirectory()) {
+    if (!initSDCard()) {
       return false;
     }
   }
@@ -34,6 +64,22 @@ static bool captureImageToSD(String &savedPath) {
   }
 
   ensureClockBeforeTimestamp();
+  return writeCapturedJpegToPath(frame, path);
+}
+
+static bool captureImageToSD(String &savedPath) {
+  savedPath = "";
+
+  {
+    ScopedSdLock sdLock(pdMS_TO_TICKS(SD_LONG_LOCK_TIMEOUT_MS));
+    if (!sdLock.locked()) {
+      return false;
+    }
+
+    if (!initSDCard() || !ensureCaptureDirectory()) {
+      return false;
+    }
+  }
 
   uint32_t sequence = 0;
   {
@@ -48,28 +94,7 @@ static bool captureImageToSD(String &savedPath) {
   }
 
   savedPath = buildCapturePath(sequence, "jpg");
-
-  bool ok = false;
-  {
-    ScopedSdLock sdLock(pdMS_TO_TICKS(SD_LONG_LOCK_TIMEOUT_MS));
-    if (!sdLock.locked()) {
-      return false;
-    }
-
-    File file = SD_MMC.open(savedPath, FILE_WRITE);
-    if (!file) {
-      return false;
-    }
-
-    ok = file.write(frame.data, frame.len) == frame.len;
-    file.close();
-
-    if (!ok) {
-      SD_MMC.remove(savedPath);
-    }
-  }
-
-  return ok;
+  return captureImageToPath(savedPath);
 }
 
 static void handleCaptureSD() {

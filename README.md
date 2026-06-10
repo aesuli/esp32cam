@@ -1,6 +1,6 @@
 # ESP32 multipurpose CAM
 
-Firmware for AI-Thinker ESP32-CAM (OV3660) with web streaming, camera controls, motion actions, and SD-backed secure configuration.
+Firmware for AI-Thinker ESP32-CAM (OV3660) with web streaming, camera controls, motion actions, intervalometer (timelapse), and SD-backed secure configuration.
 
 ## Hardware and Assembly
 
@@ -110,6 +110,21 @@ Use this page to configure PIR-triggered behavior.
 - Optional auto-standby after 2 minutes without authenticated requests and without motion events.
 - Manual Enter Standby Now command from the page.
 - Deep standby wake source is PIR HIGH on GPIO13.
+
+### Intervalometer page
+
+Use this page to run deep-sleep timelapse captures.
+
+- Configure interval value (1 to 100000) and unit (seconds, minutes, hours, days).
+- Configure burst count (1 to 10 images per wake cycle).
+- Start timelapse from the page:
+  - first burst is captured immediately;
+  - device enters deep sleep and wakes by timer for the next burst.
+- Wake period is compensated by capture time so interval cadence does not drift.
+- During intervalometer mode, WiFi and motion features are suspended.
+- Intervalometer mode stops on power cycle.
+- Files are saved as:
+  - `/timelapse/t-<num_timelapse>/i-<num_img>-<num_burst>-<time>.jpg`
 
 ### SD browser page
 

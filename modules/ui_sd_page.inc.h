@@ -7,7 +7,7 @@ static const char SD_HTML[] PROGMEM = R"html(<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ESP32-CAM - SD Browser</title>
+<title>__PAGE_TITLE__</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;min-height:100vh}

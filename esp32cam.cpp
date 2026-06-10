@@ -92,8 +92,9 @@ static constexpr uint32_t CAMERA_XCLK_FREQS_HZ[] = {
 
 // ─── SD configuration storage ──────────────────────────────────────────────────
 #define CONFIG_FILE_PATH "/config.enc"
-#define CONFIG_FILE_MAGIC "ESP32CAMCFG11"
+#define CONFIG_FILE_MAGIC "ESP32CAMCFG12"
 #define CAPTURE_COUNTER_FILE_PATH "/capture_counter.txt"
+#define TIMELAPSE_COUNTER_FILE_PATH "/timelapse_counter.txt"
 #define SD_SORT_FILE_PATH "/.sort"
 
 // ─── HTTP status codes ────────────────────────────────────────────────────────
@@ -254,6 +255,7 @@ static constexpr uint32_t AVI_MOVI_LIST_HEADER_SIZE = 4;
 static constexpr size_t RECORDING_WRITE_BUFFER_BYTES = 64U * 1024U;
 static constexpr unsigned long RECORDING_FILE_SYNC_INTERVAL_MS = 3000;
 static constexpr const char *CAPTURE_DIRECTORY = "/capture";
+static constexpr const char *TIMELAPSE_DIRECTORY = "/timelapse";
 static constexpr const char *AVI_VIDEO_CHUNK_ID = "00dc";
 static constexpr const char *SERIAL_LOG_FILE_PATH = "/log.txt";
 static constexpr const char *FIRMWARE_VERSION_TEXT = FIRMWARE_VERSION;
@@ -651,6 +653,12 @@ struct MotionSettings {
   bool standbyAfterInactivity = false;
 };
 
+struct IntervalometerSettings {
+  uint32_t intervalValue = 60;  // 1..100000
+  uint8_t intervalUnit = 0;     // 0=seconds,1=minutes,2=hours,3=days
+  uint8_t burstCount = 1;       // 1..10
+};
+
 struct StoredConfig {
   std::vector<WifiCredential> wifiList;
   String adminPass;
@@ -659,11 +667,18 @@ struct StoredConfig {
   bool hasCameraSettings = false;
   CameraSettings cameraSettings;
   MotionSettings motionSettings;
+  IntervalometerSettings intervalometerSettings;
   bool ledAccessBlink = false;  // LED blink on URL access
   bool logFileEnabled = true;
   int8_t txPowerSta = (int8_t)DEFAULT_TX_POWER_STA;  // wifi_power_t cast to int8
   int8_t txPowerAp  = (int8_t)DEFAULT_TX_POWER_AP;
 };
+
+RTC_DATA_ATTR static bool intervalometerRtcActive = false;
+RTC_DATA_ATTR static uint32_t intervalometerRtcTimelapseId = 0;
+RTC_DATA_ATTR static uint32_t intervalometerRtcImageIndex = 0;
+RTC_DATA_ATTR static uint64_t intervalometerRtcIntervalUs = 60000000ULL;
+RTC_DATA_ATTR static uint8_t intervalometerRtcBurstCount = 1;
 
 struct FrameSizeOption {
   framesize_t value;
@@ -743,6 +758,8 @@ static void clampMotionSettings(MotionSettings &settings);
 static void handleMotionPage();
 static void handleMotionConfigGet();
 static void handleMotionConfigSet();
+static bool isValidIntervalometerUnitValue(uint8_t unit);
+static void clampIntervalometerSettings(IntervalometerSettings &settings);
 static bool sendMotionNotifyRequest(const String &url);
 static bool isValidRuntimeTxPowerValue(int value);
 static wifi_power_t validatedTxPowerValue(int configuredValue, wifi_power_t fallback, const char *label);
@@ -750,8 +767,10 @@ static void setWifiModemSleep(bool enabled, const char *reason = nullptr);
 static bool applyWifiEnabledRuntimeState(bool enabled, bool showLedFeedback);
 static bool persistWifiEnabledAndApply(bool enabled, const char *reason);
 static void registerCameraRoutes();
+static void registerIntervalometerRoutes();
 static void startAuxHttpServers();
 static void startOtaRecoveryAPMode();
+static bool serviceIntervalometerStartupIfNeeded();
 
 static void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   switch (event) {
@@ -1354,7 +1373,7 @@ static String formatLocalTimeString() {
   return String(buf);
 }
 
-static String buildCapturePath(uint32_t sequence, const char *extension) {
+static String buildTimestampFilenameToken() {
   time_t now = time(nullptr);
   struct tm timeinfo;
   char stamp[24] = "19700101_000000";
@@ -1364,12 +1383,16 @@ static String buildCapturePath(uint32_t sequence, const char *extension) {
       stamp[sizeof(stamp) - 1] = '\0';
     }
   }
+  return String(stamp);
+}
 
+static String buildCapturePath(uint32_t sequence, const char *extension) {
   char path[80];
+  String stamp = buildTimestampFilenameToken();
   snprintf(path, sizeof(path), "%s/%lu-%s.%s",
            CAPTURE_DIRECTORY,
            (unsigned long)sequence,
-           stamp,
+           stamp.c_str(),
            extension);
   return String(path);
 }
@@ -2046,6 +2069,13 @@ static void appendU16(std::vector<uint8_t> &buf, uint16_t value) {
   buf.push_back((uint8_t)((value >> 8) & 0xFF));
 }
 
+static void appendU32(std::vector<uint8_t> &buf, uint32_t value) {
+  buf.push_back((uint8_t)(value & 0xFF));
+  buf.push_back((uint8_t)((value >> 8) & 0xFF));
+  buf.push_back((uint8_t)((value >> 16) & 0xFF));
+  buf.push_back((uint8_t)((value >> 24) & 0xFF));
+}
+
 static bool readU16(const std::vector<uint8_t> &buf, size_t &offset, uint16_t &out) {
   if (offset + 2 > buf.size()) {
     return false;
@@ -2054,6 +2084,31 @@ static bool readU16(const std::vector<uint8_t> &buf, size_t &offset, uint16_t &o
   out = (uint16_t)buf[offset] | ((uint16_t)buf[offset + 1] << 8);
   offset += 2;
   return true;
+}
+
+static bool readU32(const std::vector<uint8_t> &buf, size_t &offset, uint32_t &out) {
+  if (offset + 4 > buf.size()) {
+    return false;
+  }
+
+  out = (uint32_t)buf[offset]
+      | ((uint32_t)buf[offset + 1] << 8)
+      | ((uint32_t)buf[offset + 2] << 16)
+      | ((uint32_t)buf[offset + 3] << 24);
+  offset += 4;
+  return true;
+}
+
+static bool isValidIntervalometerUnitValue(uint8_t unit) {
+  return unit <= 3;
+}
+
+static void clampIntervalometerSettings(IntervalometerSettings &settings) {
+  if (settings.intervalValue < 1U) settings.intervalValue = 1U;
+  if (settings.intervalValue > 100000U) settings.intervalValue = 100000U;
+  if (!isValidIntervalometerUnitValue(settings.intervalUnit)) settings.intervalUnit = 0;
+  if (settings.burstCount < 1U) settings.burstCount = 1U;
+  if (settings.burstCount > 10U) settings.burstCount = 10U;
 }
 
 static void appendI16(std::vector<uint8_t> &buf, int16_t value) {
@@ -2423,9 +2478,27 @@ static void sendHtmlWithToken(const char *html) {
 enum class AppPage {
   Camera,
   Motion,
+  Intervalometer,
   Sd,
   Admin
 };
+
+static String buildDevicePageTitle(const char *pageLabel) {
+  String deviceName = cfgDeviceName;
+  deviceName.trim();
+  if (deviceName.isEmpty()) {
+    deviceName = "ESP32-CAM";
+  }
+
+  if (pageLabel == nullptr || *pageLabel == '\0') {
+    return deviceName;
+  }
+
+  String title = deviceName;
+  title += " - ";
+  title += pageLabel;
+  return title;
+}
 
 static String buildAppNavLink(const char *href, const char *label, AppPage page, AppPage activePage) {
   String html;
@@ -2450,6 +2523,8 @@ static String buildAppNav(AppPage activePage) {
   html += buildAppNavLink("/", "📷 Camera", AppPage::Camera, activePage);
   html += "\n  ";
   html += buildAppNavLink("/motion", "🚶 Motion", AppPage::Motion, activePage);
+  html += "\n  ";
+  html += buildAppNavLink("/intervalometer", "⏱ Timelapse", AppPage::Intervalometer, activePage);
   html += "\n  ";
   html += buildAppNavLink("/sd", "💾 SD Browser", AppPage::Sd, activePage);
   html += "\n  ";
@@ -2491,19 +2566,32 @@ static String buildAppFooter() {
   return html;
 }
 
-static void applyAppChrome(String &page, AppPage activePage) {
-  page.replace("__APP_NAV__", buildAppNav(activePage));
-  page.replace("__APP_FOOTER__", buildAppFooter());
+static const char *buildAppPageLabel(AppPage activePage) {
+  switch (activePage) {
+    case AppPage::Camera: return "Camera";
+    case AppPage::Motion: return "Motion";
+    case AppPage::Intervalometer: return "Timelapse";
+    case AppPage::Sd: return "SD Browser";
+    case AppPage::Admin: return "Admin";
+  }
+
+  return nullptr;
 }
 
-static void sendAppHtmlWithToken(String &page, AppPage activePage) {
-  applyAppChrome(page, activePage);
+static void applyAppChrome(String &page, AppPage activePage, const char *pageLabel) {
+  page.replace("__APP_NAV__", buildAppNav(activePage));
+  page.replace("__APP_FOOTER__", buildAppFooter());
+  page.replace("__PAGE_TITLE__", buildDevicePageTitle(pageLabel));
+}
+
+static void sendAppHtmlWithToken(String &page, AppPage activePage, const char *pageLabel) {
+  applyAppChrome(page, activePage, pageLabel);
   sendHtmlWithToken(page);
 }
 
-static void sendAppHtmlWithToken(const char *html, AppPage activePage) {
+static void sendAppHtmlWithToken(const char *html, AppPage activePage, const char *pageLabel) {
   String page(html);
-  sendAppHtmlWithToken(page, activePage);
+  sendAppHtmlWithToken(page, activePage, pageLabel);
 }
 
 static bool encryptPayload(const std::vector<uint8_t> &plain, String &ivHex, String &cipherHex) {
@@ -2626,6 +2714,9 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
   appendU8(plain, cfg.motionSettings.standbyAfterInactivity ? 1 : 0);
   appendU8(plain, cfg.motionSettings.notifyEnabled ? 1 : 0);
   appendU8(plain, cfg.wifiEnabled ? 1 : 0);
+  appendU32(plain, cfg.intervalometerSettings.intervalValue);
+  appendU8(plain, cfg.intervalometerSettings.intervalUnit);
+  appendU8(plain, cfg.intervalometerSettings.burstCount);
 
   return encryptPayload(plain, ivHex, cipherHex);
 }
@@ -2720,11 +2811,23 @@ static bool decryptConfig(const String &ivHex, const String &cipherHex, StoredCo
   }
   cfg.wifiEnabled = (wifiEnabled != 0);
 
+  cfg.intervalometerSettings = IntervalometerSettings();
+  if (offset < plain.size()) {
+    if (!readU32(plain, offset, cfg.intervalometerSettings.intervalValue)) return false;
+  }
+  if (offset < plain.size()) {
+    if (!readU8(plain, offset, cfg.intervalometerSettings.intervalUnit)) return false;
+  }
+  if (offset < plain.size()) {
+    if (!readU8(plain, offset, cfg.intervalometerSettings.burstCount)) return false;
+  }
+
   cfg.motionSettings.enabled = (motionEnabled != 0);
   cfg.motionSettings.captureImage = (motionCaptureImage != 0);
   cfg.motionSettings.captureVideo = (motionCaptureVideo != 0);
 
   clampMotionSettings(cfg.motionSettings);
+  clampIntervalometerSettings(cfg.intervalometerSettings);
   return offset == plain.size() && !cfg.adminPass.isEmpty();
 }
 
@@ -2818,6 +2921,7 @@ static bool persistRuntimeConfig(const StoredConfig &cfg) {
   StoredConfig updated = cfg;
   syncCameraSettingsFromSensor(updated);
   clampMotionSettings(updated.motionSettings);
+  clampIntervalometerSettings(updated.intervalometerSettings);
 
   if (!saveConfigToSD(updated)) {
     return false;
@@ -3289,7 +3393,9 @@ static void handleUrlAccess() {
 
 static void handleSetupRoot() {
     handleUrlAccess();
-  server.send_P(HTTP_OK, "text/html", SETUP_HTML);
+  String page(SETUP_HTML);
+  page.replace("__PAGE_TITLE__", buildDevicePageTitle("Setup"));
+  server.send(HTTP_OK, "text/html", page);
 }
 
 static void handleOtaRecoveryRoot() {
@@ -3458,7 +3564,7 @@ static void handleCameraRoot() {
 
     String page(MAIN_HTML);
     page.replace("__FRAME_SIZE_OPTIONS__", buildFrameSizeOptionsHtml(selected));
-    sendAppHtmlWithToken(page, AppPage::Camera);
+    sendAppHtmlWithToken(page, AppPage::Camera, "Camera");
 }
 
 static String wifiEncryptionLabel(wifi_auth_mode_t authMode) {
@@ -4078,6 +4184,7 @@ static void registerCameraRoutes() {
   server.on("/wifi/scan",     HTTP_GET,  handleWifiScan);
 
   registerMotionRoutes();
+  registerIntervalometerRoutes();
   registerAdminRoutes();
   registerOtaRoutes();
   registerSdRoutes();
@@ -4387,6 +4494,8 @@ static void servicePendingAdminRestart() {
 }
 
 #include "modules/motion_module.inc.h"
+
+#include "modules/intervalometer_module.inc.h"
 
 [[noreturn]] static void haltBoot(const char *message) {
   Logger.LogLine(message);
@@ -4771,6 +4880,9 @@ void setup() {
   }
 
   loadStartupConfig();
+  if (serviceIntervalometerStartupIfNeeded()) {
+    return;
+  }
   finalizeMotionStartupConfig();
   initializeRouteAccessToken();
   startInitialNetworkServices();

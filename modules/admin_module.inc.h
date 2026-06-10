@@ -308,7 +308,7 @@ static void handleAdminPage() {
   String page(ADMIN_HTML);
   page.replace("__FIRMWARE_VERSION__", FIRMWARE_VERSION_TEXT);
   page.replace("__FIRMWARE_BUILD__", FIRMWARE_BUILD_TEXT);
-  sendAppHtmlWithToken(page, AppPage::Admin);
+  sendAppHtmlWithToken(page, AppPage::Admin, "Admin");
 }
 
 static void registerAdminRoutes() {

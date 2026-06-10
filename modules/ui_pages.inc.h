@@ -7,3 +7,4 @@
 #include "ui_admin_page.inc.h"
 #include "ui_sd_page.inc.h"
 #include "ui_motion_pages.inc.h"
+#include "ui_intervalometer_page.inc.h"

@@ -86,7 +86,7 @@ static void handleMotionPage() {
     return;
   }
 
-  sendAppHtmlWithToken(MOTION_HTML, AppPage::Motion);
+  sendAppHtmlWithToken(MOTION_HTML, AppPage::Motion, "Motion");
 }
 
 static void handleMotionGraphPage() {
@@ -94,7 +94,7 @@ static void handleMotionGraphPage() {
     return;
   }
 
-  sendAppHtmlWithToken(MOTION_GRAPH_HTML, AppPage::Motion);
+  sendAppHtmlWithToken(MOTION_GRAPH_HTML, AppPage::Motion, "Motion Graph");
 }
 
 static void handleMotionReadings() {
