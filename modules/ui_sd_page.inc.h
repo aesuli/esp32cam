@@ -71,6 +71,14 @@ __APP_NAV__
     <button onclick="loadFiles()">Refresh</button>
     <button id="select_all" onclick="toggleSelectAllFiles()" disabled>Select All</button>
     <button id="download_selected" onclick="downloadSelectedFiles()" disabled>Download Selected</button>
+    <button id="download_mjpg_avi" onclick="downloadSelectedAsMjpgAvi()" disabled>Download as MJPG AVI</button>
+    <label for="mjpg_fps">FPS</label>
+    <select id="mjpg_fps" title="Frame rate for MJPG AVI export">
+      <option value="10">10</option>
+      <option value="15">15</option>
+      <option value="24">24</option>
+      <option value="30" selected>30</option>
+    </select>
     <button id="delete_selected" onclick="deleteSelectedFiles()" disabled>Delete Selected</button>
     <label>Upload: <input id="upload_file" type="file" onchange="uploadFile(this)"></label>
   </div>
@@ -136,6 +144,10 @@ function isImage(path){
   var p=String(path).toLowerCase();
   return p.endsWith('.jpg')||p.endsWith('.jpeg')||p.endsWith('.png')||p.endsWith('.gif')||p.endsWith('.webp')||p.endsWith('.bmp');
 }
+function isJpeg(path){
+  var p=String(path).toLowerCase();
+  return p.endsWith('.jpg')||p.endsWith('.jpeg');
+}
 function formatSize(bytes){
   var n=Number(bytes)||0;
   if(n<1024)return n+' B';
@@ -161,21 +173,27 @@ function syncSelectedFiles(){
   selectedFiles=valid;
 }
 function updateBulkDeleteButton(){
-  var count=getSelectedFiles().length;
+  var selected=getSelectedFiles();
+  var count=selected.length;
   var visiblePaths=getVisibleFilePaths();
   var visibleCount=visiblePaths.length;
   var selectedVisibleCount=visiblePaths.filter(function(path){return !!selectedFiles[path];}).length;
   var allVisibleSelected=visibleCount>0&&selectedVisibleCount===visibleCount;
   var deleteButton=document.getElementById('delete_selected');
   var downloadButton=document.getElementById('download_selected');
+  var mjpgButton=document.getElementById('download_mjpg_avi');
   var selectAllButton=document.getElementById('select_all');
   var hasSelection=count>0;
+  var allSelectedAreJpeg=hasSelection&&selected.every(function(path){return isJpeg(path);});
+  var canDownloadAsAvi=allSelectedAreJpeg&&count>=2;
   deleteButton.disabled=!hasSelection;
   downloadButton.disabled=!hasSelection;
+  mjpgButton.disabled=!canDownloadAsAvi;
   selectAllButton.disabled=visibleCount===0;
   selectAllButton.textContent=allVisibleSelected?'Clear All':'Select All';
   deleteButton.textContent=hasSelection?'Delete Selected ('+count+')':'Delete Selected';
   downloadButton.textContent=hasSelection?'Download Selected ('+count+')':'Download Selected';
+  mjpgButton.textContent=hasSelection?'Download as MJPG AVI ('+count+')':'Download as MJPG AVI';
 }
 function toggleFileSelection(path,checked){
   var normalized=String(path||'');
@@ -273,6 +291,37 @@ function downloadSelectedFiles(){
     })(files[i],i*120);
   }
   setStatus('Started '+files.length+' download(s). Your browser may ask for permission.',false);
+}
+function buildFilesQuery(paths){
+  return (paths||[]).map(function(path){return 'file='+encodeURIComponent(path);}).join('&');
+}
+function getSelectedMjpgFps(){
+  var input=document.getElementById('mjpg_fps');
+  var fps=Number(input&&input.value);
+  if(!Number.isFinite(fps)||fps<=0) return 30;
+  return Math.floor(fps);
+}
+function downloadSelectedAsMjpgAvi(){
+  var files=getSelectedFiles();
+  if(files.length<2){
+    setStatus('Select at least two JPG/JPEG files to build MJPG AVI.',true);
+    return;
+  }
+  if(!files.every(function(path){return isJpeg(path);} )){
+    setStatus('MJPG AVI export supports JPG/JPEG files only.',true);
+    return;
+  }
+
+  var fps=getSelectedMjpgFps();
+  var query=buildFilesQuery(files)+'&fps='+encodeURIComponent(String(fps));
+  var url='/sd/download_mjpg_avi?'+query;
+  var anchor=document.createElement('a');
+  anchor.href=url;
+  anchor.style.display='none';
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  setStatus('Building MJPG AVI from '+files.length+' frame(s) at '+fps+' FPS...',false);
 }
 function renderCrumbs(){
   var el=document.getElementById('crumbs');

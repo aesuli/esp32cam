@@ -249,6 +249,338 @@ static void sendTransferError(WebServer &srv, int statusCode, const char *messag
   srv.send(statusCode, "text/plain", message);
 }
 
+static bool sdIsJpegPath(const String &filePath) {
+  String lower = filePath;
+  lower.toLowerCase();
+  return lower.endsWith(".jpg") || lower.endsWith(".jpeg");
+}
+
+static bool sdReadU16BE(File &file, uint16_t &value) {
+  int hi = file.read();
+  int lo = file.read();
+  if (hi < 0 || lo < 0) {
+    return false;
+  }
+  value = (uint16_t)(((uint16_t)hi << 8) | (uint16_t)lo);
+  return true;
+}
+
+static bool sdIsSofMarker(uint8_t marker) {
+  switch (marker) {
+    case 0xC0:
+    case 0xC1:
+    case 0xC2:
+    case 0xC3:
+    case 0xC5:
+    case 0xC6:
+    case 0xC7:
+    case 0xC9:
+    case 0xCA:
+    case 0xCB:
+    case 0xCD:
+    case 0xCE:
+    case 0xCF:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static bool sdReadJpegDimensions(File &file, uint16_t &width, uint16_t &height) {
+  width = 0;
+  height = 0;
+
+  if (!file.seek(0)) {
+    return false;
+  }
+
+  int b0 = file.read();
+  int b1 = file.read();
+  if (b0 != 0xFF || b1 != 0xD8) {
+    return false;
+  }
+
+  while (file.available()) {
+    int prefix = file.read();
+    if (prefix < 0) {
+      return false;
+    }
+    if (prefix != 0xFF) {
+      continue;
+    }
+
+    int marker = file.read();
+    while (marker == 0xFF) {
+      marker = file.read();
+    }
+    if (marker < 0) {
+      return false;
+    }
+
+    if (marker == 0xD9 || marker == 0xDA) {
+      break;
+    }
+
+    if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
+      continue;
+    }
+
+    uint16_t segmentLength = 0;
+    if (!sdReadU16BE(file, segmentLength) || segmentLength < 2U) {
+      return false;
+    }
+
+    if (sdIsSofMarker((uint8_t)marker)) {
+      if (segmentLength < 7U) {
+        return false;
+      }
+
+      if (file.read() < 0) {
+        return false;
+      }
+
+      uint16_t parsedHeight = 0;
+      uint16_t parsedWidth = 0;
+      if (!sdReadU16BE(file, parsedHeight) || !sdReadU16BE(file, parsedWidth)) {
+        return false;
+      }
+
+      width = parsedWidth;
+      height = parsedHeight;
+      return width > 0U && height > 0U;
+    }
+
+    uint32_t skipBytes = (uint32_t)segmentLength - 2U;
+    uint32_t nextPos = (uint32_t)file.position() + skipBytes;
+    if (!file.seek(nextPos)) {
+      return false;
+    }
+  }
+
+  return false;
+}
+
+static bool sdWriteClientAll(WiFiClient &client, const uint8_t *data, size_t length) {
+  size_t writtenTotal = 0;
+  while (writtenTotal < length) {
+    size_t written = client.write(data + writtenTotal, length - writtenTotal);
+    if (written == 0) {
+      return false;
+    }
+    writtenTotal += written;
+  }
+  return true;
+}
+
+static bool sdWriteClientU16LE(WiFiClient &client, uint16_t value) {
+  uint8_t bytes[2] = {
+    (uint8_t)(value & 0xFFU),
+    (uint8_t)((value >> 8) & 0xFFU)
+  };
+  return sdWriteClientAll(client, bytes, sizeof(bytes));
+}
+
+static bool sdWriteClientU32LE(WiFiClient &client, uint32_t value) {
+  uint8_t bytes[4] = {
+    (uint8_t)(value & 0xFFU),
+    (uint8_t)((value >> 8) & 0xFFU),
+    (uint8_t)((value >> 16) & 0xFFU),
+    (uint8_t)((value >> 24) & 0xFFU)
+  };
+  return sdWriteClientAll(client, bytes, sizeof(bytes));
+}
+
+static bool sdWriteClientFourCC(WiFiClient &client, const char *fourcc) {
+  return sdWriteClientAll(client, reinterpret_cast<const uint8_t *>(fourcc), 4U);
+}
+
+static uint32_t sdGcdU32(uint32_t a, uint32_t b) {
+  while (b != 0U) {
+    uint32_t temp = a % b;
+    a = b;
+    b = temp;
+  }
+  return a;
+}
+
+static bool sdWriteMjpgAviHeaderToClient(
+    WiFiClient &client,
+    uint32_t riffSize,
+    uint32_t durationMs,
+    uint32_t frameCount,
+    uint32_t maxFrameSize,
+    uint16_t width,
+    uint16_t height,
+    uint32_t moviListSize,
+    bool hasIndex) {
+  if (durationMs == 0U) {
+    durationMs = frameCount == 0U ? 1U : (frameCount * RECORDING_FRAME_INTERVAL_MS);
+  }
+
+  uint64_t totalMicroseconds = (uint64_t)durationMs * 1000ULL;
+  uint32_t microsecondsPerFrame = frameCount == 0U
+    ? 0U
+    : (uint32_t)((totalMicroseconds + (frameCount / 2ULL)) / (uint64_t)frameCount);
+  if (frameCount != 0U && microsecondsPerFrame == 0U) {
+    microsecondsPerFrame = 1U;
+  }
+
+  uint32_t moviPayloadSize = moviListSize >= 4U ? (moviListSize - 4U) : 0U;
+  uint32_t bytesPerSecond = durationMs == 0U
+    ? 0U
+    : (uint32_t)((((uint64_t)moviPayloadSize * 1000ULL) + (durationMs / 2ULL)) / (uint64_t)durationMs);
+  uint32_t imageSize = maxFrameSize == 0U
+    ? (uint32_t)width * (uint32_t)height * 3UL
+    : maxFrameSize;
+  uint32_t scale = durationMs;
+  uint64_t rawRate = (uint64_t)frameCount * 1000ULL;
+  uint32_t rate = rawRate > 0xFFFFFFFFULL ? 0xFFFFFFFFUL : (uint32_t)rawRate;
+
+  if (scale == 0U || rate == 0U) {
+    scale = 1U;
+    rate = 1U;
+  } else {
+    uint32_t divisor = sdGcdU32(scale, rate);
+    scale /= divisor;
+    rate /= divisor;
+  }
+
+  return
+    sdWriteClientFourCC(client, "RIFF") &&
+    sdWriteClientU32LE(client, riffSize) &&
+    sdWriteClientFourCC(client, "AVI ") &&
+    sdWriteClientFourCC(client, "LIST") &&
+    sdWriteClientU32LE(client, 192U) &&
+    sdWriteClientFourCC(client, "hdrl") &&
+    sdWriteClientFourCC(client, "avih") &&
+    sdWriteClientU32LE(client, 56U) &&
+    sdWriteClientU32LE(client, microsecondsPerFrame) &&
+    sdWriteClientU32LE(client, bytesPerSecond) &&
+    sdWriteClientU32LE(client, 0U) &&
+    sdWriteClientU32LE(client, hasIndex ? AVI_HAS_INDEX_FLAG : 0U) &&
+    sdWriteClientU32LE(client, frameCount) &&
+    sdWriteClientU32LE(client, 0U) &&
+    sdWriteClientU32LE(client, 1U) &&
+    sdWriteClientU32LE(client, maxFrameSize) &&
+    sdWriteClientU32LE(client, width) &&
+    sdWriteClientU32LE(client, height) &&
+    sdWriteClientU32LE(client, 0U) &&
+    sdWriteClientU32LE(client, 0U) &&
+    sdWriteClientU32LE(client, 0U) &&
+    sdWriteClientU32LE(client, 0U) &&
+    sdWriteClientFourCC(client, "LIST") &&
+    sdWriteClientU32LE(client, 116U) &&
+    sdWriteClientFourCC(client, "strl") &&
+    sdWriteClientFourCC(client, "strh") &&
+    sdWriteClientU32LE(client, 56U) &&
+    sdWriteClientFourCC(client, "vids") &&
+    sdWriteClientFourCC(client, "MJPG") &&
+    sdWriteClientU32LE(client, 0U) &&
+    sdWriteClientU16LE(client, 0U) &&
+    sdWriteClientU16LE(client, 0U) &&
+    sdWriteClientU32LE(client, 0U) &&
+    sdWriteClientU32LE(client, scale) &&
+    sdWriteClientU32LE(client, rate) &&
+    sdWriteClientU32LE(client, 0U) &&
+    sdWriteClientU32LE(client, frameCount) &&
+    sdWriteClientU32LE(client, maxFrameSize) &&
+    sdWriteClientU32LE(client, 0xFFFFFFFFUL) &&
+    sdWriteClientU32LE(client, 0U) &&
+    sdWriteClientU16LE(client, 0U) &&
+    sdWriteClientU16LE(client, 0U) &&
+    sdWriteClientU16LE(client, width) &&
+    sdWriteClientU16LE(client, height) &&
+    sdWriteClientFourCC(client, "strf") &&
+    sdWriteClientU32LE(client, 40U) &&
+    sdWriteClientU32LE(client, 40U) &&
+    sdWriteClientU32LE(client, width) &&
+    sdWriteClientU32LE(client, height) &&
+    sdWriteClientU16LE(client, 1U) &&
+    sdWriteClientU16LE(client, 24U) &&
+    sdWriteClientFourCC(client, "MJPG") &&
+    sdWriteClientU32LE(client, imageSize) &&
+    sdWriteClientU32LE(client, 0U) &&
+    sdWriteClientU32LE(client, 0U) &&
+    sdWriteClientU32LE(client, 0U) &&
+    sdWriteClientU32LE(client, 0U) &&
+    sdWriteClientFourCC(client, "LIST") &&
+    sdWriteClientU32LE(client, moviListSize) &&
+    sdWriteClientFourCC(client, "movi");
+}
+
+static bool collectMjpgAviFiles(WebServer &srv, std::vector<String> &filePaths, String &errorMessage) {
+  if (!srv.hasArg(PARAM_FILE)) {
+    errorMessage = ERR_FILE_REQUIRED;
+    return false;
+  }
+
+  filePaths.clear();
+  filePaths.reserve(srv.args());
+  for (int index = 0; index < srv.args(); ++index) {
+    if (srv.argName(index) != PARAM_FILE) {
+      continue;
+    }
+
+    String filePath;
+    if (!normalizeAndValidateSDPath(srv.arg(index), filePath)) {
+      errorMessage = ERR_INVALID_PATH;
+      return false;
+    }
+
+    if (isProtectedSDPath(filePath)) {
+      errorMessage = ERR_ACCESS_DENIED;
+      return false;
+    }
+
+    if (!sdIsJpegPath(filePath)) {
+      errorMessage = "MJPG AVI download supports only .jpg/.jpeg files";
+      return false;
+    }
+
+    if (std::find(filePaths.begin(), filePaths.end(), filePath) == filePaths.end()) {
+      filePaths.push_back(filePath);
+    }
+  }
+
+  if (filePaths.size() < 2U) {
+    errorMessage = "Select at least two JPEG files";
+    return false;
+  }
+
+  return true;
+}
+
+static bool collectMjpgAviFps(WebServer &srv, uint32_t &fps, String &errorMessage) {
+  fps = 30U;
+  if (!srv.hasArg("fps")) {
+    return true;
+  }
+
+  String fpsRaw = srv.arg("fps");
+  fpsRaw.trim();
+  if (fpsRaw.isEmpty()) {
+    errorMessage = "fps parameter is invalid";
+    return false;
+  }
+
+  for (size_t i = 0; i < fpsRaw.length(); ++i) {
+    char ch = fpsRaw.charAt(i);
+    if (ch < '0' || ch > '9') {
+      errorMessage = "fps parameter must be numeric";
+      return false;
+    }
+  }
+
+  uint32_t parsed = (uint32_t)fpsRaw.toInt();
+  if (parsed < 1U || parsed > 60U) {
+    errorMessage = "fps must be between 1 and 60";
+    return false;
+  }
+
+  fps = parsed;
+  return true;
+}
+
 static void handleSDDownloadWorker() {
   if (!checkAuth(transferServer, true)) {
     sendTransferError(transferServer, HTTP_UNAUTHORIZED, ERR_UNAUTHORIZED);
@@ -321,6 +653,237 @@ static void handleSDDownloadMain() {
   }
 
   server.sendHeader("Location", buildLocalUrl(HTTP_TRANSFER_PORT, String("/sd/download?file=") + urlEncode(filePath), true));
+  server.send(HTTP_FOUND, "text/plain", "Redirecting to transfer server");
+}
+
+static void handleSDDownloadMjpgAviWorker() {
+  if (!checkAuth(transferServer, true)) {
+    sendTransferError(transferServer, HTTP_UNAUTHORIZED, ERR_UNAUTHORIZED);
+    return;
+  }
+
+  if (!initSDCard()) {
+    sendTransferError(transferServer, HTTP_INTERNAL_ERROR, ERR_SD_CARD_NOT_AVAILABLE);
+    return;
+  }
+
+  std::vector<String> filePaths;
+  String selectionError;
+  if (!collectMjpgAviFiles(transferServer, filePaths, selectionError)) {
+    sendTransferError(transferServer, HTTP_BAD_REQUEST, selectionError.c_str());
+    return;
+  }
+
+  uint32_t fps = 30U;
+  if (!collectMjpgAviFps(transferServer, fps, selectionError)) {
+    sendTransferError(transferServer, HTTP_BAD_REQUEST, selectionError.c_str());
+    return;
+  }
+
+  std::vector<uint32_t> frameSizes;
+  frameSizes.reserve(filePaths.size());
+  uint16_t width = 0;
+  uint16_t height = 0;
+  uint32_t maxFrameSize = 0;
+  uint64_t moviListSize64 = AVI_MOVI_LIST_HEADER_SIZE;
+
+  for (const String &filePath : filePaths) {
+    File frameFile = SD_MMC.open(filePath, FILE_READ);
+    if (!frameFile || frameFile.isDirectory()) {
+      sendTransferError(transferServer, HTTP_NOT_FOUND, ERR_FILE_NOT_FOUND);
+      return;
+    }
+
+    uint16_t frameWidth = 0;
+    uint16_t frameHeight = 0;
+    bool dimOk = sdReadJpegDimensions(frameFile, frameWidth, frameHeight);
+    uint32_t frameSize = (uint32_t)frameFile.size();
+    frameFile.close();
+
+    if (!dimOk || frameSize == 0U) {
+      sendTransferError(transferServer, HTTP_BAD_REQUEST, "One or more files are not valid JPEG images");
+      return;
+    }
+
+    if (width == 0U && height == 0U) {
+      width = frameWidth;
+      height = frameHeight;
+    } else if (width != frameWidth || height != frameHeight) {
+      sendTransferError(transferServer, HTTP_BAD_REQUEST, "All selected JPEG images must have the same resolution");
+      return;
+    }
+
+    maxFrameSize = std::max(maxFrameSize, frameSize);
+    frameSizes.push_back(frameSize);
+
+    uint64_t chunkSpan = 8ULL + (uint64_t)frameSize + (uint64_t)(frameSize & 1U);
+    moviListSize64 += chunkSpan;
+    if (moviListSize64 > 0xFFFFFFFFULL) {
+      sendTransferError(transferServer, HTTP_BAD_REQUEST, "Selection is too large for AVI output");
+      return;
+    }
+  }
+
+  uint32_t frameCount = (uint32_t)frameSizes.size();
+  if (frameCount == 0U) {
+    sendTransferError(transferServer, HTTP_BAD_REQUEST, "No JPEG frames selected");
+    return;
+  }
+
+  uint64_t indexSize64 = (uint64_t)frameCount * 16ULL;
+  if (indexSize64 > 0xFFFFFFFFULL) {
+    sendTransferError(transferServer, HTTP_BAD_REQUEST, "Too many frames selected");
+    return;
+  }
+
+  uint64_t riffSize64 = 4ULL + (8ULL + 192ULL) + (8ULL + moviListSize64) + (8ULL + indexSize64);
+  if (riffSize64 > 0xFFFFFFFFULL) {
+    sendTransferError(transferServer, HTTP_BAD_REQUEST, "Selection is too large for AVI output");
+    return;
+  }
+
+  uint32_t moviListSize = (uint32_t)moviListSize64;
+  uint32_t indexSize = (uint32_t)indexSize64;
+  uint32_t riffSize = (uint32_t)riffSize64;
+  uint32_t contentLength = riffSize + 8U;
+  uint64_t durationNumerator = ((uint64_t)frameCount * 1000ULL) + ((uint64_t)fps / 2ULL);
+  uint32_t durationMs = (uint32_t)(durationNumerator / (uint64_t)fps);
+  if (durationMs == 0U) {
+    durationMs = 1U;
+  }
+
+  String firstName = filePaths.front();
+  int slash = firstName.lastIndexOf('/');
+  if (slash >= 0) {
+    firstName = firstName.substring(slash + 1);
+  }
+  int dot = firstName.lastIndexOf('.');
+  if (dot > 0) {
+    firstName = firstName.substring(0, dot);
+  }
+  if (firstName.isEmpty()) {
+    firstName = "selection";
+  }
+  String downloadName = firstName + "_mjpg.avi";
+
+  WiFiClient client = transferServer.client();
+  transferServer.sendHeader("Access-Control-Allow-Origin", "*");
+  char responseHeader[320];
+  int hlen = snprintf(
+      responseHeader,
+      sizeof(responseHeader),
+      "HTTP/1.1 200 OK\r\n"
+      "Content-Type: video/x-msvideo\r\n"
+      "Content-Disposition: attachment; filename=\"%s\"\r\n"
+      "Content-Length: %lu\r\n"
+      "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+      "Pragma: no-cache\r\n"
+      "Connection: close\r\n"
+      "Access-Control-Allow-Origin: *\r\n"
+      "\r\n",
+      downloadName.c_str(),
+      (unsigned long)contentLength);
+  if (hlen <= 0 || (size_t)hlen >= sizeof(responseHeader)) {
+    client.stop();
+    return;
+  }
+  if (!sdWriteClientAll(client, reinterpret_cast<const uint8_t *>(responseHeader), (size_t)hlen)) {
+    client.stop();
+    return;
+  }
+
+  if (!sdWriteMjpgAviHeaderToClient(client, riffSize, durationMs, frameCount, maxFrameSize, width, height, moviListSize, true)) {
+    client.stop();
+    return;
+  }
+
+  uint8_t frameBuffer[1024];
+  const uint8_t zero = 0;
+  for (const String &filePath : filePaths) {
+    File frameFile = SD_MMC.open(filePath, FILE_READ);
+    if (!frameFile || frameFile.isDirectory()) {
+      client.stop();
+      return;
+    }
+
+    uint32_t frameSize = (uint32_t)frameFile.size();
+    if (!sdWriteClientFourCC(client, AVI_VIDEO_CHUNK_ID) || !sdWriteClientU32LE(client, frameSize)) {
+      frameFile.close();
+      client.stop();
+      return;
+    }
+
+    uint32_t remaining = frameSize;
+    while (remaining > 0U) {
+      size_t toRead = remaining > sizeof(frameBuffer) ? sizeof(frameBuffer) : (size_t)remaining;
+      int readNow = frameFile.read(frameBuffer, toRead);
+      if (readNow <= 0 || !sdWriteClientAll(client, frameBuffer, (size_t)readNow)) {
+        frameFile.close();
+        client.stop();
+        return;
+      }
+      remaining -= (uint32_t)readNow;
+    }
+    frameFile.close();
+
+    if ((frameSize & 1U) != 0U && !sdWriteClientAll(client, &zero, 1U)) {
+      client.stop();
+      return;
+    }
+
+  }
+
+  if (!sdWriteClientFourCC(client, "idx1") || !sdWriteClientU32LE(client, indexSize)) {
+    client.stop();
+    return;
+  }
+
+  uint32_t indexOffset = AVI_MOVI_LIST_HEADER_SIZE;
+  for (size_t i = 0; i < frameSizes.size(); ++i) {
+    uint32_t frameSize = frameSizes[i];
+    if (!sdWriteClientFourCC(client, AVI_VIDEO_CHUNK_ID) ||
+        !sdWriteClientU32LE(client, AVI_KEYFRAME_FLAG) ||
+        !sdWriteClientU32LE(client, indexOffset) ||
+        !sdWriteClientU32LE(client, frameSize)) {
+      client.stop();
+      return;
+    }
+    indexOffset += 8U + frameSize + (frameSize & 1U);
+  }
+
+  client.stop();
+}
+
+static void handleSDDownloadMjpgAviMain() {
+  if (!checkAuth(server)) {
+    return;
+  }
+
+  std::vector<String> filePaths;
+  String selectionError;
+  if (!collectMjpgAviFiles(server, filePaths, selectionError)) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", selectionError);
+    return;
+  }
+
+  uint32_t fps = 30U;
+  if (!collectMjpgAviFps(server, fps, selectionError)) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", selectionError);
+    return;
+  }
+
+  String query;
+  bool first = true;
+  for (const String &filePath : filePaths) {
+    if (!first) {
+      query += "&";
+    }
+    query += String("file=") + urlEncode(filePath);
+    first = false;
+  }
+  query += String("&fps=") + String((unsigned int)fps);
+
+  server.sendHeader("Location", buildLocalUrl(HTTP_TRANSFER_PORT, String("/sd/download_mjpg_avi?") + query, true));
   server.send(HTTP_FOUND, "text/plain", "Redirecting to transfer server");
 }
 
@@ -1350,6 +1913,7 @@ static void registerSdRoutes() {
   server.on("/sd", HTTP_GET, handleSDPage);
   server.on("/sd/list", HTTP_GET, handleSDList);
   server.on("/sd/download", HTTP_GET, handleSDDownloadMain);
+  server.on("/sd/download_mjpg_avi", HTTP_GET, handleSDDownloadMjpgAviMain);
   server.on("/sd/view", HTTP_GET, handleSDViewMain);
   server.on("/sd/player", HTTP_GET, handleSDPlayerMain);
   server.on("/sd/delete", HTTP_POST, handleSDDelete);
@@ -1362,6 +1926,7 @@ static void registerSdRoutes() {
 
 static void registerSdTransferRoutes() {
   transferServer.on("/sd/download", HTTP_GET, handleSDDownloadWorker);
+  transferServer.on("/sd/download_mjpg_avi", HTTP_GET, handleSDDownloadMjpgAviWorker);
   transferServer.on("/sd/view", HTTP_GET, handleSDViewWorker);
   transferServer.on("/sd/playback", HTTP_GET, handleSDPlaybackWorker);
   transferServer.on("/sd/upload", HTTP_POST, handleSDUploadWorker, handleSDUploadDataWorker);

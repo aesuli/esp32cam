@@ -53,6 +53,10 @@ __APP_NAV__
       <label for="burst_count">Shots per interval (1-10)</label>
       <input id="burst_count" type="number" min="1" max="10" step="1" value="1">
     </div>
+    <div class="cg row">
+      <label for="burst_delay_sec">Delay between burst shots (seconds, 1-100)</label>
+      <input id="burst_delay_sec" type="number" min="1" max="100" step="1" value="1">
+    </div>
     <div class="small">When started, the camera takes the first burst immediately, then sleeps and wakes by timer. WiFi and motion functions are disabled until power cycle.</div>
     <div class="actions" style="margin-top:12px">
       <button id="start_btn" class="btn" type="button">Start Timelapse</button>
@@ -70,7 +74,8 @@ function payload(){
   return {
     intervalValue:clamp(asInt(id('interval_value').value,60),1,100000),
     intervalUnit:clamp(asInt(id('interval_unit').value,0),0,3),
-    burstCount:clamp(asInt(id('burst_count').value,1),1,10)
+    burstCount:clamp(asInt(id('burst_count').value,1),1,10),
+    burstDelaySec:clamp(asInt(id('burst_delay_sec').value,1),1,100)
   };
 }
 function encodeForm(obj){
@@ -80,6 +85,7 @@ function fill(c){
   id('interval_value').value=c.intervalValue||60;
   id('interval_unit').value=String(c.intervalUnit||0);
   id('burst_count').value=c.burstCount||1;
+  id('burst_delay_sec').value=c.burstDelaySec||1;
 }
 var saveTimer=0;
 var savePending=false;
@@ -102,6 +108,7 @@ function saveCfg(){
   id('interval_value').value=p.intervalValue;
   id('interval_unit').value=String(p.intervalUnit);
   id('burst_count').value=p.burstCount;
+  id('burst_delay_sec').value=p.burstDelaySec;
   setStatus('Saving...',false);
   fetch('/intervalometer/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:encodeForm(p)})
     .then(function(r){
@@ -146,6 +153,7 @@ function startTimelapse(){
 id('interval_value').addEventListener('change',scheduleSave);
 id('interval_unit').addEventListener('change',scheduleSave);
 id('burst_count').addEventListener('change',scheduleSave);
+id('burst_delay_sec').addEventListener('change',scheduleSave);
 id('start_btn').addEventListener('click',startTimelapse);
 loadCfg();
 </script>

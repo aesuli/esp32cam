@@ -203,6 +203,14 @@ static bool runIntervalometerCaptureCycle() {
     }
   }
 
+    if (!ensureCameraReady()) {
+      Logger.LogLine("[TLM] Failed to activate camera for timelapse capture");
+      return false;
+    }
+
+    // Allow the camera AE to settle after the sensor is activated.
+    delay(1000);
+
   bool allOk = true;
   for (uint8_t burst = 1; burst <= intervalometerRtcBurstCount; ++burst) {
     String path = buildIntervalometerImagePath(intervalometerRtcTimelapseId, imageNumber, burst);
@@ -211,6 +219,10 @@ static bool runIntervalometerCaptureCycle() {
     } else {
       allOk = false;
       Logger.Log("[TLM] Capture failed: %s\n", path.c_str());
+    }
+
+    if (burst < intervalometerRtcBurstCount) {
+      delay((unsigned long)intervalometerRtcBurstDelaySec * 1000UL);
     }
   }
 
@@ -242,6 +254,7 @@ static bool serviceIntervalometerStartupIfNeeded() {
     intervalometerRtcImageIndex = 0;
     intervalometerRtcIntervalUs = 60000000ULL;
     intervalometerRtcBurstCount = 1;
+    intervalometerRtcBurstDelaySec = 1;
     return false;
   }
 
@@ -266,6 +279,7 @@ static void handleIntervalometerConfigGet() {
   json += "\"intervalValue\":" + String(runtimeConfig.intervalometerSettings.intervalValue) + ",";
   json += "\"intervalUnit\":" + String(runtimeConfig.intervalometerSettings.intervalUnit) + ",";
   json += "\"burstCount\":" + String(runtimeConfig.intervalometerSettings.burstCount) + ",";
+  json += "\"burstDelaySec\":" + String(runtimeConfig.intervalometerSettings.burstDelaySec) + ",";
   json += "\"active\":" + String(intervalometerRtcActive ? "true" : "false");
   json += "}";
 
@@ -299,6 +313,15 @@ static bool parseIntervalometerArgs(IntervalometerSettings &settings, String &er
       return false;
     }
     settings.burstCount = (uint8_t)burst;
+  }
+
+  if (server.hasArg("burstDelaySec")) {
+    uint32_t burstDelay = 0;
+    if (!parseUint32Arg(server.arg("burstDelaySec"), burstDelay) || burstDelay > 255U) {
+      errorOut = "Invalid burst delay";
+      return false;
+    }
+    settings.burstDelaySec = (uint8_t)burstDelay;
   }
 
   clampIntervalometerSettings(settings);
@@ -356,6 +379,7 @@ static void handleIntervalometerStart() {
   intervalometerRtcImageIndex = 0;
   intervalometerRtcIntervalUs = intervalometerConfigToIntervalUs(updated);
   intervalometerRtcBurstCount = updated.burstCount;
+  intervalometerRtcBurstDelaySec = updated.burstDelaySec;
 
   server.send(HTTP_OK, "text/plain", "Intervalometer started. First burst is being captured now.");
   delay(120);

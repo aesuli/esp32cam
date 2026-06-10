@@ -657,6 +657,7 @@ struct IntervalometerSettings {
   uint32_t intervalValue = 60;  // 1..100000
   uint8_t intervalUnit = 0;     // 0=seconds,1=minutes,2=hours,3=days
   uint8_t burstCount = 1;       // 1..10
+  uint8_t burstDelaySec = 1;    // 1..100
 };
 
 struct StoredConfig {
@@ -679,6 +680,7 @@ RTC_DATA_ATTR static uint32_t intervalometerRtcTimelapseId = 0;
 RTC_DATA_ATTR static uint32_t intervalometerRtcImageIndex = 0;
 RTC_DATA_ATTR static uint64_t intervalometerRtcIntervalUs = 60000000ULL;
 RTC_DATA_ATTR static uint8_t intervalometerRtcBurstCount = 1;
+RTC_DATA_ATTR static uint8_t intervalometerRtcBurstDelaySec = 1;
 
 struct FrameSizeOption {
   framesize_t value;
@@ -2109,6 +2111,8 @@ static void clampIntervalometerSettings(IntervalometerSettings &settings) {
   if (!isValidIntervalometerUnitValue(settings.intervalUnit)) settings.intervalUnit = 0;
   if (settings.burstCount < 1U) settings.burstCount = 1U;
   if (settings.burstCount > 10U) settings.burstCount = 10U;
+  if (settings.burstDelaySec < 1U) settings.burstDelaySec = 1U;
+  if (settings.burstDelaySec > 100U) settings.burstDelaySec = 100U;
 }
 
 static void appendI16(std::vector<uint8_t> &buf, int16_t value) {
@@ -2717,6 +2721,7 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
   appendU32(plain, cfg.intervalometerSettings.intervalValue);
   appendU8(plain, cfg.intervalometerSettings.intervalUnit);
   appendU8(plain, cfg.intervalometerSettings.burstCount);
+  appendU8(plain, cfg.intervalometerSettings.burstDelaySec);
 
   return encryptPayload(plain, ivHex, cipherHex);
 }
@@ -2812,15 +2817,10 @@ static bool decryptConfig(const String &ivHex, const String &cipherHex, StoredCo
   cfg.wifiEnabled = (wifiEnabled != 0);
 
   cfg.intervalometerSettings = IntervalometerSettings();
-  if (offset < plain.size()) {
-    if (!readU32(plain, offset, cfg.intervalometerSettings.intervalValue)) return false;
-  }
-  if (offset < plain.size()) {
-    if (!readU8(plain, offset, cfg.intervalometerSettings.intervalUnit)) return false;
-  }
-  if (offset < plain.size()) {
-    if (!readU8(plain, offset, cfg.intervalometerSettings.burstCount)) return false;
-  }
+  if (!readU32(plain, offset, cfg.intervalometerSettings.intervalValue)) return false;
+  if (!readU8(plain, offset, cfg.intervalometerSettings.intervalUnit)) return false;
+  if (!readU8(plain, offset, cfg.intervalometerSettings.burstCount)) return false;
+  if (!readU8(plain, offset, cfg.intervalometerSettings.burstDelaySec)) return false;
 
   cfg.motionSettings.enabled = (motionEnabled != 0);
   cfg.motionSettings.captureImage = (motionCaptureImage != 0);

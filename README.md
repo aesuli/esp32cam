@@ -117,6 +117,7 @@ Use this page to run deep-sleep timelapse captures.
 
 - Configure interval value (1 to 100000) and unit (seconds, minutes, hours, days).
 - Configure burst count (1 to 10 images per wake cycle).
+- Configure delay between burst shots (1 to 100 seconds).
 - Start timelapse from the page:
   - first burst is captured immediately;
   - device enters deep sleep and wakes by timer for the next burst.
@@ -135,6 +136,7 @@ Use this page for SD file management.
 - Delete files and folders (folder delete is recursive).
 - Upload files to the current folder (file picker or drag and drop).
 - Download single or multiple selected files.
+- Export multiple selected JPG/JPEG files as a single MJPG AVI download with selectable frame rate.
 - Open supported files in browser.
 - Built-in playback page for recorded media.
 - Sort by name, size, or type (ascending/descending).
