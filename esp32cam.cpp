@@ -92,7 +92,7 @@ static constexpr uint32_t CAMERA_XCLK_FREQS_HZ[] = {
 
 // ─── SD configuration storage ──────────────────────────────────────────────────
 #define CONFIG_FILE_PATH "/config.enc"
-#define CONFIG_FILE_MAGIC "ESP32CAMCFG12"
+#define CONFIG_FILE_MAGIC "ESP32CAMCFG13"
 #define CAPTURE_COUNTER_FILE_PATH "/capture_counter.txt"
 #define TIMELAPSE_COUNTER_FILE_PATH "/timelapse_counter.txt"
 #define SD_SORT_FILE_PATH "/.sort"
@@ -658,6 +658,7 @@ struct IntervalometerSettings {
   uint8_t intervalUnit = 0;     // 0=seconds,1=minutes,2=hours,3=days
   uint8_t burstCount = 1;       // 1..10
   uint8_t burstDelaySec = 1;    // 1..100
+  bool continueAfterPowerLoss = false;
 };
 
 struct StoredConfig {
@@ -2722,6 +2723,7 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
   appendU8(plain, cfg.intervalometerSettings.intervalUnit);
   appendU8(plain, cfg.intervalometerSettings.burstCount);
   appendU8(plain, cfg.intervalometerSettings.burstDelaySec);
+  appendU8(plain, cfg.intervalometerSettings.continueAfterPowerLoss ? 1 : 0);
 
   return encryptPayload(plain, ivHex, cipherHex);
 }
@@ -2821,6 +2823,9 @@ static bool decryptConfig(const String &ivHex, const String &cipherHex, StoredCo
   if (!readU8(plain, offset, cfg.intervalometerSettings.intervalUnit)) return false;
   if (!readU8(plain, offset, cfg.intervalometerSettings.burstCount)) return false;
   if (!readU8(plain, offset, cfg.intervalometerSettings.burstDelaySec)) return false;
+  uint8_t continueAfterPowerLoss = 0;
+  if (!readU8(plain, offset, continueAfterPowerLoss)) return false;
+  cfg.intervalometerSettings.continueAfterPowerLoss = (continueAfterPowerLoss != 0);
 
   cfg.motionSettings.enabled = (motionEnabled != 0);
   cfg.motionSettings.captureImage = (motionCaptureImage != 0);

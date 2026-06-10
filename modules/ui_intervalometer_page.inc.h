@@ -57,7 +57,15 @@ __APP_NAV__
       <label for="burst_delay_sec">Delay between burst shots (seconds, 1-100)</label>
       <input id="burst_delay_sec" type="number" min="1" max="100" step="1" value="1">
     </div>
+    <div class="cg row">
+      <label for="continue_after_power_loss">Continue after power loss</label>
+      <select id="continue_after_power_loss">
+        <option value="0" selected>No (default)</option>
+        <option value="1">Yes</option>
+      </select>
+    </div>
     <div class="small">When started, the camera takes the first burst immediately, then sleeps and wakes by timer. WiFi and motion functions are disabled until power cycle.</div>
+    <div class="small">If continue-after-power-loss is enabled, timelapse resumes after boot unless RX button (GPIO3) is held during power-on.</div>
     <div class="actions" style="margin-top:12px">
       <button id="start_btn" class="btn" type="button">Start Timelapse</button>
     </div>
@@ -75,7 +83,8 @@ function payload(){
     intervalValue:clamp(asInt(id('interval_value').value,60),1,100000),
     intervalUnit:clamp(asInt(id('interval_unit').value,0),0,3),
     burstCount:clamp(asInt(id('burst_count').value,1),1,10),
-    burstDelaySec:clamp(asInt(id('burst_delay_sec').value,1),1,100)
+    burstDelaySec:clamp(asInt(id('burst_delay_sec').value,1),1,100),
+    continueAfterPowerLoss:asInt(id('continue_after_power_loss').value,0)?1:0
   };
 }
 function encodeForm(obj){
@@ -86,6 +95,7 @@ function fill(c){
   id('interval_unit').value=String(c.intervalUnit||0);
   id('burst_count').value=c.burstCount||1;
   id('burst_delay_sec').value=c.burstDelaySec||1;
+  id('continue_after_power_loss').value=c.continueAfterPowerLoss?'1':'0';
 }
 var saveTimer=0;
 var savePending=false;
@@ -154,6 +164,7 @@ id('interval_value').addEventListener('change',scheduleSave);
 id('interval_unit').addEventListener('change',scheduleSave);
 id('burst_count').addEventListener('change',scheduleSave);
 id('burst_delay_sec').addEventListener('change',scheduleSave);
+id('continue_after_power_loss').addEventListener('change',scheduleSave);
 id('start_btn').addEventListener('click',startTimelapse);
 loadCfg();
 </script>

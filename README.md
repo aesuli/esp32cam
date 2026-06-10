@@ -123,7 +123,8 @@ Use this page to run deep-sleep timelapse captures.
   - device enters deep sleep and wakes by timer for the next burst.
 - Wake period is compensated by capture time so interval cadence does not drift.
 - During intervalometer mode, WiFi and motion features are suspended.
-- Intervalometer mode stops on power cycle.
+- Intervalometer mode stops on power cycle by default.
+- Optional: enable continue-after-power-loss; if RX button (GPIO3) is held during power-on, timelapse is interrupted instead of resumed.
 - Files are saved as:
   - `/timelapse/t-<num_timelapse>/i-<num_img>-<num_burst>-<time>.jpg`
 

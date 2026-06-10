@@ -42,6 +42,15 @@ static uint64_t intervalometerConfigToIntervalUs(const IntervalometerSettings &s
   return seconds * 1000000ULL;
 }
 
+static void clearIntervalometerRtcState() {
+  intervalometerRtcActive = false;
+  intervalometerRtcTimelapseId = 0;
+  intervalometerRtcImageIndex = 0;
+  intervalometerRtcIntervalUs = 60000000ULL;
+  intervalometerRtcBurstCount = 1;
+  intervalometerRtcBurstDelaySec = 1;
+}
+
 static bool ensureTimelapseDirectory(const String &path) {
   if (path.isEmpty() || path[0] != '/') {
     return false;
@@ -246,16 +255,25 @@ static bool serviceIntervalometerStartupIfNeeded() {
     return false;
   }
 
+  bool continueAfterPowerLoss = runtimeConfig.intervalometerSettings.continueAfterPowerLoss;
   esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
-  if (wakeCause != ESP_SLEEP_WAKEUP_TIMER) {
+  if (wakeCause != ESP_SLEEP_WAKEUP_TIMER && !continueAfterPowerLoss) {
     Logger.LogLine("[TLM] Clearing intervalometer state (not a timer wake)");
-    intervalometerRtcActive = false;
-    intervalometerRtcTimelapseId = 0;
-    intervalometerRtcImageIndex = 0;
-    intervalometerRtcIntervalUs = 60000000ULL;
-    intervalometerRtcBurstCount = 1;
-    intervalometerRtcBurstDelaySec = 1;
+    clearIntervalometerRtcState();
     return false;
+  }
+
+  if (wakeCause != ESP_SLEEP_WAKEUP_TIMER && continueAfterPowerLoss) {
+    // Use button state at boot as an explicit "do not continue" override.
+    pinMode(MOTION_TOGGLE_BUTTON_GPIO, INPUT_PULLDOWN);
+    delay(2);
+    if (digitalRead(MOTION_TOGGLE_BUTTON_GPIO) == HIGH) {
+      Logger.LogLine("[TLM] Timelapse interrupted at boot (RX button held)");
+      clearIntervalometerRtcState();
+      return false;
+    }
+
+    Logger.LogLine("[TLM] Continuing timelapse after power loss");
   }
 
   Logger.Log("[TLM] Resume timelapse t-%lu image #%lu\n",
@@ -280,6 +298,7 @@ static void handleIntervalometerConfigGet() {
   json += "\"intervalUnit\":" + String(runtimeConfig.intervalometerSettings.intervalUnit) + ",";
   json += "\"burstCount\":" + String(runtimeConfig.intervalometerSettings.burstCount) + ",";
   json += "\"burstDelaySec\":" + String(runtimeConfig.intervalometerSettings.burstDelaySec) + ",";
+  json += "\"continueAfterPowerLoss\":" + String(runtimeConfig.intervalometerSettings.continueAfterPowerLoss ? "true" : "false") + ",";
   json += "\"active\":" + String(intervalometerRtcActive ? "true" : "false");
   json += "}";
 
@@ -322,6 +341,13 @@ static bool parseIntervalometerArgs(IntervalometerSettings &settings, String &er
       return false;
     }
     settings.burstDelaySec = (uint8_t)burstDelay;
+  }
+
+  if (server.hasArg("continueAfterPowerLoss")) {
+    String value = server.arg("continueAfterPowerLoss");
+    value.trim();
+    value.toLowerCase();
+    settings.continueAfterPowerLoss = (value == "1" || value == "true" || value == "on");
   }
 
   clampIntervalometerSettings(settings);
