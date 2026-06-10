@@ -107,8 +107,18 @@ Use this page to configure PIR-triggered behavior.
 - Set detection cooldown interval between triggers.
 - Optional notify URL (HTTP GET) on motion event.
 - Open live Motion Graph page for PIR signal visualization.
-- Optional auto-standby after 2 minutes without authenticated requests and without motion events.
-- Manual Enter Standby Now command from the page.
+
+### Admin page
+
+Use this page for system-wide settings and maintenance.
+
+- Configure WiFi priority list and credentials.
+- Manage admin password and device name.
+- Set time manually or request NTP sync.
+- Configure LED blink-on-access behavior.
+- Configure logging to /log.txt.
+- Configure optional auto-standby after 2 minutes without authenticated requests and without motion events.
+- Trigger Enter Standby Now manually.
 - Deep standby wake source is PIR HIGH on GPIO13.
 
 ### Intervalometer page

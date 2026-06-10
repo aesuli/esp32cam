@@ -267,7 +267,7 @@ static bool gLogWriteInProgress = false;
 static bool gLogSdReady = false;
 static bool gLogSdFailureReported = false;
 static bool gLogFileFailureReported = false;
-static bool gLogFileEnabled = true;
+static bool gLogFileEnabled = false;
 static bool gSdCardMounted = false;
 static volatile bool gSdOperationInProgress = false;
 static constexpr size_t LOG_FILE_BUFFER_CAPACITY = 8192;
@@ -2975,22 +2975,11 @@ static void configureCameraPins(camera_config_t &config, uint32_t xclkFreqHz) {
   config.pin_reset = RESET_GPIO_NUM;
   config.xclk_freq_hz = xclkFreqHz;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
-  config.fb_location = CAMERA_FB_IN_DRAM;
-  config.frame_size = FRAMESIZE_VGA;
-  config.jpeg_quality = 12;
-  config.fb_count = 1;
-}
-
-static void tuneCameraConfigForMemory(camera_config_t &config) {
-  if (psramFound()) {
-    config.fb_location = CAMERA_FB_IN_PSRAM;
-    config.jpeg_quality = 10;
-    config.fb_count = 2;
-    config.grab_mode = CAMERA_GRAB_LATEST;
-  } else {
-    config.frame_size = FRAMESIZE_CIF;
-  }
+  config.grab_mode = CAMERA_GRAB_LATEST;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.frame_size = FRAMESIZE_SXGA;
+  config.jpeg_quality = 25;
+  config.fb_count = 2;
 }
 
 static void applySensorDefaults() {
@@ -3013,7 +3002,6 @@ static bool initCamera(uint32_t xclkFreqHz) {
 
   camera_config_t config;
   configureCameraPins(config, xclkFreqHz);
-  tuneCameraConfigForMemory(config);
 
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {

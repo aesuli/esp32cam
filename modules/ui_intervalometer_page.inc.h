@@ -60,7 +60,7 @@ __APP_NAV__
     <div class="cg row">
       <label for="continue_after_power_loss">Continue after power loss</label>
       <select id="continue_after_power_loss">
-        <option value="0" selected>No (default)</option>
+        <option value="0" selected>No</option>
         <option value="1">Yes</option>
       </select>
     </div>
