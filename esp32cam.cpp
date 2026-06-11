@@ -166,6 +166,7 @@ static bool   motionLatched = false;
 static bool   motionToggleButtonStableHigh = false;
 static bool   motionToggleButtonLastReadingHigh = false;
 static bool   motionToggleButtonLongPressHandled = false;
+static bool   motionToggleButtonConsumeUntilRelease = false;
 static uint8_t motionToggleButtonClickCount = 0;
 static volatile bool motionEdgePending = false;
 static volatile uint32_t motionEdgeCount = 0;
@@ -4539,6 +4540,7 @@ static void resetMotionRuntimeState() {
   motionActionWindowActive = false;
   motionNotifyPending = false;
   motionNotifyLastAttemptAt = 0;
+  motionToggleButtonConsumeUntilRelease = false;
   motionIgnoreUntilAt = 0;
   motionEnableActivationAt = 0;
   deferredNetworkStartupPending = false;
@@ -4612,11 +4614,37 @@ static void applyMotionToggleButtonInputMode() {
   motionToggleButtonLastChangeAt = millis();
   motionToggleButtonClickCount = 0;
   motionToggleButtonClickDeadlineAt = 0;
+  if (motionToggleButtonConsumeUntilRelease && !initialHigh) {
+    motionToggleButtonConsumeUntilRelease = false;
+  }
 }
 
 static void serviceMotionToggleButton() {
   unsigned long now = millis();
   bool readingHigh = (digitalRead(MOTION_TOGGLE_BUTTON_GPIO) == HIGH);
+
+  if (motionToggleButtonConsumeUntilRelease) {
+    if (readingHigh != motionToggleButtonLastReadingHigh) {
+      motionToggleButtonLastReadingHigh = readingHigh;
+      motionToggleButtonLastChangeAt = now;
+    }
+
+    if ((now - motionToggleButtonLastChangeAt) < MOTION_TOGGLE_DEBOUNCE_MS) {
+      return;
+    }
+
+    if (!readingHigh) {
+      // A boot-time hold was used for timelapse interruption; ignore it until released.
+      motionToggleButtonConsumeUntilRelease = false;
+      motionToggleButtonStableHigh = false;
+      motionToggleButtonLastReadingHigh = false;
+      motionToggleButtonLongPressHandled = false;
+      motionToggleButtonPressedAt = 0;
+      motionToggleButtonClickCount = 0;
+      motionToggleButtonClickDeadlineAt = 0;
+    }
+    return;
+  }
 
   if (readingHigh != motionToggleButtonLastReadingHigh) {
     motionToggleButtonLastReadingHigh = readingHigh;

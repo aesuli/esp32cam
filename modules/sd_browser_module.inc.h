@@ -164,6 +164,115 @@ static void handleSDPage() {
   sendAppHtmlWithToken(SD_HTML, AppPage::Sd, "SD Browser");
 }
 
+static inline bool sdIsAsciiDigit(char ch) {
+  return ch >= '0' && ch <= '9';
+}
+
+static inline char sdToLowerAscii(char ch) {
+  return (ch >= 'A' && ch <= 'Z') ? (char)(ch + ('a' - 'A')) : ch;
+}
+
+static int sdCompareNaturalName(const String &a, const String &b) {
+  const size_t aLen = a.length();
+  const size_t bLen = b.length();
+  size_t ai = 0;
+  size_t bi = 0;
+
+  while (ai < aLen && bi < bLen) {
+    const char ac = a.charAt(ai);
+    const char bc = b.charAt(bi);
+    const bool aDigit = sdIsAsciiDigit(ac);
+    const bool bDigit = sdIsAsciiDigit(bc);
+
+    if (aDigit && bDigit) {
+      size_t aRunEnd = ai;
+      size_t bRunEnd = bi;
+      while (aRunEnd < aLen && sdIsAsciiDigit(a.charAt(aRunEnd))) {
+        ++aRunEnd;
+      }
+      while (bRunEnd < bLen && sdIsAsciiDigit(b.charAt(bRunEnd))) {
+        ++bRunEnd;
+      }
+
+      size_t aTrim = ai;
+      size_t bTrim = bi;
+      while (aTrim < aRunEnd && a.charAt(aTrim) == '0') {
+        ++aTrim;
+      }
+      while (bTrim < bRunEnd && b.charAt(bTrim) == '0') {
+        ++bTrim;
+      }
+
+      const size_t aDigits = aRunEnd - aTrim;
+      const size_t bDigits = bRunEnd - bTrim;
+      if (aDigits != bDigits) {
+        return aDigits < bDigits ? -1 : 1;
+      }
+
+      if (aDigits > 0U) {
+        for (size_t i = 0; i < aDigits; ++i) {
+          const char da = a.charAt(aTrim + i);
+          const char db = b.charAt(bTrim + i);
+          if (da != db) {
+            return da < db ? -1 : 1;
+          }
+        }
+      }
+
+      const size_t aRunLen = aRunEnd - ai;
+      const size_t bRunLen = bRunEnd - bi;
+      if (aRunLen != bRunLen) {
+        return aRunLen < bRunLen ? -1 : 1;
+      }
+
+      ai = aRunEnd;
+      bi = bRunEnd;
+      continue;
+    }
+
+    if (aDigit != bDigit) {
+      return aDigit ? -1 : 1;
+    }
+
+    const char al = sdToLowerAscii(ac);
+    const char bl = sdToLowerAscii(bc);
+    if (al != bl) {
+      return al < bl ? -1 : 1;
+    }
+    if (ac != bc) {
+      return ac < bc ? -1 : 1;
+    }
+
+    ++ai;
+    ++bi;
+  }
+
+  if (ai < aLen) {
+    return 1;
+  }
+  if (bi < bLen) {
+    return -1;
+  }
+  return 0;
+}
+
+static String sdGetLowerExtension(const String &name) {
+  int dot = name.lastIndexOf('.');
+  if (dot < 0 || dot + 1 >= (int)name.length()) {
+    return String();
+  }
+  String ext = name.substring(dot + 1);
+  ext.toLowerCase();
+  return ext;
+}
+
+struct SDListItem {
+  String name;
+  String path;
+  bool isDir;
+  uint32_t size;
+};
+
 static void handleSDList() {
   if (!checkAuth()) {
     server.send(HTTP_UNAUTHORIZED, "application/json", "{\"error\":\"Unauthorized\"}");
@@ -195,8 +304,13 @@ static void handleSDList() {
     return;
   }
 
-  String json = "{\"dir\":\"" + jsonEscape(dirPath) + "\",\"items\":[";
-  bool first = true;
+  String sortBy;
+  String sortDir;
+  loadSDSortPreferences(sortBy, sortDir);
+  const bool descending = (sortDir == "desc");
+
+  std::vector<SDListItem> items;
+  items.reserve(32);
 
   File entry = dir.openNextFile();
   while (entry) {
@@ -224,14 +338,12 @@ static void handleSDList() {
         itemName = itemName.substring(slash + 1);
       }
 
-      if (!first) {
-        json += ",";
-      }
-      json += "{\"name\":\"" + jsonEscape(itemName) + "\",";
-      json += "\"path\":\"" + jsonEscape(normalizedPath) + "\",";
-      json += "\"isDir\":" + String(entry.isDirectory() ? "true" : "false") + ",";
-      json += "\"size\":" + String((unsigned int)entry.size()) + "}";
-      first = false;
+      SDListItem item;
+      item.name = itemName;
+      item.path = normalizedPath;
+      item.isDir = entry.isDirectory();
+      item.size = (uint32_t)entry.size();
+      items.push_back(item);
     }
 
     entry.close();
@@ -239,6 +351,50 @@ static void handleSDList() {
   }
 
   dir.close();
+
+  std::sort(items.begin(), items.end(), [&](const SDListItem &a, const SDListItem &b) {
+    if (a.isDir != b.isDir) {
+      return a.isDir;
+    }
+
+    int cmp = 0;
+    if (sortBy == "size") {
+      if (a.size < b.size) {
+        cmp = -1;
+      } else if (a.size > b.size) {
+        cmp = 1;
+      }
+    } else if (sortBy == "type") {
+      String aExt = sdGetLowerExtension(a.name);
+      String bExt = sdGetLowerExtension(b.name);
+      cmp = aExt.compareTo(bExt);
+      if (cmp == 0) {
+        cmp = sdCompareNaturalName(a.name, b.name);
+      }
+    } else {
+      cmp = sdCompareNaturalName(a.name, b.name);
+    }
+
+    if (cmp == 0) {
+      cmp = sdCompareNaturalName(a.name, b.name);
+    }
+    return descending ? (cmp > 0) : (cmp < 0);
+  });
+
+  String json = "{\"dir\":\"" + jsonEscape(dirPath) + "\",\"items\":[";
+  bool first = true;
+
+  for (const SDListItem &item : items) {
+    if (!first) {
+      json += ",";
+    }
+    json += "{\"name\":\"" + jsonEscape(item.name) + "\",";
+    json += "\"path\":\"" + jsonEscape(item.path) + "\",";
+    json += "\"isDir\":" + String(item.isDir ? "true" : "false") + ",";
+    json += "\"size\":" + String((unsigned int)item.size) + "}";
+    first = false;
+  }
+
   json += "]}";
   sdLock.release();
   server.send(HTTP_OK, "application/json", json);

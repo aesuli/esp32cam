@@ -346,21 +346,34 @@ function renderCrumbs(){
 function sortItems(items){
   var by=document.getElementById('sort_by').value;
   var dir=document.getElementById('sort_dir').value==='desc'?-1:1;
-  function splitNumericPrefix(name){
-    var text=String(name||'');
-    var m=text.match(/^(\d+)(.*)$/);
-    if(!m) return {hasPrefix:false,num:0,rest:text};
-    return {hasPrefix:true,num:parseInt(m[1],10)||0,rest:m[2]};
-  }
+  // Natural sort: numeric chunks in names compare by number, not lexicographically.
   function compareSmartName(aName,bName){
-    var aParts=splitNumericPrefix(aName);
-    var bParts=splitNumericPrefix(bName);
-    if(aParts.hasPrefix&&bParts.hasPrefix){
-      if(aParts.num!==bParts.num) return aParts.num-bParts.num;
-      return aParts.rest.localeCompare(bParts.rest);
+    var a=String(aName||'');
+    var b=String(bName||'');
+    var aParts=a.match(/\d+|\D+/g)||[''];
+    var bParts=b.match(/\d+|\D+/g)||[''];
+    var len=Math.max(aParts.length,bParts.length);
+    for(var i=0;i<len;i++){
+      var ap=aParts[i];
+      var bp=bParts[i];
+      if(ap===undefined) return -1;
+      if(bp===undefined) return 1;
+      var aIsNum=/^\d+$/.test(ap);
+      var bIsNum=/^\d+$/.test(bp);
+      if(aIsNum&&bIsNum){
+        var an=parseInt(ap,10)||0;
+        var bn=parseInt(bp,10)||0;
+        if(an!==bn) return an-bn;
+        if(ap.length!==bp.length) return ap.length-bp.length;
+        continue;
+      }
+      if(aIsNum!==bIsNum) return aIsNum?-1:1;
+      var al=ap.toLowerCase();
+      var bl=bp.toLowerCase();
+      if(al!==bl) return al<bl?-1:1;
+      if(ap!==bp) return ap<bp?-1:1;
     }
-    if(aParts.hasPrefix!==bParts.hasPrefix) return aParts.hasPrefix?-1:1;
-    return String(aName||'').localeCompare(String(bName||''));
+    return 0;
   }
   return items.slice().sort(function(a,b){
     if(a.isDir!==b.isDir) return a.isDir?-1:1;

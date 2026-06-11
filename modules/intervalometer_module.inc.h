@@ -139,7 +139,7 @@ static String buildIntervalometerImagePath(uint32_t timelapseId, uint32_t imageN
   String stamp = buildTimestampFilenameToken();
 
   char filename[80];
-  snprintf(filename, sizeof(filename), "i-%lu-%u-%s.jpg",
+  snprintf(filename, sizeof(filename), "%lu-%u-%s.jpg",
     (unsigned long)imageNumber,
     (unsigned int)burstNumber,
     stamp.c_str());
@@ -269,6 +269,7 @@ static bool serviceIntervalometerStartupIfNeeded() {
     delay(2);
     if (digitalRead(MOTION_TOGGLE_BUTTON_GPIO) == HIGH) {
       Logger.LogLine("[TLM] Timelapse interrupted at boot (RX button held)");
+      motionToggleButtonConsumeUntilRelease = true;
       clearIntervalometerRtcState();
       return false;
     }
