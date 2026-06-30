@@ -31,7 +31,7 @@ static bool writeCapturedJpegToPath(const OwnedJpegFrame &frame, const String &p
   return ok;
 }
 
-static bool captureImageToPath(const String &path) {
+static bool captureImageToPath(const String &path, bool useMotionFlash = false) {
   if (path.isEmpty()) {
     return false;
   }
@@ -51,14 +51,25 @@ static bool captureImageToPath(const String &path) {
     return false;
   }
 
+  bool flashWasMotionOwned = motionCaptureFlashOwned;
+  if (useMotionFlash) {
+    startMotionCaptureFlashIfNeeded();
+  }
+
   camera_fb_t *fb = lockAndCaptureFrame(pdMS_TO_TICKS(1000));
   if (!fb) {
+    if (useMotionFlash && !flashWasMotionOwned) {
+      stopMotionCaptureFlashIfOwned();
+    }
     return false;
   }
 
   OwnedJpegFrame frame;
   bool copied = copyCameraFrame(fb, frame);
   unlockCameraFrame(fb);
+  if (useMotionFlash && !flashWasMotionOwned) {
+    stopMotionCaptureFlashIfOwned();
+  }
   if (!copied) {
     return false;
   }
@@ -67,7 +78,7 @@ static bool captureImageToPath(const String &path) {
   return writeCapturedJpegToPath(frame, path);
 }
 
-static bool captureImageToSD(String &savedPath) {
+static bool captureImageToSD(String &savedPath, bool useMotionFlash) {
   savedPath = "";
 
   {
@@ -94,7 +105,7 @@ static bool captureImageToSD(String &savedPath) {
   }
 
   savedPath = buildCapturePath(sequence, "jpg");
-  return captureImageToPath(savedPath);
+  return captureImageToPath(savedPath, useMotionFlash);
 }
 
 static void handleCaptureSD() {
@@ -278,6 +289,7 @@ static void stopRecordingSession(bool keepFile) {
 
   resetRecordingState();
   resetStreamPreviewFrame();
+  stopMotionCaptureFlashIfOwned();
   if (!streamClientConnected) {
     setWifiModemSleep(true, "idle");
   }

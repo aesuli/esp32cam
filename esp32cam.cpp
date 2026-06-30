@@ -92,7 +92,7 @@ static constexpr uint32_t CAMERA_XCLK_FREQS_HZ[] = {
 
 // ─── SD configuration storage ──────────────────────────────────────────────────
 #define CONFIG_FILE_PATH "/config.enc"
-#define CONFIG_FILE_MAGIC "ESP32CAMCFG13"
+#define CONFIG_FILE_MAGIC "ESP32CAMCFG14"
 #define CAPTURE_COUNTER_FILE_PATH "/capture_counter.txt"
 #define TIMELAPSE_COUNTER_FILE_PATH "/timelapse_counter.txt"
 #define SD_SORT_FILE_PATH "/.sort"
@@ -156,6 +156,7 @@ static bool   recordingActive = false;
 static volatile bool streamClientConnected = false;
 static volatile bool streamClientAbortRequested = false;
 static bool   flashEnabled = false;
+static bool   motionCaptureFlashOwned = false;
 static bool   cameraInitialized = false;
 static bool   ledAccessBlinkEnabled = false;
 static bool   wifiModemSleepEnabled = false;
@@ -647,6 +648,7 @@ struct MotionSettings {
   uint8_t imageCount = 1;            // 1..10
   uint8_t imageDelayDs = 1;          // deciseconds: 1..20 (0.1s..2.0s)
   bool captureVideo = false;
+  bool flashOnCapture = false;
   uint8_t videoDurationSec = 5;      // 1..30
   uint16_t detectionIntervalSec = 0; // 0,5,10,30,60,600
   String notifyUrl;
@@ -750,7 +752,7 @@ static void servicePendingStandby();
 static void triggerMotionEvent(const char *source);
 static void noteAuthenticatedWebActivity();
 static void closeMotionActionWindow();
-static bool captureImageToSD(String &savedPath);
+static bool captureImageToSD(String &savedPath, bool useMotionFlash = false);
 static bool startRecordingSessionInternal(String &message);
 static bool startManualRecordingSession(String &message);
 static bool stopRecordingSessionInternal(String &message);
@@ -762,6 +764,7 @@ static void clampMotionSettings(MotionSettings &settings);
 static void handleMotionPage();
 static void handleMotionConfigGet();
 static void handleMotionConfigSet();
+static bool applyMotionSettingsChange(const MotionSettings &settings, const char *source, String &message);
 static bool isValidIntervalometerUnitValue(uint8_t unit);
 static void clampIntervalometerSettings(IntervalometerSettings &settings);
 static bool sendMotionNotifyRequest(const String &url);
@@ -770,6 +773,9 @@ static wifi_power_t validatedTxPowerValue(int configuredValue, wifi_power_t fall
 static void setWifiModemSleep(bool enabled, const char *reason = nullptr);
 static bool applyWifiEnabledRuntimeState(bool enabled, bool showLedFeedback);
 static bool persistWifiEnabledAndApply(bool enabled, const char *reason);
+static void setFlashOutput(bool enabled);
+static void startMotionCaptureFlashIfNeeded();
+static void stopMotionCaptureFlashIfOwned();
 static void registerCameraRoutes();
 static void registerIntervalometerRoutes();
 static void startAuxHttpServers();
@@ -958,8 +964,8 @@ static void powerDownCameraHardware() {
     digitalWrite(PWDN_GPIO_NUM, HIGH);
   }
 
-  digitalWrite(LED_FLASH_GPIO_NUM, LOW);
-  flashEnabled = false;
+  setFlashOutput(false);
+  motionCaptureFlashOwned = false;
 }
 
 static bool initSDCard() {
@@ -2682,7 +2688,7 @@ static bool decryptPayload(const String &ivHex, const String &cipherHex, std::ve
 
 static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipherHex) {
   std::vector<uint8_t> plain;
-  plain.reserve(cfg.adminPass.length() + cfg.deviceName.length() + cfg.wifiList.size() * 96 + cfg.motionSettings.notifyUrl.length() + 128);
+  plain.reserve(cfg.adminPass.length() + cfg.deviceName.length() + cfg.wifiList.size() * 96 + cfg.motionSettings.notifyUrl.length() + 160);
 
   uint16_t wifiCount = (uint16_t)cfg.wifiList.size();
   plain.push_back((uint8_t)(wifiCount & 0xFF));
@@ -2714,6 +2720,7 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
   appendU8(plain, cfg.motionSettings.imageCount);
   appendU8(plain, cfg.motionSettings.imageDelayDs);
   appendU8(plain, cfg.motionSettings.captureVideo ? 1 : 0);
+  appendU8(plain, cfg.motionSettings.flashOnCapture ? 1 : 0);
   appendU8(plain, cfg.motionSettings.videoDurationSec);
   appendU16(plain, cfg.motionSettings.detectionIntervalSec);
   appendField(plain, cfg.motionSettings.notifyUrl);
@@ -2799,6 +2806,8 @@ static bool decryptConfig(const String &ivHex, const String &cipherHex, StoredCo
   if (!readU8(plain, offset, cfg.motionSettings.imageCount)) return false;
   if (!readU8(plain, offset, cfg.motionSettings.imageDelayDs)) return false;
   if (!readU8(plain, offset, motionCaptureVideo)) return false;
+  uint8_t motionFlashOnCapture = 0;
+  if (!readU8(plain, offset, motionFlashOnCapture)) return false;
   if (!readU8(plain, offset, cfg.motionSettings.videoDurationSec)) return false;
   if (!readU16(plain, offset, cfg.motionSettings.detectionIntervalSec)) return false;
   if (!readField(plain, offset, cfg.motionSettings.notifyUrl)) return false;
@@ -2831,6 +2840,7 @@ static bool decryptConfig(const String &ivHex, const String &cipherHex, StoredCo
   cfg.motionSettings.enabled = (motionEnabled != 0);
   cfg.motionSettings.captureImage = (motionCaptureImage != 0);
   cfg.motionSettings.captureVideo = (motionCaptureVideo != 0);
+  cfg.motionSettings.flashOnCapture = (motionFlashOnCapture != 0);
 
   clampMotionSettings(cfg.motionSettings);
   clampIntervalometerSettings(cfg.intervalometerSettings);
@@ -2993,9 +3003,34 @@ static void applySensorDefaults() {
 }
 
 static void resetFlashOutput() {
+  setFlashOutput(false);
+  motionCaptureFlashOwned = false;
+}
+
+static void setFlashOutput(bool enabled) {
   pinMode(LED_FLASH_GPIO_NUM, OUTPUT);
-  digitalWrite(LED_FLASH_GPIO_NUM, LOW);
-  flashEnabled = false;
+  digitalWrite(LED_FLASH_GPIO_NUM, enabled ? HIGH : LOW);
+  flashEnabled = enabled;
+}
+
+static void startMotionCaptureFlashIfNeeded() {
+  if (!runtimeConfig.motionSettings.flashOnCapture || motionCaptureFlashOwned) {
+    return;
+  }
+
+  if (!flashEnabled) {
+    setFlashOutput(true);
+    motionCaptureFlashOwned = true;
+  }
+}
+
+static void stopMotionCaptureFlashIfOwned() {
+  if (!motionCaptureFlashOwned) {
+    return;
+  }
+
+  setFlashOutput(false);
+  motionCaptureFlashOwned = false;
 }
 
 static bool initCamera(uint32_t xclkFreqHz) {
@@ -3915,15 +3950,9 @@ static void handleControl() {
 
     // Handle non-sensor controls separately.
     if (varName == "flash") {
-        if (val) {
-            digitalWrite(LED_FLASH_GPIO_NUM, HIGH);
-            flashEnabled = true;
-            Logger.LogLine("[FLASH] Enabled");
-        } else {
-            digitalWrite(LED_FLASH_GPIO_NUM, LOW);
-            flashEnabled = false;
-            Logger.LogLine("[FLASH] Disabled");
-        }
+        motionCaptureFlashOwned = false;
+        setFlashOutput(val != 0);
+        Logger.LogLine(val ? "[FLASH] Enabled" : "[FLASH] Disabled");
         server.send(HTTP_OK, "text/plain", "OK");
         return;
     }
@@ -4708,20 +4737,15 @@ static void serviceMotionToggleButton() {
 
     MotionSettings updated = runtimeConfig.motionSettings;
     updated.enabled = !updated.enabled;
-    clampMotionSettings(updated);
-    runtimeConfig.motionSettings = updated;
 
-    if (!persistRuntimeConfig(runtimeConfig)) {
-      Logger.LogLine("[MOTION] Failed to persist RX button toggle");
+    String message;
+    if (!applyMotionSettingsChange(updated, "rx-toggle", message)) {
+      Logger.Log("[MOTION] RX button toggle failed: %s\n", message.c_str());
+      ledBlinkCount(4, 40, 40);
       return;
     }
 
-    resetMotionDetectionState();
-    applyPirInputMode();
-    attachInterrupt(digitalPinToInterrupt(PIR_GPIO), onPirEdgeInterrupt, CHANGE);
-
     if (runtimeConfig.motionSettings.enabled) {
-      scheduleMotionActivationDelay("rx-toggle");
       Logger.LogLine("[MOTION] Enabled by RX button");
       ledBlinkCount(2, 100, 100);
     } else {
@@ -4742,6 +4766,19 @@ static void serviceMotionToggleButton() {
     motionLastActivityAt = now;
 
     String message;
+    if (runtimeConfig.motionSettings.enabled) {
+      MotionSettings updated = runtimeConfig.motionSettings;
+      updated.enabled = false;
+      if (applyMotionSettingsChange(updated, "rx-long-press", message)) {
+        Logger.Log("[MOTION] Disabled by RX long press: %s\n", message.c_str());
+        ledBlinkCount(1, 100, 100);
+      } else {
+        Logger.Log("[MOTION] RX long-press disable failed: %s\n", message.c_str());
+        ledBlinkCount(4, 40, 40);
+      }
+      return;
+    }
+
     if (recordingActive) {
       if (motionVideoManagedRecording) {
         if (startManualRecordingSession(message)) {

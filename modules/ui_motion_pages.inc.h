@@ -56,6 +56,7 @@ __APP_NAV__
       <label for="video_duration_sec">Video duration (1-30 sec)</label>
       <input id="video_duration_sec" type="number" min="1" max="30" step="1">
     </div>
+    <div class="cg"><label><input id="flash_on_capture" type="checkbox"> Turn on flash while capturing motion media</label></div>
 
     <div class="cg row">
       <label for="detection_interval_sec">Interval between detections</label>
@@ -97,6 +98,7 @@ function buildPayload(){
     imageCount:asInt(id('image_count').value,1),
     imageDelayDs:Math.round((parseFloat(id('image_delay_ds').value)||0.1)*10),
     captureVideo:id('capture_video').checked?1:0,
+    flashOnCapture:id('flash_on_capture').checked?1:0,
     videoDurationSec:asInt(id('video_duration_sec').value,5),
     detectionIntervalSec:asInt(id('detection_interval_sec').value,0),
     notifyUrl:id('notify_url').value||'',
@@ -151,6 +153,7 @@ function loadConfig(){
     id('image_count').value=c.imageCount;
     id('image_delay_ds').value=((c.imageDelayDs||1)/10).toFixed(1);
     id('capture_video').checked=!!c.captureVideo;
+    id('flash_on_capture').checked=!!c.flashOnCapture;
     id('video_duration_sec').value=c.videoDurationSec;
     id('detection_interval_sec').value=String(c.detectionIntervalSec||0);
     id('notify_url').value=c.notifyUrl||'';
@@ -163,6 +166,7 @@ bindAutoSave('capture_image');
 bindAutoSave('image_count');
 bindAutoSave('image_delay_ds');
 bindAutoSave('capture_video');
+bindAutoSave('flash_on_capture');
 bindAutoSave('video_duration_sec');
 bindAutoSave('detection_interval_sec');
 bindAutoSave('notify_url');

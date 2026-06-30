@@ -50,6 +50,7 @@ static void resetMotionDetectionState() {
   motionPendingImages = 0;
   motionVideoManagedRecording = false;
   motionRecordingStopAt = 0;
+  stopMotionCaptureFlashIfOwned();
 }
 
 static void scheduleMotionActivationDelay(const char *reason) {
@@ -147,6 +148,7 @@ static void handleMotionConfigGet() {
   json += "\"imageCount\":" + String((int)m.imageCount) + ",";
   json += "\"imageDelayDs\":" + String((int)m.imageDelayDs) + ",";
   json += "\"captureVideo\":" + String(m.captureVideo ? "true" : "false") + ",";
+  json += "\"flashOnCapture\":" + String(m.flashOnCapture ? "true" : "false") + ",";
   json += "\"videoDurationSec\":" + String((int)m.videoDurationSec) + ",";
   json += "\"detectionIntervalSec\":" + String((int)m.detectionIntervalSec) + ",";
   json += "\"notifyUrl\":\"" + notifyUrlEscaped + "\",";
@@ -156,16 +158,60 @@ static void handleMotionConfigGet() {
   server.send(HTTP_OK, "application/json", json);
 }
 
+static bool applyMotionSettingsChange(const MotionSettings &settings, const char *source, String &message) {
+  MotionSettings updatedSettings = settings;
+  clampMotionSettings(updatedSettings);
+
+  bool wasEnabled = runtimeConfig.motionSettings.enabled;
+  bool disablingMotion = wasEnabled && !updatedSettings.enabled;
+  String stopMessage;
+  bool stoppedRecording = false;
+
+  if (disablingMotion && recordingActive) {
+    if (!stopRecordingSessionWithOverride(stopMessage)) {
+      message = String("Failed to stop recording before disabling motion: ") + stopMessage;
+      return false;
+    }
+
+    stoppedRecording = true;
+    Logger.Log("[MOTION] Recording stopped while disabling motion (%s): %s\n",
+               source ? source : "config",
+               stopMessage.c_str());
+  }
+
+  StoredConfig updatedConfig = runtimeConfig;
+  updatedConfig.motionSettings = updatedSettings;
+  if (!persistRuntimeConfig(updatedConfig)) {
+    message = "Failed to save motion configuration";
+    return false;
+  }
+
+  resetMotionDetectionState();
+  applyPirInputMode();
+  attachInterrupt(digitalPinToInterrupt(PIR_GPIO), onPirEdgeInterrupt, CHANGE);
+
+  if (!wasEnabled && runtimeConfig.motionSettings.enabled) {
+    scheduleMotionActivationDelay(source ? source : "config");
+  }
+
+  message = "Motion configuration saved";
+  if (stoppedRecording) {
+    message += ". ";
+    message += stopMessage;
+  }
+  return true;
+}
+
 static void handleMotionConfigSet() {
   if (!checkAuth()) return;
 
-  bool wasEnabled = runtimeConfig.motionSettings.enabled;
   MotionSettings updated = runtimeConfig.motionSettings;
   if (server.hasArg("enabled")) updated.enabled = server.arg("enabled") == "1" || server.arg("enabled") == "true";
   if (server.hasArg("captureImage")) updated.captureImage = server.arg("captureImage") == "1" || server.arg("captureImage") == "true";
   if (server.hasArg("imageCount")) updated.imageCount = (uint8_t)server.arg("imageCount").toInt();
   if (server.hasArg("imageDelayDs")) updated.imageDelayDs = (uint8_t)server.arg("imageDelayDs").toInt();
   if (server.hasArg("captureVideo")) updated.captureVideo = server.arg("captureVideo") == "1" || server.arg("captureVideo") == "true";
+  if (server.hasArg("flashOnCapture")) updated.flashOnCapture = server.arg("flashOnCapture") == "1" || server.arg("flashOnCapture") == "true";
   if (server.hasArg("videoDurationSec")) updated.videoDurationSec = (uint8_t)server.arg("videoDurationSec").toInt();
   if (server.hasArg("detectionIntervalSec")) updated.detectionIntervalSec = (uint16_t)server.arg("detectionIntervalSec").toInt();
   if (server.hasArg("notifyUrl")) updated.notifyUrl = server.arg("notifyUrl");
@@ -174,21 +220,12 @@ static void handleMotionConfigSet() {
     updated.standbyAfterInactivity = server.arg("standbyAfterInactivity") == "1" || server.arg("standbyAfterInactivity") == "true";
   }
 
-  clampMotionSettings(updated);
-  runtimeConfig.motionSettings = updated;
-
-  if (!persistRuntimeConfig(runtimeConfig)) {
-    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to save motion configuration");
+  String message;
+  if (!applyMotionSettingsChange(updated, "web-config", message)) {
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", message);
     return;
   }
-
-  resetMotionDetectionState();
-  applyPirInputMode();
-  attachInterrupt(digitalPinToInterrupt(PIR_GPIO), onPirEdgeInterrupt, CHANGE);
-  if (!wasEnabled && runtimeConfig.motionSettings.enabled) {
-    scheduleMotionActivationDelay("web-config");
-  }
-  server.send(HTTP_OK, "text/plain", "Motion configuration saved");
+  server.send(HTTP_OK, "text/plain", message);
 }
 
 static void registerMotionRoutes() {
@@ -290,6 +327,7 @@ static void triggerMotionEvent(const char *source) {
   if (runtimeConfig.motionSettings.captureVideo) {
     String message;
     if (startRecordingSessionInternal(message)) {
+      startMotionCaptureFlashIfNeeded();
       motionVideoManagedRecording = true;
       motionRecordingStopAt = now + ((unsigned long)runtimeConfig.motionSettings.videoDurationSec * 1000UL);
       Logger.Log("[MOTION] %s\n", message.c_str());
@@ -408,7 +446,7 @@ static void serviceMotionActions() {
 
   if (motionPendingImages > 0 && now >= motionNextImageAt) {
     String path;
-    if (captureImageToSD(path)) {
+    if (captureImageToSD(path, true)) {
       Logger.Log("[MOTION] Image captured: %s\n", path.c_str());
     } else {
       Logger.LogLine("[MOTION] Failed to capture image");
