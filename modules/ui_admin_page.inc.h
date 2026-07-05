@@ -149,29 +149,6 @@ __APP_NAV__
     <div style="font-size:.85em;color:#bbb;margin-top:10px">When enabled, LED blinks briefly on each URL request. Boot sequences are unaffected.</div>
   </div>
   <div class="panel">
-    <h3>Logging</h3>
-    <form class="form" id="logging_form">
-      <div style="display:flex;align-items:center;gap:10px">
-        <label for="logging_file_enabled" style="margin:0">Enable /log.txt file logging</label>
-        <input id="logging_file_enabled" type="checkbox" style="width:auto">
-      </div>
-    </form>
-    <div id="logging_status" class="status"></div>
-    <div style="font-size:.85em;color:#bbb;margin-top:10px">When disabled, firmware logs are not written to /log.txt.</div>
-  </div>
-  <div class="panel">
-    <h3>Standby</h3>
-    <form class="form" id="standby_form">
-      <div style="display:flex;align-items:center;gap:10px">
-        <label for="standby_after_inactivity" style="margin:0">Enter standby after 2 minutes of inactivity</label>
-        <input id="standby_after_inactivity" type="checkbox" style="width:auto">
-      </div>
-      <button type="button" id="standby_now" class="btn">Enter Standby Now</button>
-    </form>
-    <div id="standby_status" class="status"></div>
-    <div style="font-size:.85em;color:#bbb;margin-top:10px">Inactivity means no authenticated URL requests and no motion triggers. PIR wake uses GPIO13 HIGH with pulldown.</div>
-  </div>
-  <div class="panel">
     <h3>TX Power</h3>
     <form class="form" id="txpower_form">
       <div>
@@ -249,8 +226,6 @@ function setAdminStatus(msg,err){var e=id('admin_status');e.textContent=msg;e.cl
 function setNameStatus(msg,err){var e=id('name_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setTimeStatus(msg,err){var e=id('time_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setLedStatus(msg,err){var e=id('led_status');e.textContent=msg;e.className=err?'status error':'status';}
-function setLoggingStatus(msg,err){var e=id('logging_status');e.textContent=msg;e.className=err?'status error':'status';}
-function setStandbyStatus(msg,err){var e=id('standby_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setTxPowerStatus(msg,err){var e=id('txpower_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setFirmwareStatus(msg,err){var e=id('firmware_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setResetStatus(msg,err){var e=id('reset_status');e.textContent=msg;e.className=err?'status error':'status';}
@@ -459,55 +434,6 @@ id('led_form').addEventListener('submit',function(e){
   saveLedSettings();
 });
 id('led_access_blink').addEventListener('change',saveLedSettings);
-function refreshLoggingStatus(){
-  fetch('/admin/logging').then(function(r){
-    if(!r.ok){throw new Error('Failed to load logging settings');}
-    return r.json();
-  }).then(function(d){
-    id('logging_file_enabled').checked=d.loggingFileEnabled!==false;
-  }).catch(function(){});
-}
-function saveLoggingSettings(){
-  setLoggingStatus('Saving...',false);
-  fetch('/admin/logging',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({loggingFileEnabled:id('logging_file_enabled').checked?'1':'0'})}).then(function(r){r.text().then(function(msg){setLoggingStatus(msg||'Saved',!r.ok);refreshLoggingStatus();});}).catch(function(err){setLoggingStatus(err.message||'Failed to save logging settings',true);});
-}
-id('logging_form').addEventListener('submit',function(e){
-  e.preventDefault();
-  saveLoggingSettings();
-});
-id('logging_file_enabled').addEventListener('change',saveLoggingSettings);
-function refreshStandbySettings(){
-  fetch('/motion/config').then(function(r){
-    if(!r.ok){throw new Error('Failed to load standby settings');}
-    return r.json();
-  }).then(function(d){
-    id('standby_after_inactivity').checked=!!d.standbyAfterInactivity;
-  }).catch(function(err){setStandbyStatus(err.message||'Failed to load standby settings',true);});
-}
-function saveStandbySettings(){
-  setStandbyStatus('Saving...',false);
-  fetch('/motion/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({standbyAfterInactivity:id('standby_after_inactivity').checked?'1':'0'})}).then(function(r){
-    return r.text().then(function(msg){
-      setStandbyStatus(msg||'Saved',!r.ok);
-      if(r.ok){refreshStandbySettings();}
-    });
-  }).catch(function(err){setStandbyStatus(err.message||'Failed to save standby settings',true);});
-}
-function requestStandbyNow(){
-  if(!confirm('Enter deep standby now? Device will wake only on PIR GPIO13 HIGH.')){return;}
-  setStandbyStatus('Requesting standby...',false);
-  fetch('/motion/standby',{method:'POST'}).then(function(r){
-    return r.text().then(function(msg){
-      setStandbyStatus(msg||'Standby requested',!r.ok);
-    });
-  }).catch(function(err){setStandbyStatus(err.message||'Standby request failed',true);});
-}
-id('standby_form').addEventListener('submit',function(e){
-  e.preventDefault();
-  saveStandbySettings();
-});
-id('standby_after_inactivity').addEventListener('change',saveStandbySettings);
-id('standby_now').addEventListener('click',requestStandbyNow);
 function refreshTxPower(){
   fetch('/admin/txpower').then(function(r){
     if(!r.ok){throw new Error('Failed to load TX power settings');}

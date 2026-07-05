@@ -30,6 +30,7 @@
 #include <WebServer.h>
 #include <FS.h>
 #include <SD_MMC.h>
+#include <Preferences.h>
 #include <Update.h>
 #include <esp_err.h>
 #include <esp_heap_caps.h>
@@ -50,28 +51,22 @@
 #define FIRMWARE_VERSION "dev"
 #endif
 
-// ─── Pin definitions ──────────────────────────────────────────────────────────
-// PIR wiring: VCC -> 3.3, DATA -> GPIO13, GND -> GND.
-// Note: GPIO13 is now used for PIR input.
-static constexpr int PIR_GPIO    = GPIO_NUM_13;
-static constexpr int LED_GPIO    = GPIO_NUM_33;  // Internal red LED on ESP32-CAM
-static constexpr int MOTION_TOGGLE_BUTTON_GPIO = GPIO_NUM_3;  // RX pin
+// Pin definitions
+static constexpr int PIR_GPIO = GPIO_NUM_13;
+static constexpr int LED_GPIO = GPIO_NUM_33;
+static constexpr int MOTION_TOGGLE_BUTTON_GPIO = GPIO_NUM_3;
 
-// ─── AP setup credentials ─────────────────────────────────────────────────────
-#define AP_SETUP_SSID   "ESP32-CAM-Setup"
-#define AP_SETUP_PASS   "ESP32-CAM"
+// AP setup credentials
+#define AP_SETUP_SSID "ESP32-CAM-Setup"
+#define AP_SETUP_PASS "ESP32-CAM"
 #define AP_FALLBACK_SSID "ESP32-CAM"
 #define AP_OTA_RECOVERY_SSID "ESP32-CAM-OTA"
 static constexpr int AP_CHANNEL = 1;
 static constexpr bool AP_HIDDEN = false;
 static constexpr int AP_MAX_CONNECTIONS = 4;
-// Default TX power levels (overridden by stored config if available)
 static constexpr wifi_power_t DEFAULT_TX_POWER_STA = WIFI_POWER_19_5dBm;
-static constexpr wifi_power_t DEFAULT_TX_POWER_AP  = WIFI_POWER_8_5dBm;
-// Beacon interval for fallback AP in TU (1 TU = 1024 µs). Default is 100; Must be a multiple of 100, range 100–60000.
+static constexpr wifi_power_t DEFAULT_TX_POWER_AP = WIFI_POWER_8_5dBm;
 static constexpr uint16_t AP_FALLBACK_BEACON_INTERVAL_TU = 10000;
-// AP fallback stability knobs: ESP32-CAM boards can become unstable when
-// AP modem sleep and long beacon intervals are combined with camera traffic.
 static constexpr bool AP_FALLBACK_MODEM_SLEEP_ENABLED = false;
 static constexpr bool AP_FALLBACK_EXTENDED_BEACON_ENABLED = false;
 static constexpr const char *NTP_SERVER = "pool.ntp.org";
@@ -83,21 +78,20 @@ static constexpr unsigned long CAMERA_INIT_RETRY_DELAY_MS = 500;
 static constexpr unsigned long BOOT_RECOVERY_RESTART_DELAY_MS = 5000;
 static constexpr int AP_START_RETRIES = 3;
 static constexpr unsigned long AP_START_RETRY_DELAY_MS = 1000;
-static constexpr uint32_t CAMERA_XCLK_FREQS_HZ[] = {
-  20000000UL,
-  10000000UL,
-  8000000UL,
-  4000000UL
-};
+static constexpr uint32_t CAMERA_XCLK_FREQS_HZ[] = {20000000UL, 10000000UL, 8000000UL, 4000000UL};
 
-// ─── SD configuration storage ──────────────────────────────────────────────────
+// Config persistence metadata
 #define CONFIG_FILE_PATH "/config.enc"
 #define CONFIG_FILE_MAGIC "ESP32CAMCFG14"
 #define CAPTURE_COUNTER_FILE_PATH "/capture_counter.txt"
 #define TIMELAPSE_COUNTER_FILE_PATH "/timelapse_counter.txt"
 #define SD_SORT_FILE_PATH "/.sort"
+static constexpr const char *CONFIG_NVS_NAMESPACE = "esp32camcfg";
+static constexpr const char *CONFIG_NVS_MAGIC_KEY = "cfg_magic";
+static constexpr const char *CONFIG_NVS_IV_KEY = "cfg_iv";
+static constexpr const char *CONFIG_NVS_CIPHER_KEY = "cfg_cipher";
 
-// ─── HTTP status codes ────────────────────────────────────────────────────────
+// HTTP status and shared parameters
 static constexpr int HTTP_OK = 200;
 static constexpr int HTTP_NO_CONTENT = 204;
 static constexpr int HTTP_FOUND = 302;
@@ -111,41 +105,38 @@ static constexpr int HTTP_UNSUPPORTED_MEDIA_TYPE = 415;
 static constexpr int HTTP_INTERNAL_ERROR = 500;
 static constexpr int HTTP_SERVICE_UNAVAILABLE = 503;
 
-// ─── HTTP parameter names ────────────────────────────────────────────────────
-static constexpr const char* PARAM_SSID = "ssid";
-static constexpr const char* PARAM_WPASS = "wpass";
-static constexpr const char* PARAM_APASS = "apass";
-static constexpr const char* PARAM_FILE = "file";
-static constexpr const char* PARAM_INDEX = "index";
-static constexpr const char* PARAM_CURRENT = "current";
-static constexpr const char* PARAM_NEXT = "next";
-static constexpr const char* PARAM_CONFIRM = "confirm";
-static constexpr const char* PARAM_NET_MODE = "netmode";
-static constexpr const char* PARAM_STATIC_IP = "ip";
-static constexpr const char* PARAM_GATEWAY = "gw";
-static constexpr const char* PARAM_SUBNET = "mask";
-static constexpr const char* PARAM_DNS1 = "dns1";
-static constexpr const char* PARAM_DNS2 = "dns2";
+static constexpr const char *PARAM_SSID = "ssid";
+static constexpr const char *PARAM_WPASS = "wpass";
+static constexpr const char *PARAM_APASS = "apass";
+static constexpr const char *PARAM_FILE = "file";
+static constexpr const char *PARAM_INDEX = "index";
+static constexpr const char *PARAM_CURRENT = "current";
+static constexpr const char *PARAM_NEXT = "next";
+static constexpr const char *PARAM_CONFIRM = "confirm";
+static constexpr const char *PARAM_NET_MODE = "netmode";
+static constexpr const char *PARAM_STATIC_IP = "ip";
+static constexpr const char *PARAM_GATEWAY = "gw";
+static constexpr const char *PARAM_SUBNET = "mask";
+static constexpr const char *PARAM_DNS1 = "dns1";
+static constexpr const char *PARAM_DNS2 = "dns2";
 
-// ─── HTTP error messages ──────────────────────────────────────────────────────
-static constexpr const char* ERR_FILE_REQUIRED = "file parameter required";
-static constexpr const char* ERR_INVALID_PATH = "Invalid file path";
-static constexpr const char* ERR_ACCESS_DENIED = "Access denied";
-static constexpr const char* ERR_SD_CARD_NOT_AVAILABLE = "SD card not available";
-static constexpr const char* ERR_SD_CARD_BUSY = "SD card busy";
-static constexpr const char* ERR_FILE_NOT_FOUND = "File not found";
-static constexpr const char* ERR_UNAUTHORIZED = "Unauthorized";
+static constexpr const char *ERR_FILE_REQUIRED = "file parameter required";
+static constexpr const char *ERR_INVALID_PATH = "Invalid file path";
+static constexpr const char *ERR_ACCESS_DENIED = "Access denied";
+static constexpr const char *ERR_SD_CARD_NOT_AVAILABLE = "SD card not available";
+static constexpr const char *ERR_SD_CARD_BUSY = "SD card busy";
+static constexpr const char *ERR_FILE_NOT_FOUND = "File not found";
+static constexpr const char *ERR_UNAUTHORIZED = "Unauthorized";
 
-// ─── Globals ──────────────────────────────────────────────────────────────────
 static constexpr uint16_t HTTP_MAIN_PORT = 80;
 static constexpr uint16_t HTTP_STREAM_PORT = 81;
 static constexpr uint16_t HTTP_TRANSFER_PORT = 82;
 static constexpr uint32_t HTTP_STREAM_TASK_STACK = 8192;
 static constexpr uint32_t HTTP_TRANSFER_TASK_STACK = 8192;
 
-static WebServer   server(HTTP_MAIN_PORT);
-static WebServer   streamServer(HTTP_STREAM_PORT);
-static WebServer   transferServer(HTTP_TRANSFER_PORT);
+static WebServer server(HTTP_MAIN_PORT);
+static WebServer streamServer(HTTP_STREAM_PORT);
+static WebServer transferServer(HTTP_TRANSFER_PORT);
 
 static String cfgAccessPass;
 static String cfgDeviceName;
@@ -399,103 +390,14 @@ static void clearLogFileBuffer() {
 }
 
 static void serviceLogFileFlush() {
-  if (!gLogFileEnabled) {
-    clearLogFileBuffer();
-    return;
-  }
-
-  // In recovery/no-SD boot path, avoid periodic SD re-mount attempts from logger flush.
-  if (!sdCardAvailableAtBoot) {
-    clearLogFileBuffer();
-    return;
-  }
-
-  if (motionActionWindowActive || gLogWriteInProgress || gSdOperationInProgress || !sdMutex) {
-    return;
-  }
-
-  size_t pendingBytes = currentLogFileBufferSize();
-  if (pendingBytes == 0) {
-    return;
-  }
-
-  unsigned long now = millis();
-  if ((now - gLogLastFlushAt) < LOG_FILE_FLUSH_INTERVAL_MS && pendingBytes < (LOG_FILE_BUFFER_CAPACITY / 2)) {
-    return;
-  }
-
-  if (xSemaphoreTake(sdMutex, 0) != pdTRUE) {
-    return;
-  }
-
-  gLogWriteInProgress = true;
-
-  if (!gLogSdReady) {
-    gLogSdReady = initSDCard();
-    if (!gLogSdReady) {
-      gLogSdFailureReported = true;
-      gLogWriteInProgress = false;
-      xSemaphoreGive(sdMutex);
-      return;
-    }
-  }
-
-  File file = SD_MMC.open(SERIAL_LOG_FILE_PATH, FILE_APPEND);
-  if (!file) {
-    gLogFileFailureReported = true;
-    gLogWriteInProgress = false;
-    xSemaphoreGive(sdMutex);
-    return;
-  }
-
-  size_t totalWritten = 0;
-  size_t totalRequested = 0;
-  for (;;) {
-    if (totalRequested >= LOG_FILE_MAX_BATCH_BYTES) {
-      break;
-    }
-
-    size_t chunkLen = dequeueLogFileChunk(gLogFileFlushChunk, LOG_FILE_FLUSH_CHUNK_BYTES);
-    if (chunkLen == 0) {
-      break;
-    }
-
-    size_t written = file.write(gLogFileFlushChunk, chunkLen);
-    totalRequested += chunkLen;
-    totalWritten += written;
-    if (written != chunkLen) {
-      gLogFileFailureReported = true;
-      break;
-    }
-  }
-
-  uint32_t droppedBytes = 0;
-  portENTER_CRITICAL(&gLogFileBufferMux);
-  droppedBytes = gLogFileDroppedBytes;
-  gLogFileDroppedBytes = 0;
-  portEXIT_CRITICAL(&gLogFileBufferMux);
-  if (droppedBytes > 0) {
-    char dropMsg[64];
-    int n = snprintf(dropMsg, sizeof(dropMsg), "[LOGGER] dropped %lu bytes\n", (unsigned long)droppedBytes);
-    if (n > 0) {
-      (void)file.write((const uint8_t *)dropMsg, (size_t)n);
-    }
-  }
-
-  file.flush();
-  file.close();
-
-  (void)totalWritten;
-  gLogLastFlushAt = now;
-
-  gLogWriteInProgress = false;
-  xSemaphoreGive(sdMutex);
+  // Logging is serial-only in this firmware variant.
+  clearLogFileBuffer();
 }
 
 class AppLogger {
  public:
   void begin(unsigned long baud) {
-    (void)baud;
+    Serial.begin(baud);
   }
 
   int Log(const char *format, ...) {
@@ -549,10 +451,10 @@ class AppLogger {
 
  private:
   size_t write(const uint8_t *buffer, size_t size) {
-    if (!buffer || size == 0 || !gLogFileEnabled) {
-      return size;
+    if (!buffer || size == 0) {
+      return 0;
     }
-    enqueueLogFileChunk(buffer, size);
+    Serial.write(buffer, size);
     return size;
   }
 
@@ -725,9 +627,6 @@ static bool ensureCameraReady(TickType_t timeoutTicks = pdMS_TO_TICKS(5000));
 static void serviceCameraIdleTimeout();
 static bool isRecordingFrameDue(unsigned long now);
 static bool isDeviceBusy();
-static bool recordFrameIfDue(const OwnedJpegFrame &frame, unsigned long now);
-static bool appendRecordingFrame(const OwnedJpegFrame &frame);
-static void stopRecordingSession(bool keepFile);
 static bool loadRuntimeConfigWithRetries(StoredConfig &cfg);
 static bool initCameraWithRetries();
 static bool applyWifiClientConfig(const WifiCredential &wifi);
@@ -737,37 +636,13 @@ static void serviceLogFileFlush();
 static void applyPirInputMode();
 static void restoreInputPinsAfterSDInit();
 static void logSharedPinCaveats();
-static void updateSdLoggingState();
-static void IRAM_ATTR onPirEdgeInterrupt();
-static void serviceMotionDetection();
-static void serviceMotionActions();
-static void serviceMotionNotifyRetry();
-static void serviceDeferredNetworkStartup();
-static void serviceAutoStandby();
 static void applyMotionToggleButtonInputMode();
 static void serviceMotionToggleButton();
-[[noreturn]] static void enterDeepStandbyNow(const char *reason);
-static void requestDeepStandby(const char *reason, bool immediate);
-static void servicePendingStandby();
-static void triggerMotionEvent(const char *source);
 static void noteAuthenticatedWebActivity();
 static void closeMotionActionWindow();
-static bool captureImageToSD(String &savedPath, bool useMotionFlash = false);
-static bool startRecordingSessionInternal(String &message);
-static bool startManualRecordingSession(String &message);
-static bool stopRecordingSessionInternal(String &message);
-static bool stopRecordingSessionWithOverride(String &message);
-static void handleMotionGraphPage();
-static void handleMotionReadings();
-static bool isValidMotionIntervalSec(uint16_t seconds);
 static void clampMotionSettings(MotionSettings &settings);
-static void handleMotionPage();
-static void handleMotionConfigGet();
-static void handleMotionConfigSet();
-static bool applyMotionSettingsChange(const MotionSettings &settings, const char *source, String &message);
 static bool isValidIntervalometerUnitValue(uint8_t unit);
 static void clampIntervalometerSettings(IntervalometerSettings &settings);
-static bool sendMotionNotifyRequest(const String &url);
 static bool isValidRuntimeTxPowerValue(int value);
 static wifi_power_t validatedTxPowerValue(int configuredValue, wifi_power_t fallback, const char *label);
 static void setWifiModemSleep(bool enabled, const char *reason = nullptr);
@@ -777,10 +652,7 @@ static void setFlashOutput(bool enabled);
 static void startMotionCaptureFlashIfNeeded();
 static void stopMotionCaptureFlashIfOwned();
 static void registerCameraRoutes();
-static void registerIntervalometerRoutes();
 static void startAuxHttpServers();
-static void startOtaRecoveryAPMode();
-static bool serviceIntervalometerStartupIfNeeded();
 
 static void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   switch (event) {
@@ -2113,6 +1985,20 @@ static bool isValidIntervalometerUnitValue(uint8_t unit) {
   return unit <= 3;
 }
 
+static void clampMotionSettings(MotionSettings &settings) {
+  settings.enabled = false;
+  settings.captureImage = false;
+  settings.captureVideo = false;
+  settings.flashOnCapture = false;
+  settings.notifyEnabled = false;
+  settings.standbyAfterInactivity = false;
+  settings.notifyUrl = "";
+  settings.detectionIntervalSec = 0;
+  if (settings.imageCount < 1) settings.imageCount = 1;
+  if (settings.imageDelayDs < 1) settings.imageDelayDs = 1;
+  if (settings.videoDurationSec < 1) settings.videoDurationSec = 1;
+}
+
 static void clampIntervalometerSettings(IntervalometerSettings &settings) {
   if (settings.intervalValue < 1U) settings.intervalValue = 1U;
   if (settings.intervalValue > 100000U) settings.intervalValue = 100000U;
@@ -2529,16 +2415,10 @@ static String buildAppNavLink(const char *href, const char *label, AppPage page,
 
 static String buildAppNav(AppPage activePage) {
   String html;
-  html.reserve(360);
+  html.reserve(180);
   html += "<nav>\n";
   html += "  ";
   html += buildAppNavLink("/", "📷 Camera", AppPage::Camera, activePage);
-  html += "\n  ";
-  html += buildAppNavLink("/motion", "🚶 Motion", AppPage::Motion, activePage);
-  html += "\n  ";
-  html += buildAppNavLink("/intervalometer", "⏱ Timelapse", AppPage::Intervalometer, activePage);
-  html += "\n  ";
-  html += buildAppNavLink("/sd", "💾 SD Browser", AppPage::Sd, activePage);
   html += "\n  ";
   html += buildAppNavLink("/admin", "⚙️ Admin", AppPage::Admin, activePage);
   html += "\n</nav>";
@@ -2855,65 +2735,42 @@ static bool saveConfigToSD(const StoredConfig &cfg) {
     return false;
   }
 
-  {
-    ScopedSdLock sdLock(pdMS_TO_TICKS(SD_LONG_LOCK_TIMEOUT_MS));
-    if (!sdLock.locked()) {
-      Logger.LogLine("[CFG] SD card is busy; config not saved");
-      return false;
-    }
-
-    if (!initSDCard()) {
-      return false;
-    }
-
-    // FILE_WRITE may append on some FS implementations; remove first to keep one canonical config record.
-    if (SD_MMC.exists(CONFIG_FILE_PATH) && !SD_MMC.remove(CONFIG_FILE_PATH)) {
-      Logger.LogLine("[CFG] Failed to replace existing config file");
-      return false;
-    }
-
-    File file = SD_MMC.open(CONFIG_FILE_PATH, FILE_WRITE);
-    if (!file) {
-      Logger.LogLine("[CFG] Failed to open config file for write");
-      return false;
-    }
-
-    file.println(CONFIG_FILE_MAGIC);
-    file.println(ivHex);
-    file.println(cipherHex);
-    file.close();
+  Preferences prefs;
+  if (!prefs.begin(CONFIG_NVS_NAMESPACE, false)) {
+    Logger.LogLine("[CFG] Failed to open NVS for write");
+    return false;
   }
 
-  Logger.LogLine("[CFG] Encrypted config saved to SD");
+  size_t magicLen = prefs.putString(CONFIG_NVS_MAGIC_KEY, CONFIG_FILE_MAGIC);
+  size_t ivLen = prefs.putString(CONFIG_NVS_IV_KEY, ivHex);
+  size_t cipherLen = prefs.putString(CONFIG_NVS_CIPHER_KEY, cipherHex);
+  prefs.end();
+
+  if (magicLen == 0 || ivLen == 0 || cipherLen == 0) {
+    Logger.LogLine("[CFG] Failed to save encrypted config in NVS");
+    return false;
+  }
+
+  Logger.LogLine("[CFG] Encrypted config saved to NVS");
   return true;
 }
 
 static bool loadConfigFromSD(StoredConfig &cfg) {
-  ScopedSdLock sdLock(pdMS_TO_TICKS(SD_LONG_LOCK_TIMEOUT_MS));
-  if (!sdLock.locked()) {
-    Logger.LogLine("[CFG] SD card is busy; config not loaded");
+  Preferences prefs;
+  if (!prefs.begin(CONFIG_NVS_NAMESPACE, true)) {
+    Logger.LogLine("[CFG] Failed to open NVS for read");
     return false;
   }
 
-  if (!initSDCard()) {
+  String magic = prefs.getString(CONFIG_NVS_MAGIC_KEY, "");
+  String ivHex = prefs.getString(CONFIG_NVS_IV_KEY, "");
+  String cipherHex = prefs.getString(CONFIG_NVS_CIPHER_KEY, "");
+  prefs.end();
+
+  if (magic.isEmpty() || ivHex.isEmpty() || cipherHex.isEmpty()) {
+    Logger.LogLine("[CFG] Config missing in NVS");
     return false;
   }
-
-  if (!SD_MMC.exists(CONFIG_FILE_PATH)) {
-    Logger.LogLine("[CFG] Config file missing");
-    return false;
-  }
-
-  File file = SD_MMC.open(CONFIG_FILE_PATH, FILE_READ);
-  if (!file) {
-    Logger.LogLine("[CFG] Failed to open config file");
-    return false;
-  }
-
-  String magic = file.readStringUntil('\n');
-  String ivHex = file.readStringUntil('\n');
-  String cipherHex = file.readStringUntil('\n');
-  file.close();
 
   magic.trim();
   ivHex.trim();
@@ -3140,13 +2997,6 @@ static void sendTransferError(WebServer &srv, int statusCode, const char *messag
 static void handleStreamMain();
 static void handleStreamClose();
 static void handleStreamWorker();
-static void handleSDDownloadMain();
-static void handleSDDownloadWorker();
-static void handleSDViewMain();
-static void handleSDViewWorker();
-static void handleSDUploadMain();
-static void handleSDUploadWorker();
-static void handleSDUploadDataWorker();
 static void handleFirmwareUploadMain();
 static void handleFirmwareUploadWorker();
 static void handleFirmwareUploadDataWorker();
@@ -3156,10 +3006,6 @@ static void startAuxHttpServers();
 static void registerAdminRoutes();
 static void registerOtaRoutes();
 static void registerOtaTransferRoutes();
-static void registerSdRoutes();
-static void registerSdTransferRoutes();
-static void registerRecordingRoutes();
-static void registerMotionRoutes();
 
 static bool isValidRuntimeTxPowerValue(int value) {
   switch ((wifi_power_t)value) {
@@ -4128,10 +3974,6 @@ static void handleNotFound() {
 
 #include "modules/ota_module.inc.h"
 
-#include "modules/sd_browser_module.inc.h"
-
-#include "modules/recording_module.inc.h"
-
 static void streamServerTask(void *arg) {
   WebServer *srv = static_cast<WebServer *>(arg);
   for (;;) {
@@ -4173,7 +4015,6 @@ static void startAuxHttpServers() {
   }
 
   if (!transferServerTaskHandle) {
-    registerSdTransferRoutes();
     registerOtaTransferRoutes();
     transferServer.onNotFound([]() {
       transferServer.send(HTTP_NOT_FOUND, "text/plain", "Not found");
@@ -4206,12 +4047,8 @@ static void registerCameraRoutes() {
   server.on("/status",        HTTP_GET,  handleStatus);
   server.on("/wifi/scan",     HTTP_GET,  handleWifiScan);
 
-  registerMotionRoutes();
-  registerIntervalometerRoutes();
   registerAdminRoutes();
   registerOtaRoutes();
-  registerSdRoutes();
-  registerRecordingRoutes();
 
   server.onNotFound(handleNotFound);
 }
@@ -4234,51 +4071,6 @@ static void startSetupAPMode() {
     server.onNotFound(handleNotFound);
     server.begin();
     Logger.LogLine("[HTTP] Setup server ready on port 80");
-}
-
-static void startOtaRecoveryAPMode() {
-  otaRecoveryModeActive = true;
-  wifiModemSleepEnabled = false;
-  bool ok = startSoftAPWithRetries(AP_OTA_RECOVERY_SSID, nullptr);
-  if (!ok) {
-    Logger.LogLine("[WIFI] OTA recovery AP start failed");
-    return;
-  }
-
-  WiFi.setSleep(false);
-  Logger.Log("[WIFI] OTA recovery AP started — SSID: %s (open)  IP: %s\n",
-    AP_OTA_RECOVERY_SSID,
-    WiFi.softAPIP().toString().c_str());
-
-  server.on("/", HTTP_GET, handleOtaRecoveryRoot);
-  server.on("/ota/format-sd", HTTP_POST, handleOtaFormatSd);
-  registerOtaRoutes();
-  server.onNotFound(handleNotFound);
-  server.begin();
-  Logger.LogLine("[HTTP] OTA recovery server ready on port 80");
-
-  if (!transferServerTaskHandle) {
-    registerOtaTransferRoutes();
-    transferServer.onNotFound([]() {
-      transferServer.send(HTTP_NOT_FOUND, "text/plain", "Not found");
-    });
-    transferServer.begin();
-    BaseType_t created = xTaskCreatePinnedToCore(
-      transferServerTask,
-      "http-transfer",
-      HTTP_TRANSFER_TASK_STACK,
-      &transferServer,
-      1,
-      &transferServerTaskHandle,
-      ARDUINO_RUNNING_CORE
-    );
-    if (created == pdPASS) {
-      Logger.Log("[HTTP] OTA transfer server ready on port %u\n", (unsigned int)HTTP_TRANSFER_PORT);
-    } else {
-      transferServerTaskHandle = nullptr;
-      Logger.LogLine("[HTTP] Failed to start OTA transfer server task");
-    }
-  }
 }
 
 static void startCameraAPMode() {
@@ -4458,11 +4250,6 @@ static bool applyWifiEnabledRuntimeState(bool enabled, bool showLedFeedback) {
 }
 
 static bool persistWifiEnabledAndApply(bool enabled, const char *reason) {
-  if (!sdCardAvailableAtBoot) {
-    Logger.LogLine("[WIFI] Cannot persist WiFi state without SD card");
-    return false;
-  }
-
   if (runtimeConfig.wifiEnabled != enabled) {
     StoredConfig updated = runtimeConfig;
     updated.wifiEnabled = enabled;
@@ -4515,10 +4302,6 @@ static void servicePendingAdminRestart() {
   delay(100);
   ESP.restart();
 }
-
-#include "modules/motion_module.inc.h"
-
-#include "modules/intervalometer_module.inc.h"
 
 [[noreturn]] static void haltBoot(const char *message) {
   Logger.LogLine(message);
@@ -4577,10 +4360,11 @@ static void resetMotionRuntimeState() {
 
 static void applyLoadedStartupConfig(const StoredConfig &cfg) {
   runtimeConfig = cfg;
+  runtimeConfig.logFileEnabled = false;
   cfgAccessPass = cfg.adminPass;
   cfgDeviceName = cfg.deviceName;
   ledAccessBlinkEnabled = cfg.ledAccessBlink;
-  gLogFileEnabled = cfg.logFileEnabled;
+  gLogFileEnabled = false;
   if (cfgDeviceName.isEmpty()) {
     cfgDeviceName = "ESP32-CAM";
   }
@@ -4589,21 +4373,14 @@ static void applyLoadedStartupConfig(const StoredConfig &cfg) {
 
 static void applyDefaultStartupConfig() {
   runtimeConfig = StoredConfig();
+  runtimeConfig.logFileEnabled = false;
   cfgDeviceName = "ESP32-CAM";
   ledAccessBlinkEnabled = false;
-  gLogFileEnabled = true;
+  gLogFileEnabled = false;
   isConfigured = false;
 }
 
 static void loadStartupConfig() {
-  if (!sdCardAvailableAtBoot) {
-    Logger.LogLine("[CFG] SD card missing at boot - skipping config load");
-    applyDefaultStartupConfig();
-    runtimeConfig.logFileEnabled = false;
-    gLogFileEnabled = false;
-    return;
-  }
-
   StoredConfig cfg;
   if (loadRuntimeConfigWithRetries(cfg)) {
     applyLoadedStartupConfig(cfg);
@@ -4614,22 +4391,21 @@ static void loadStartupConfig() {
 
 static void finalizeMotionStartupConfig() {
   clampMotionSettings(runtimeConfig.motionSettings);
-  resetMotionDetectionState();
-  applyPirInputMode();
-  applyMotionToggleButtonInputMode();
-  attachInterrupt(digitalPinToInterrupt(PIR_GPIO), onPirEdgeInterrupt, CHANGE);
-  if (runtimeConfig.motionSettings.enabled && !wokeFromPirDeepSleep) {
-    scheduleMotionActivationDelay("startup");
-  }
-  if (wokeFromPirDeepSleep) {
-    motionEdgePending = true;
-    ++motionEdgeCount;
-    motionRawHigh = true;
-    motionLastActivityAt = millis();
-    deferredNetworkStartupPending = true;
-    Logger.LogLine("[BOOT] PIR wake detected - deferring network startup until motion actions complete");
-  }
-  updateSdLoggingState();
+  motionRawHigh = false;
+  motionLatched = false;
+  motionEdgePending = false;
+  motionEdgeCount = 0;
+  motionPendingImages = 0;
+  motionVideoManagedRecording = false;
+  motionActionWindowActive = false;
+  motionNotifyPending = false;
+  motionNotifyLastAttemptAt = 0;
+  motionIgnoreUntilAt = 0;
+  motionEnableActivationAt = 0;
+  motionToggleButtonConsumeUntilRelease = false;
+  motionToggleButtonClickCount = 0;
+  motionToggleButtonClickDeadlineAt = 0;
+  gLogFileEnabled = false;
 }
 
 static void applyMotionToggleButtonInputMode() {
@@ -4649,239 +4425,8 @@ static void applyMotionToggleButtonInputMode() {
 }
 
 static void serviceMotionToggleButton() {
-  unsigned long now = millis();
-  bool readingHigh = (digitalRead(MOTION_TOGGLE_BUTTON_GPIO) == HIGH);
-
-  if (motionToggleButtonConsumeUntilRelease) {
-    if (readingHigh != motionToggleButtonLastReadingHigh) {
-      motionToggleButtonLastReadingHigh = readingHigh;
-      motionToggleButtonLastChangeAt = now;
-    }
-
-    if ((now - motionToggleButtonLastChangeAt) < MOTION_TOGGLE_DEBOUNCE_MS) {
-      return;
-    }
-
-    if (!readingHigh) {
-      // A boot-time hold was used for timelapse interruption; ignore it until released.
-      motionToggleButtonConsumeUntilRelease = false;
-      motionToggleButtonStableHigh = false;
-      motionToggleButtonLastReadingHigh = false;
-      motionToggleButtonLongPressHandled = false;
-      motionToggleButtonPressedAt = 0;
-      motionToggleButtonClickCount = 0;
-      motionToggleButtonClickDeadlineAt = 0;
-    }
-    return;
-  }
-
-  if (readingHigh != motionToggleButtonLastReadingHigh) {
-    motionToggleButtonLastReadingHigh = readingHigh;
-    motionToggleButtonLastChangeAt = now;
-  }
-
-  if ((now - motionToggleButtonLastChangeAt) < MOTION_TOGGLE_DEBOUNCE_MS) {
-    return;
-  }
-
-  if (readingHigh != motionToggleButtonStableHigh) {
-    motionToggleButtonStableHigh = readingHigh;
-    if (motionToggleButtonStableHigh) {
-      motionToggleButtonPressedAt = now;
-      motionToggleButtonLongPressHandled = false;
-      return;
-    }
-
-    motionToggleButtonPressedAt = 0;
-    if (motionToggleButtonLongPressHandled) {
-      motionToggleButtonLongPressHandled = false;
-      motionToggleButtonClickCount = 0;
-      motionToggleButtonClickDeadlineAt = 0;
-      return;
-    }
-
-    motionLastActivityAt = now;
-    if (recordingActive) {
-      // While recording, reserve button control for long-press stop only.
-      motionToggleButtonClickCount = 0;
-      motionToggleButtonClickDeadlineAt = 0;
-      return;
-    }
-
-    if (motionToggleButtonClickCount < UINT8_MAX) {
-      ++motionToggleButtonClickCount;
-    }
-    motionToggleButtonClickDeadlineAt = now + MOTION_TOGGLE_DOUBLE_CLICK_GAP_MS;
-    return;
-  }
-
-  if (motionToggleButtonClickCount == 0 || motionToggleButtonClickDeadlineAt == 0) {
-    // No pending single/double-click action.
-  } else if ((long)(now - motionToggleButtonClickDeadlineAt) >= 0) {
-    uint8_t clickCount = motionToggleButtonClickCount;
-    motionToggleButtonClickCount = 0;
-    motionToggleButtonClickDeadlineAt = 0;
-
-    if (clickCount >= 2) {
-      bool enableWifi = !runtimeConfig.wifiEnabled;
-      if (persistWifiEnabledAndApply(enableWifi, "rx-double-click")) {
-        if (!enableWifi) {
-          ledBlink(500, 200);
-        }
-      } else {
-        Logger.LogLine("[WIFI] RX double-click failed");
-        ledBlinkCount(4, 40, 40);
-      }
-      return;
-    }
-
-    MotionSettings updated = runtimeConfig.motionSettings;
-    updated.enabled = !updated.enabled;
-
-    String message;
-    if (!applyMotionSettingsChange(updated, "rx-toggle", message)) {
-      Logger.Log("[MOTION] RX button toggle failed: %s\n", message.c_str());
-      ledBlinkCount(4, 40, 40);
-      return;
-    }
-
-    if (runtimeConfig.motionSettings.enabled) {
-      Logger.LogLine("[MOTION] Enabled by RX button");
-      ledBlinkCount(2, 100, 100);
-    } else {
-      Logger.LogLine("[MOTION] Disabled by RX button");
-      ledBlinkCount(1, 100, 100);
-    }
-    return;
-  }
-
-  if (!motionToggleButtonStableHigh || motionToggleButtonLongPressHandled || motionToggleButtonPressedAt == 0) {
-    return;
-  }
-
-  if ((now - motionToggleButtonPressedAt) >= MOTION_TOGGLE_LONG_PRESS_MS) {
-    motionToggleButtonLongPressHandled = true;
-    motionToggleButtonClickCount = 0;
-    motionToggleButtonClickDeadlineAt = 0;
-    motionLastActivityAt = now;
-
-    String message;
-    if (runtimeConfig.motionSettings.enabled) {
-      MotionSettings updated = runtimeConfig.motionSettings;
-      updated.enabled = false;
-      if (applyMotionSettingsChange(updated, "rx-long-press", message)) {
-        Logger.Log("[MOTION] Disabled by RX long press: %s\n", message.c_str());
-        ledBlinkCount(1, 100, 100);
-      } else {
-        Logger.Log("[MOTION] RX long-press disable failed: %s\n", message.c_str());
-        ledBlinkCount(4, 40, 40);
-      }
-      return;
-    }
-
-    if (recordingActive) {
-      if (motionVideoManagedRecording) {
-        if (startManualRecordingSession(message)) {
-          Logger.Log("[REC] %s (RX button takeover)\n", message.c_str());
-          ledBlinkCount(3, 60, 60);
-        } else {
-          Logger.Log("[REC] RX button takeover failed: %s\n", message.c_str());
-        }
-      } else {
-        if (stopRecordingSessionWithOverride(message)) {
-          Logger.Log("[REC] %s (RX button)\n", message.c_str());
-          ledBlinkCount(4, 60, 60);
-        } else {
-          Logger.Log("[REC] RX button stop failed: %s\n", message.c_str());
-        }
-      }
-    } else {
-      if (startManualRecordingSession(message)) {
-        Logger.Log("[REC] %s (RX button)\n", message.c_str());
-        ledBlinkCount(3, 60, 60);
-      } else {
-        Logger.Log("[REC] RX button start failed: %s\n", message.c_str());
-      }
-    }
-  }
-}
-
-static void requestDeepStandby(const char *reason, bool immediate) {
-  if (standbyPending) {
-    return;
-  }
-
-  standbyPending = true;
-  standbyPendingReason = (reason && reason[0] != '\0') ? reason : "standby";
-  standbyPendingAt = millis() + (immediate ? STANDBY_RESPONSE_GRACE_MS : 0);
-  Logger.Log("[STANDBY] Requested (%s)%s\n",
-    standbyPendingReason,
-    immediate ? "" : " after inactivity");
-}
-
-static void servicePendingStandby() {
-  if (!standbyPending) {
-    return;
-  }
-
-  if ((long)(millis() - standbyPendingAt) < 0) {
-    return;
-  }
-
-  enterDeepStandbyNow(standbyPendingReason);
-}
-
-[[noreturn]] static void enterDeepStandbyNow(const char *reason) {
-  Logger.Log("[STANDBY] Entering deep sleep (%s), wake on PIR GPIO%d HIGH\n",
-    reason ? reason : "standby",
-    PIR_GPIO);
-
-  streamClientAbortRequested = true;
-  detachInterrupt(digitalPinToInterrupt(PIR_GPIO));
-
-  if (recordingActive) {
-    String stopMessage;
-    if (stopRecordingSessionInternal(stopMessage)) {
-      Logger.Log("[STANDBY] %s\n", stopMessage.c_str());
-    }
-  }
-
-  if (cameraInitialized) {
-    esp_err_t camErr = esp_camera_deinit();
-    if (camErr != ESP_OK) {
-      Logger.Log("[STANDBY] Camera deinit failed: 0x%x\n", camErr);
-    } else {
-      cameraInitialized = false;
-      powerDownCameraHardware();
-    }
-  } else {
-    powerDownCameraHardware();
-  }
-
-  serviceLogFileFlush();
-
-  WiFi.setSleep(false);
-  WiFi.disconnect(false, false);
-  WiFi.mode(WIFI_OFF);
-
-  pinMode(PIR_GPIO, INPUT_PULLDOWN);
-  gpio_hold_dis(static_cast<gpio_num_t>(PIR_GPIO));
-  gpio_hold_en(static_cast<gpio_num_t>(PIR_GPIO));
-  gpio_deep_sleep_hold_en();
-
-  uint64_t wakeMask = (1ULL << PIR_GPIO);
-  esp_err_t wakeErr = esp_sleep_enable_ext1_wakeup(wakeMask, ESP_EXT1_WAKEUP_ANY_HIGH);
-  if (wakeErr != ESP_OK) {
-    Logger.Log("[STANDBY] Failed to enable EXT0 wake on GPIO%d: 0x%x\n", PIR_GPIO, wakeErr);
-    delay(100);
-    ESP.restart();
-  }
-
-  delay(50);
-  esp_deep_sleep_start();
-  for (;;) {
-    delay(1000);
-  }
+  // Motion/button behavior is disabled in this simplified firmware variant.
+  return;
 }
 
 static void initializeRouteAccessToken() {
@@ -4892,12 +4437,6 @@ static void initializeRouteAccessToken() {
 static void startInitialNetworkServices() {
   Logger.Log("[CFG] Configured: %s\n", isConfigured ? "yes" : "no");
   Logger.Log("[CAM] Lazy init enabled with idle timeout %lu ms\n", cameraIdleTimeoutMs);
-
-  if (!sdCardAvailableAtBoot) {
-    Logger.LogLine("[BOOT] SD missing at boot - starting OTA recovery AP mode");
-    startOtaRecoveryAPMode();
-    return;
-  }
 
   if (!runtimeConfig.wifiEnabled) {
     Logger.LogLine("[WIFI] Startup skipped: WiFi is disabled in persisted config");
@@ -4931,16 +4470,9 @@ void setup() {
   initializeBootPins();
   logInputPinConfiguration();
   resetMotionRuntimeState();
-
-  sdCardAvailableAtBoot = initSDCard();
-  if (!sdCardAvailableAtBoot) {
-    Logger.LogLine("[SD] Boot check: SD card unavailable");
-  }
+  sdCardAvailableAtBoot = false;
 
   loadStartupConfig();
-  if (serviceIntervalometerStartupIfNeeded()) {
-    return;
-  }
   finalizeMotionStartupConfig();
   initializeRouteAccessToken();
   startInitialNetworkServices();
@@ -4951,14 +4483,6 @@ void loop() {
   server.handleClient();
   serviceNtpSync();
   serviceStaReconnect();
-  serviceMotionToggleButton();
-  serviceRecording();
-  serviceMotionDetection();
-  serviceMotionActions();
-  serviceDeferredNetworkStartup();
-  serviceMotionNotifyRetry();
-  serviceAutoStandby();
-  servicePendingStandby();
   serviceCameraIdleTimeout();
   servicePendingFirmwareRestart();
   servicePendingAdminRestart();

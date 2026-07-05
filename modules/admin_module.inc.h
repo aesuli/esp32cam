@@ -160,45 +160,6 @@ static void handleAdminLedSet() {
   server.send(HTTP_OK, "text/plain", "LED configuration saved");
 }
 
-static void handleAdminLoggingGet() {
-  if (!checkAuth()) return;
-
-  String json = "{";
-  json += "\"loggingFileEnabled\":" + String(gLogFileEnabled ? "true" : "false") + ",";
-  json += "\"loggingEnabled\":" + String(gLogFileEnabled ? "true" : "false");
-  json += "}";
-  server.send(HTTP_OK, "application/json", json);
-}
-
-static void handleAdminLoggingSet() {
-  if (!checkAuth()) return;
-
-  bool hasFile = server.hasArg("loggingFileEnabled");
-  bool hasLegacy = server.hasArg("loggingEnabled");
-  if (!hasFile && !hasLegacy) {
-    server.send(HTTP_BAD_REQUEST, "text/plain", "Missing loggingFileEnabled parameter");
-    return;
-  }
-
-  bool fileEnabled = runtimeConfig.logFileEnabled;
-  if (hasLegacy) {
-    fileEnabled = (server.arg("loggingEnabled") == "1" || server.arg("loggingEnabled") == "true");
-  }
-  if (hasFile) {
-    fileEnabled = (server.arg("loggingFileEnabled") == "1" || server.arg("loggingFileEnabled") == "true");
-  }
-
-  runtimeConfig.logFileEnabled = fileEnabled;
-  updateSdLoggingState();
-
-  if (!persistRuntimeConfig(runtimeConfig)) {
-    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to save logging configuration");
-    return;
-  }
-
-  server.send(HTTP_OK, "text/plain", "Logging configuration saved");
-}
-
 // Valid wifi_power_t raw values accepted from the UI
 static bool isValidTxPowerValue(int v) {
   switch (v) {
@@ -281,23 +242,14 @@ static void handleAdminFactoryReset() {
 
   handleUrlAccess();
 
-  ScopedSdLock sdLock(pdMS_TO_TICKS(SD_LONG_LOCK_TIMEOUT_MS));
-  if (!sdLock.locked()) {
-    server.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", ERR_SD_CARD_BUSY);
+  Preferences prefs;
+  if (!prefs.begin(CONFIG_NVS_NAMESPACE, false)) {
+    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to open NVS for reset");
     return;
   }
 
-  if (!initSDCard()) {
-    server.send(HTTP_INTERNAL_ERROR, "text/plain", ERR_SD_CARD_NOT_AVAILABLE);
-    return;
-  }
-
-  if (SD_MMC.exists(CONFIG_FILE_PATH) && !SD_MMC.remove(CONFIG_FILE_PATH)) {
-    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to delete configuration file");
-    return;
-  }
-
-  sdLock.release();
+  prefs.clear();
+  prefs.end();
   adminRestartPending = true;
   adminRestartAt = millis() + FIRMWARE_RESTART_DELAY_MS;
   server.send(HTTP_OK, "text/plain", "Configuration deleted. Rebooting to setup mode shortly.");
@@ -321,15 +273,12 @@ static void registerAdminRoutes() {
   server.on("/admin/time/sync", HTTP_POST, handleAdminTimeSync);
   server.on("/admin/led", HTTP_GET, handleAdminLedGet);
   server.on("/admin/led", HTTP_POST, handleAdminLedSet);
-  server.on("/admin/logging", HTTP_GET, handleAdminLoggingGet);
-  server.on("/admin/logging", HTTP_POST, handleAdminLoggingSet);
   server.on("/admin/txpower", HTTP_GET, handleAdminTxPowerGet);
   server.on("/admin/txpower", HTTP_POST, handleAdminTxPowerSet);
   server.on("/admin/reset", HTTP_POST, handleAdminReset);
   server.on("/admin/factory-reset", HTTP_POST, handleAdminFactoryReset);
   server.on("/wifi/list", HTTP_GET, handleWifiList);
   server.on("/wifi/add", HTTP_POST, handleWifiAdd);
-  server.on("/wifi/enabled", HTTP_POST, handleWifiSetEnabled);
   server.on("/wifi/delete", HTTP_POST, handleWifiDelete);
   server.on("/wifi/move", HTTP_POST, handleWifiMove);
 }
