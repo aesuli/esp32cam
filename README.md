@@ -20,7 +20,7 @@ On first boot (or if no saved config is found), the device starts in setup mode.
 - Setup WiFi AP:
   - SSID: ESP32-CAM-Setup
   - Password: ESP32-CAM
-- Open https://192.168.4.1 and accept the browser warning for the self-signed certificate, then complete setup:
+- Open http://192.168.4.1, then complete setup:
   - WiFi network SSID and password
   - Admin password (min 8 characters)
   - Device name (default: ESP32-CAM)
@@ -31,11 +31,10 @@ On first boot (or if no saved config is found), the device starts in setup mode.
 After setup, the device boots into normal operation.
 
 - It tries saved WiFi networks in priority order until one connects.
-- Main web interface: port 443 (self-signed HTTPS, HTTP Basic Auth, user: `admin`, password: configured admin password).
-- Live MJPEG stream endpoint: `/stream` on HTTPS port 444. This accepts HTTP Basic Auth and also the internal shared route token used by the camera page.
-- Direct JPEG snapshot URLs: `/snapshot` or `/snapshot.jpg` on HTTPS port 443. These require HTTP Basic Auth.
-- Firmware upload endpoint: HTTPS port 445.
-- Plain HTTP remains available internally on ports 80, 81, and 82 for the HTTPS forwarding layer.
+- Main web interface: port 80 (HTTP Basic Auth, user: `admin`, password: configured admin password).
+- Live MJPEG stream endpoint: `/stream` on HTTP port 81. This accepts HTTP Basic Auth and also the internal shared route token used by the camera page.
+- Direct JPEG snapshot URLs: `/snapshot` or `/snapshot.jpg` on HTTP port 80. These require HTTP Basic Auth.
+- Firmware upload endpoint: HTTP port 82.
 - If no saved WiFi connects, it starts fallback AP:
   - SSID: ESP32-CAM
   - Password: current admin password

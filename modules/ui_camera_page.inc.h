@@ -125,9 +125,9 @@ __APP_FOOTER__
 <script>
 var streamVisible=true;
 var viewRotate90=false;
-var streamUrl='https://'+window.location.hostname+':444/stream?t='+encodeURIComponent('__ROUTE_TOKEN__');
-var directStreamUrl='https://'+window.location.hostname+':444/stream';
-var snapshotUrl='https://'+window.location.hostname+'/snapshot.jpg';
+var streamUrl='http://'+window.location.hostname+':81/stream?t='+encodeURIComponent('__ROUTE_TOKEN__');
+var directStreamUrl='http://'+window.location.hostname+':81/stream';
+var snapshotUrl='http://'+window.location.hostname+':80/snapshot.jpg';
 function id(n){return document.getElementById(n);}
 function chk(el){return el.checked?1:0;}
 function setStatus(text){
