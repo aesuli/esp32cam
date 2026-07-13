@@ -27,9 +27,7 @@ header span{font-size:.85em;color:#888}
 .stream-placeholder.visible{display:flex}
 .btn{display:inline-block;margin-top:8px;padding:8px 20px;background:#e94560;color:#fff;border:none;border-radius:4px;cursor:pointer;text-decoration:none;font-size:.9em}
 .btn:hover{background:#c73652}
-.btn.recording{background:#c73652;animation:pulse 1s infinite}
 .btn.flash-on{background:#fbbf24}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.7}}
 .controls{flex:0 1 280px;background:#16213e;border-radius:8px;padding:14px;height:fit-content}
 .controls h3{color:#e94560;margin-bottom:12px;font-size:1em}
 .cg{margin-bottom:10px}
@@ -54,8 +52,8 @@ __APP_NAV__
     </div>
     <br>
     <button class="btn" id="stream_toggle_btn">🙈 Hide Stream</button>
-    <button class="btn" id="cap_btn">📸 Capture</button>
-    <button class="btn" id="rec_btn">⏺️ Record</button>
+    <button class="btn" id="stream_open_btn">🎞️ Stream</button>
+    <button class="btn" id="snapshot_open_btn">📷 Snapshot</button>
     <button class="btn" id="flash_btn">💡 Flash Off</button>
     <div id="rec_status" style="margin-top:8px;font-size:.85em;color:#7dd3fc"></div>
   </div>
@@ -125,13 +123,17 @@ __APP_NAV__
 </div>
 __APP_FOOTER__
 <script>
-var recordingMode=false;
-var motionRecordingMode=false;
 var streamVisible=true;
 var viewRotate90=false;
 var streamUrl='https://'+window.location.hostname+':444/stream?t='+encodeURIComponent('__ROUTE_TOKEN__');
+var directStreamUrl='https://'+window.location.hostname+':444/stream';
+var snapshotUrl='https://'+window.location.hostname+'/snapshot.jpg';
 function id(n){return document.getElementById(n);}
 function chk(el){return el.checked?1:0;}
+function setStatus(text){
+  var status=id('rec_status');
+  if(status)status.textContent=text||'';
+}
 function ctrl(v,val,persist){
   var url='/control?var='+encodeURIComponent(v)+'&val='+encodeURIComponent(val);
   if(persist===false){url+='&persist=0';}
@@ -172,16 +174,6 @@ function setStreamVisibility(isVisible){
     releaseStream(true);
   }
 }
-function setRecordingState(isRecording,statusText,isMotionRecording){
-  var btn=id('rec_btn');
-  var status=id('rec_status');
-  recordingMode=!!isRecording;
-  if(isMotionRecording!==undefined){motionRecordingMode=!!isMotionRecording;}
-  else if(!recordingMode){motionRecordingMode=false;}
-  btn.classList.toggle('recording',recordingMode);
-  btn.textContent=recordingMode?(motionRecordingMode?'⏺️ Manual Record':'⏹️ Stop'):'⏺️ Record';
-  if(statusText!==undefined){status.textContent=statusText;}
-}
 function updateStreamLayout(){
   var shell=id('stream_shell');
   var img=id('stream');
@@ -205,18 +197,16 @@ function bindFrameSizeControl(){
   if(!el)return;
   el.addEventListener('change',function(){
     var shouldResumeStream=streamVisible;
-    setRecordingState(recordingMode,'Applying resolution change...');
+    setStatus('Applying resolution change...');
     if(shouldResumeStream){releaseStream(true);}
     ctrl('framesize',el.value,true).then(function(result){
       return loadStatus().catch(function(){}).then(function(){
-        if(!result.ok){setRecordingState(recordingMode,result.text||'Failed to change resolution');}
-        else if(recordingMode){setRecordingState(true,'Recording...');}
-        else{id('rec_status').textContent='';}
+        if(!result.ok){setStatus(result.text||'Failed to change resolution');}
         if(shouldResumeStream){setTimeout(function(){setStreamVisibility(true);},150);}
       });
     }).catch(function(){
       if(shouldResumeStream){setStreamVisibility(true);}
-      setRecordingState(recordingMode,'Failed to change resolution');
+      setStatus('Failed to change resolution');
     });
   });
 }
@@ -251,7 +241,7 @@ function applyStatus(s){
     setViewRotation(!!s.view_rotate_90);
   }
   setStreamVisibility(s.stream_visible!==undefined?!!s.stream_visible:true);
-  if(s.recording_active!==undefined){setRecordingState(!!s.recording_active,s.recording_active?(s.recording_motion?'Motion recording...':'Recording...'):'',!!s.recording_motion);}
+  if(s.recording_active!==undefined){setStatus(s.recording_active?(s.recording_motion?'Motion recording...':'Recording...'):'');}
 }
 function loadStatus(){
   return fetch('/status').then(function(r){return r.json();}).then(function(s){
@@ -269,21 +259,11 @@ id('stream_toggle_btn').addEventListener('click',function(){
   setStreamVisibility(nextVisible);
   ctrl('stream_visible',nextVisible?1:0,true);
 });
-id('cap_btn').addEventListener('click',function(){fetch('/capture').then(function(r){if(r.ok)id('rec_status').textContent='Capture saved to /capture folder';});});
-id('rec_btn').addEventListener('click',function(){
-  if(recordingMode&&!motionRecordingMode){
-    fetch('/record/stop',{method:'POST'}).then(function(r){
-      return r.text().then(function(msg){
-        if(r.ok){setRecordingState(false,msg||'Recording saved.');}
-      });
-    });
-  }else{
-    fetch('/record/start',{method:'POST'}).then(function(r){
-      return r.text().then(function(msg){
-        if(r.ok){setRecordingState(true,msg||'Recording...',false);}
-      });
-    });
-  }
+id('stream_open_btn').addEventListener('click',function(){
+  window.open(directStreamUrl,'_blank','noopener');
+});
+id('snapshot_open_btn').addEventListener('click',function(){
+  window.open(snapshotUrl,'_blank','noopener');
 });
 id('flash_btn').addEventListener('click',function(){
   var isFlashOn=id('flash_btn').classList.contains('flash-on');

@@ -3223,8 +3223,8 @@ static void requestStreamClientCloseAndWait() {
     }
 }
 
-static void handleStreamWorker() {
-    if (!checkAuth(streamServer, true)) return;
+static void handleStreamRequest(bool allowSharedToken) {
+    if (!checkAuth(streamServer, allowSharedToken)) return;
 
     if (!ensureCameraReady()) {
       streamServer.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", "Camera unavailable");
@@ -3294,6 +3294,10 @@ static void handleStreamWorker() {
       setWifiModemSleep(true, "idle");
     }
     Logger.LogLine("[STREAM] Client disconnected");
+}
+
+static void handleStreamWorker() {
+  handleStreamRequest(true);
 }
 
 static void handleStreamMain() {
@@ -4395,6 +4399,8 @@ static void registerCameraRoutes() {
   server.on("/",              HTTP_GET,  handleCameraRoot);
   server.on("/stream",        HTTP_GET,  handleStreamMain);
   server.on("/stream/close",  HTTP_POST, handleStreamClose);
+  server.on("/snapshot",      HTTP_GET,  handleCapture);
+  server.on("/snapshot.jpg",  HTTP_GET,  handleCapture);
   server.on("/control",       HTTP_GET,  handleControl);
   server.on("/status",        HTTP_GET,  handleStatus);
   server.on("/wifi/scan",     HTTP_GET,  handleWifiScan);

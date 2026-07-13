@@ -1,30 +1,17 @@
 # ESP32 multipurpose CAM
 
-Firmware for AI-Thinker ESP32-CAM (OV3660) with web streaming, camera controls, motion actions, intervalometer (timelapse), and SD-backed secure configuration.
+Firmware for AI-Thinker ESP32-CAM (OV3660) with web streaming and camera controls.
 
 ## Hardware and Assembly
 
 ### Hardware parts
 
 - AI-Thinker ESP32-CAM board with OV3660 camera.
-- microSD card (required for setup, settings persistence, captures, recordings, and optional logs).
-- PIR motion sensor (digital output).
-- Optional push button for hardware control.
 - Stable 5V power source suitable for ESP32-CAM current peaks.
 
 ### Wiring
 
-- PIR sensor:
-  - VCC -> 3.3V
-  - GND -> GND
-  - DATA/OUT -> GPIO13
-- Optional physical button:
-  - One side -> GPIO3 (RX pin)
-  - Other side -> 3.3V
-  - The firmware keeps GPIO3 pulled down internally, so idle state is LOW and press is HIGH.
-- microSD:
-  - Insert card in the ESP32-CAM slot.
-  - Firmware uses SD_MMC 1-bit mode.
+None required
 
 ## First setup
 
@@ -39,23 +26,15 @@ On first boot (or if no saved config is found), the device starts in setup mode.
   - Device name (default: ESP32-CAM)
   - You can use the scan button to list nearby WiFi networks.
 
-### Storage behavior
-
-- SD card is required.
-- Configuration is encrypted and stored as `/config.enc` on the SD card.
-- If `/config.enc` is missing, the device returns to first setup.
-- To migrate to another SD card while keeping settings, copy `/config.enc` to the new card.
-- Captures and recordings are stored under `/capture`.
-- If enabled in Admin, runtime logs are written to `/log.txt`.
-
 ## Normal Operation
 
 After setup, the device boots into normal operation.
 
 - It tries saved WiFi networks in priority order until one connects.
 - Main web interface: port 443 (self-signed HTTPS, HTTP Basic Auth, user: `admin`, password: configured admin password).
-- Live stream endpoint: `/stream` on HTTPS port 444.
-- SD transfer and firmware upload endpoints: HTTPS port 445.
+- Live MJPEG stream endpoint: `/stream` on HTTPS port 444. This accepts HTTP Basic Auth and also the internal shared route token used by the camera page.
+- Direct JPEG snapshot URLs: `/snapshot` or `/snapshot.jpg` on HTTPS port 443. These require HTTP Basic Auth.
+- Firmware upload endpoint: HTTPS port 445.
 - Plain HTTP remains available internally on ports 80, 81, and 82 for the HTTPS forwarding layer.
 - If no saved WiFi connects, it starts fallback AP:
   - SSID: ESP32-CAM
@@ -71,7 +50,6 @@ Use this page for system-level configuration.
 - Change device name.
 - Set time manually or sync via NTP.
 - Enable or disable LED blink on URL access.
-- Enable or disable writing logs to `/log.txt`.
 - Configure WiFi TX power for STA mode and fallback AP mode.
 - Upload new firmware (`.bin`) for OTA update.
 - Restart device.
@@ -82,10 +60,10 @@ Use this page for system-level configuration.
 Use this page for live view and manual capture.
 
 - Live MJPEG stream view.
+- Use `/stream` for clients that need a direct authenticated stream URL.
 - Show/hide stream without leaving the page.
+- Use `/snapshot` or `/snapshot.jpg` for a one-shot authenticated JPEG.
 - Flash LED on/off.
-- Capture still image to `/capture/SEQUENCE-YYYYMMDD_HHMMSS.jpg`.
-- Start/stop manual video recording to `/capture/SEQUENCE-YYYYMMDD_HHMMSS.avi`.
 - Camera tuning controls, including:
   - resolution
   - brightness, contrast, saturation
@@ -96,19 +74,6 @@ Use this page for live view and manual capture.
   - lens correction
   - optional 90-degree view rotation in the browser
 
-### Motion page
-
-Use this page to configure PIR-triggered behavior.
-
-- Enable/disable motion detection.
-- After enabling, arming starts after a fixed 10-second delay.
-- On motion, optionally:
-  - capture one or more images (with configurable interval)
-  - record a video (configurable duration)
-- Set detection cooldown interval between triggers.
-- Optional notify URL (HTTP GET) on motion event.
-- Open live Motion Graph page for PIR signal visualization.
-
 ### Admin page
 
 Use this page for system-wide settings and maintenance.
@@ -117,57 +82,7 @@ Use this page for system-wide settings and maintenance.
 - Manage admin password and device name.
 - Set time manually or request NTP sync.
 - Configure LED blink-on-access behavior.
-- Configure logging to /log.txt.
-- Configure optional auto-standby after 2 minutes without authenticated requests and without motion events.
-- Trigger Enter Standby Now manually.
-- Deep standby wake source is PIR HIGH on GPIO13.
 
-### Intervalometer page
-
-Use this page to run deep-sleep timelapse captures.
-
-- Configure interval value (1 to 100000) and unit (seconds, minutes, hours, days).
-- Configure burst count (1 to 10 images per wake cycle).
-- Configure delay between burst shots (1 to 100 seconds).
-- Start timelapse from the page:
-  - first burst is captured immediately;
-  - device enters deep sleep and wakes by timer for the next burst.
-- Wake period is compensated by capture time so interval cadence does not drift.
-- During intervalometer mode, WiFi and motion features are suspended.
-- Intervalometer mode stops on power cycle by default.
-- Optional: enable continue-after-power-loss; if RX button (GPIO3) is held during power-on, timelapse is interrupted instead of resumed.
-- Files are saved as:
-  - `/timelapse/t-<num_timelapse>/i-<num_img>-<num_burst>-<time>.jpg`
-
-### SD browser page
-
-Use this page for SD file management.
-
-- Browse folders and files.
-- Create folders.
-- Delete files and folders (folder delete is recursive).
-- Upload files to the current folder (file picker or drag and drop).
-- Download single or multiple selected files.
-- Export multiple selected JPG/JPEG files as a single MJPG AVI download with selectable frame rate.
-- Open supported files in browser.
-- Built-in playback page for recorded media.
-- Sort by name, size, or type (ascending/descending).
-
-## Physical button
-
-The optional button connected to GPIO3 (RX) provides quick local control.
-
-- Single press: toggles motion detection on/off.
-- Double press: toggles WiFi on/off.
-- Long press (~1 second): controls recording:
-  - starts manual recording when idle
-  - stops manual recording when already recording
-  - if motion-triggered recording is active, takes over into manual recording
-
-Notes:
-
-- During recording, short/double click actions are suppressed; long press remains active.
-- Button input is active-HIGH, with internal pulldown bias.
 
 ## License
 
