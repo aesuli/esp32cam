@@ -242,16 +242,11 @@ static void handleAdminFactoryReset() {
 
   handleUrlAccess();
 
-  Preferences prefs;
-  if (!prefs.begin(CONFIG_NVS_NAMESPACE, false)) {
+  if (!requestFactoryResetAndReboot("web")) {
     server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to open NVS for reset");
     return;
   }
 
-  prefs.clear();
-  prefs.end();
-  adminRestartPending = true;
-  adminRestartAt = millis() + FIRMWARE_RESTART_DELAY_MS;
   server.send(HTTP_OK, "text/plain", "Configuration deleted. Rebooting to setup mode shortly.");
 }
 

@@ -3,14 +3,12 @@
  *
  * Hardware:
  *   - AI-Thinker ESP32-CAM with OV3660 camera sensor
- *   - microSD in 1-bit mode so SDMMC does not actively drive GPIO12/GPIO13
- *   - PIR input wired to GPIO13
  *
  * First Boot (unconfigured or missing config file):
  *   Broadcasts protected WiFi AP "ESP32-CAM-Setup"
  *   with password "ESP32-CAM".
  *   Visit https://192.168.4.1 to enter WiFi credentials and an
- *   access password. Credentials are encrypted and stored on SD.
+ *   access password. Credentials are encrypted and stored in flash.
  *
  * Normal Operation:
  *   Port 80 — HTTP web UI with live MJPEG stream and camera controls.
@@ -29,7 +27,6 @@
 #include <HTTPClient.h>
 #include <WebServer.h>
 #include <FS.h>
-#include <SD_MMC.h>
 #include <Preferences.h>
 #include <Update.h>
 #include <esp_err.h>
@@ -58,9 +55,7 @@
 #endif
 
 // Pin definitions
-static constexpr int PIR_GPIO = GPIO_NUM_13;
 static constexpr int LED_GPIO = GPIO_NUM_33;
-static constexpr int MOTION_TOGGLE_BUTTON_GPIO = GPIO_NUM_3;
 
 // AP setup credentials
 #define AP_SETUP_SSID "ESP32-CAM-Setup"
@@ -89,9 +84,6 @@ static constexpr uint32_t CAMERA_XCLK_FREQS_HZ[] = {20000000UL, 10000000UL, 8000
 // Config persistence metadata
 #define CONFIG_FILE_PATH "/config.enc"
 #define CONFIG_FILE_MAGIC "ESP32CAMCFG14"
-#define CAPTURE_COUNTER_FILE_PATH "/capture_counter.txt"
-#define TIMELAPSE_COUNTER_FILE_PATH "/timelapse_counter.txt"
-#define SD_SORT_FILE_PATH "/.sort"
 static constexpr const char *CONFIG_NVS_NAMESPACE = "esp32camcfg";
 static constexpr const char *CONFIG_NVS_MAGIC_KEY = "cfg_magic";
 static constexpr const char *CONFIG_NVS_IV_KEY = "cfg_iv";
@@ -149,138 +141,43 @@ static String cfgDeviceName;
 static String routeAccessToken;
 static bool   isConfigured = false;
 static bool   otaRecoveryModeActive = false;
-static bool   recordingActive = false;
 static volatile bool streamClientConnected = false;
 static volatile bool streamClientAbortRequested = false;
 static bool   flashEnabled = false;
-static bool   motionCaptureFlashOwned = false;
 static bool   cameraInitialized = false;
 static bool   ledAccessBlinkEnabled = false;
 static bool   wifiModemSleepEnabled = false;
 static bool   staConnectedAtBoot = false;
-static bool   sdCardAvailableAtBoot = false;
-static bool   motionRawHigh = false;
-static bool   motionLatched = false;
-static bool   motionToggleButtonStableHigh = false;
-static bool   motionToggleButtonLastReadingHigh = false;
-static bool   motionToggleButtonLongPressHandled = false;
-static bool   motionToggleButtonConsumeUntilRelease = false;
-static uint8_t motionToggleButtonClickCount = 0;
-static volatile bool motionEdgePending = false;
-static volatile uint32_t motionEdgeCount = 0;
-static uint8_t motionPendingImages = 0;
-static bool   motionVideoManagedRecording = false;
-static bool   motionActionWindowActive = false;
-static bool   motionNotifyPending = false;
-static unsigned long motionNotifyLastAttemptAt = 0;
 static bool   deferredNetworkStartupPending = false;
-static bool   standbyPending = false;
-static unsigned long standbyPendingAt = 0;
-static const char *standbyPendingReason = nullptr;
-static bool   wokeFromPirDeepSleep = false;
 static volatile bool staLinkUp = false;
 static unsigned long lastUrlAccessBlink = 0;
 static unsigned long lastCameraActivityAt = 0;
 static unsigned long lastStaReconnectAttemptAt = 0;
-static unsigned long motionHighSinceAt = 0;
-static unsigned long motionLastDetectedAt = 0;
-static unsigned long motionLastActivityAt = 0;
-static unsigned long motionToggleButtonLastChangeAt = 0;
-static unsigned long motionToggleButtonPressedAt = 0;
-static unsigned long motionToggleButtonClickDeadlineAt = 0;
-static unsigned long motionNextImageAt = 0;
-static unsigned long motionRecordingStopAt = 0;
-static unsigned long motionIgnoreUntilAt = 0;
-static unsigned long motionEnableActivationAt = 0;
 static constexpr unsigned long LED_ACCESS_BLINK_INTERVAL_MS = 100;  // Minimum interval between access blinks
 static constexpr unsigned long STA_RECONNECT_INTERVAL_MS = 30000;
 static constexpr unsigned long STA_CONNECT_TIMEOUT_MS = 20000;
-static constexpr unsigned long MOTION_NOTIFY_RETRY_INTERVAL_MS = 5000;
-static constexpr unsigned long MOTION_ENABLE_ACTIVATION_DELAY_MS = 10000;
-static constexpr unsigned long MOTION_TOGGLE_DEBOUNCE_MS = 40;
-static constexpr unsigned long MOTION_TOGGLE_LONG_PRESS_MS = 1000;
-static constexpr unsigned long MOTION_TOGGLE_DOUBLE_CLICK_GAP_MS = 550;
-static constexpr unsigned long STANDBY_INACTIVITY_TIMEOUT_MS = 120000;
-static constexpr unsigned long STANDBY_RESPONSE_GRACE_MS = 200;
 static unsigned long cameraIdleTimeoutMs = 3000;
-static unsigned long recordingStartTime = 0;
-static uint32_t recordingDurationMs = 0;
-static unsigned long recordingLastFrameAt = 0;
-static uint32_t recordingFrameCount = 0;
-static uint32_t recordingMaxFrameSize = 0;
-static uint16_t recordingWidth = 0;
-static uint16_t recordingHeight = 0;
-static uint32_t recordingMoviListSize = 4;
-static bool recordingIndexEnabled = true;
-static File   recordingFile;
-static String recordingPath;
-static uint8_t *recordingWriteBuffer = nullptr;
-static size_t recordingWriteBufferCapacity = 0;
-static size_t recordingWriteBufferLen = 0;
-static unsigned long recordingLastFileSyncAt = 0;
-static File   sdUploadFile;
-static bool   sdUploadFailed = false;
-static bool   sdUploadBlocked = false;
-static String sdUploadPath;
 static bool   firmwareUploadFailed = false;
 static bool   firmwareUploadSuccess = false;
 static unsigned long firmwareRestartAt = 0;
 static bool   adminRestartPending = false;
 static unsigned long adminRestartAt = 0;
-static uint32_t captureSequence = 0;
-static bool captureSequenceLoaded = false;
+static String serialFactoryResetCode;
+static String serialCommandBuffer;
+static bool serialFactoryResetArmed = false;
+static unsigned long serialLastInputAt = 0;
 static SemaphoreHandle_t cameraMutex = nullptr;
-static SemaphoreHandle_t recordingMutex = nullptr;
-static SemaphoreHandle_t sdMutex = nullptr;
 static SemaphoreHandle_t streamPreviewMutex = nullptr;
 static TaskHandle_t streamServerTaskHandle = nullptr;
 static TaskHandle_t transferServerTaskHandle = nullptr;
-static constexpr unsigned long SD_SHORT_LOCK_TIMEOUT_MS = 100;
-static constexpr unsigned long SD_LONG_LOCK_TIMEOUT_MS = 1500;
-static constexpr unsigned long RECORDING_SHORT_LOCK_TIMEOUT_MS = 100;
-static constexpr unsigned long RECORDING_LONG_LOCK_TIMEOUT_MS = 1500;
 static constexpr unsigned long STREAM_FRAME_INTERVAL_MS = 33;
 static constexpr unsigned long STREAM_CLOSE_WAIT_MS = 600;
-static constexpr unsigned long RECORDING_FRAME_INTERVAL_MS = 33;
 static constexpr unsigned long FIRMWARE_RESTART_DELAY_MS = 1500;
-// Keep short recordings seekable, but do not let manual-recording metadata
-// consume internal heap indefinitely.
-static constexpr size_t AVI_INDEX_MEMORY_BUDGET_BYTES = 48U * 1024U;
-static constexpr size_t AVI_INDEX_LOW_HEAP_GUARD_BYTES = 32U * 1024U;
-static constexpr uint32_t AVI_HAS_INDEX_FLAG = 0x00000010UL;
-static constexpr uint32_t AVI_KEYFRAME_FLAG = 0x00000010UL;
-static constexpr size_t AVI_HEADER_SIZE = 224;
-static constexpr uint32_t AVI_MOVI_LIST_HEADER_SIZE = 4;
-static constexpr size_t RECORDING_WRITE_BUFFER_BYTES = 64U * 1024U;
-static constexpr unsigned long RECORDING_FILE_SYNC_INTERVAL_MS = 3000;
-static constexpr const char *CAPTURE_DIRECTORY = "/capture";
-static constexpr const char *TIMELAPSE_DIRECTORY = "/timelapse";
-static constexpr const char *AVI_VIDEO_CHUNK_ID = "00dc";
+static constexpr size_t SERIAL_COMMAND_MAX_LEN = 96;
+static constexpr unsigned long SERIAL_COMMAND_IDLE_FLUSH_MS = 1200;
 static constexpr const char *SERIAL_LOG_FILE_PATH = "/log.txt";
 static constexpr const char *FIRMWARE_VERSION_TEXT = FIRMWARE_VERSION;
 static constexpr const char *FIRMWARE_BUILD_TEXT = __DATE__ " " __TIME__;
-
-static bool initSDCard();
-
-static bool gLogWriteInProgress = false;
-static bool gLogSdReady = false;
-static bool gLogSdFailureReported = false;
-static bool gLogFileFailureReported = false;
-static bool gLogFileEnabled = false;
-static bool gSdCardMounted = false;
-static volatile bool gSdOperationInProgress = false;
-static constexpr size_t LOG_FILE_BUFFER_CAPACITY = 8192;
-static constexpr size_t LOG_FILE_FLUSH_CHUNK_BYTES = 1024;
-static constexpr size_t LOG_FILE_MAX_BATCH_BYTES = 3072;
-static constexpr unsigned long LOG_FILE_FLUSH_INTERVAL_MS = 250;
-static uint8_t gLogFileBuffer[LOG_FILE_BUFFER_CAPACITY];
-static uint8_t gLogFileFlushChunk[LOG_FILE_FLUSH_CHUNK_BYTES];
-static size_t gLogFileBufferHead = 0;
-static size_t gLogFileBufferTail = 0;
-static size_t gLogFileBufferSize = 0;
-static uint32_t gLogFileDroppedBytes = 0;
-static unsigned long gLogLastFlushAt = 0;
-static portMUX_TYPE gLogFileBufferMux = portMUX_INITIALIZER_UNLOCKED;
 
 class SemaphoreLock {
  public:
@@ -310,95 +207,6 @@ class SemaphoreLock {
   SemaphoreHandle_t semaphore_;
   bool locked_;
 };
-
-class ScopedSdLock {
- public:
-  explicit ScopedSdLock(TickType_t timeoutTicks)
-      : locked_(sdMutex && xSemaphoreTake(sdMutex, timeoutTicks) == pdTRUE) {
-    if (locked_) {
-      gSdOperationInProgress = true;
-    }
-  }
-
-  ~ScopedSdLock() {
-    release();
-  }
-
-  void release() {
-    if (locked_) {
-      gSdOperationInProgress = false;
-      xSemaphoreGive(sdMutex);
-      locked_ = false;
-    }
-  }
-
-  ScopedSdLock(const ScopedSdLock &) = delete;
-  ScopedSdLock &operator=(const ScopedSdLock &) = delete;
-
-  bool locked() const {
-    return locked_;
-  }
-
- private:
-  bool locked_;
-};
-
-static void enqueueLogFileChunk(const uint8_t *data, size_t len) {
-  if (!data || len == 0) {
-    return;
-  }
-
-  portENTER_CRITICAL(&gLogFileBufferMux);
-  for (size_t i = 0; i < len; ++i) {
-    if (gLogFileBufferSize >= LOG_FILE_BUFFER_CAPACITY) {
-      gLogFileBufferTail = (gLogFileBufferTail + 1) % LOG_FILE_BUFFER_CAPACITY;
-      --gLogFileBufferSize;
-      ++gLogFileDroppedBytes;
-    }
-
-    gLogFileBuffer[gLogFileBufferHead] = data[i];
-    gLogFileBufferHead = (gLogFileBufferHead + 1) % LOG_FILE_BUFFER_CAPACITY;
-    ++gLogFileBufferSize;
-  }
-  portEXIT_CRITICAL(&gLogFileBufferMux);
-}
-
-static size_t dequeueLogFileChunk(uint8_t *out, size_t maxLen) {
-  if (!out || maxLen == 0) {
-    return 0;
-  }
-
-  portENTER_CRITICAL(&gLogFileBufferMux);
-  size_t len = (gLogFileBufferSize < maxLen) ? gLogFileBufferSize : maxLen;
-  for (size_t i = 0; i < len; ++i) {
-    out[i] = gLogFileBuffer[gLogFileBufferTail];
-    gLogFileBufferTail = (gLogFileBufferTail + 1) % LOG_FILE_BUFFER_CAPACITY;
-  }
-  gLogFileBufferSize -= len;
-  portEXIT_CRITICAL(&gLogFileBufferMux);
-  return len;
-}
-
-static size_t currentLogFileBufferSize() {
-  portENTER_CRITICAL(&gLogFileBufferMux);
-  size_t size = gLogFileBufferSize;
-  portEXIT_CRITICAL(&gLogFileBufferMux);
-  return size;
-}
-
-static void clearLogFileBuffer() {
-  portENTER_CRITICAL(&gLogFileBufferMux);
-  gLogFileBufferHead = 0;
-  gLogFileBufferTail = 0;
-  gLogFileBufferSize = 0;
-  gLogFileDroppedBytes = 0;
-  portEXIT_CRITICAL(&gLogFileBufferMux);
-}
-
-static void serviceLogFileFlush() {
-  // Logging is serial-only in this firmware variant.
-  clearLogFileBuffer();
-}
 
 class AppLogger {
  public:
@@ -550,49 +358,16 @@ struct CameraSettings {
   int16_t viewRotate90 = 0;
 };
 
-struct MotionSettings {
-  bool enabled = false;
-  bool captureImage = false;
-  uint8_t imageCount = 1;            // 1..10
-  uint8_t imageDelayDs = 1;          // deciseconds: 1..20 (0.1s..2.0s)
-  bool captureVideo = false;
-  bool flashOnCapture = false;
-  uint8_t videoDurationSec = 5;      // 1..30
-  uint16_t detectionIntervalSec = 0; // 0,5,10,30,60,600
-  String notifyUrl;
-  bool notifyEnabled = false;
-  bool standbyAfterInactivity = false;
-};
-
-struct IntervalometerSettings {
-  uint32_t intervalValue = 60;  // 1..100000
-  uint8_t intervalUnit = 0;     // 0=seconds,1=minutes,2=hours,3=days
-  uint8_t burstCount = 1;       // 1..10
-  uint8_t burstDelaySec = 1;    // 1..100
-  bool continueAfterPowerLoss = false;
-};
-
 struct StoredConfig {
   std::vector<WifiCredential> wifiList;
   String adminPass;
   String deviceName;
-  bool wifiEnabled = true;
   bool hasCameraSettings = false;
   CameraSettings cameraSettings;
-  MotionSettings motionSettings;
-  IntervalometerSettings intervalometerSettings;
   bool ledAccessBlink = false;  // LED blink on URL access
-  bool logFileEnabled = true;
   int8_t txPowerSta = (int8_t)DEFAULT_TX_POWER_STA;  // wifi_power_t cast to int8
   int8_t txPowerAp  = (int8_t)DEFAULT_TX_POWER_AP;
 };
-
-RTC_DATA_ATTR static bool intervalometerRtcActive = false;
-RTC_DATA_ATTR static uint32_t intervalometerRtcTimelapseId = 0;
-RTC_DATA_ATTR static uint32_t intervalometerRtcImageIndex = 0;
-RTC_DATA_ATTR static uint64_t intervalometerRtcIntervalUs = 60000000ULL;
-RTC_DATA_ATTR static uint8_t intervalometerRtcBurstCount = 1;
-RTC_DATA_ATTR static uint8_t intervalometerRtcBurstDelaySec = 1;
 
 struct FrameSizeOption {
   framesize_t value;
@@ -631,32 +406,19 @@ static bool publishStreamPreviewFrame(const OwnedJpegFrame &frame);
 static void resetStreamPreviewFrame();
 static bool ensureCameraReady(TickType_t timeoutTicks = pdMS_TO_TICKS(5000));
 static void serviceCameraIdleTimeout();
-static bool isRecordingFrameDue(unsigned long now);
 static bool isDeviceBusy();
 static bool loadRuntimeConfigWithRetries(StoredConfig &cfg);
 static bool initCameraWithRetries();
 static bool applyWifiClientConfig(const WifiCredential &wifi);
 static void servicePendingFirmwareRestart();
 static void servicePendingAdminRestart();
-static void serviceLogFileFlush();
-static void applyPirInputMode();
-static void restoreInputPinsAfterSDInit();
-static void logSharedPinCaveats();
-static void applyMotionToggleButtonInputMode();
-static void serviceMotionToggleButton();
-static void noteAuthenticatedWebActivity();
-static void closeMotionActionWindow();
-static void clampMotionSettings(MotionSettings &settings);
-static bool isValidIntervalometerUnitValue(uint8_t unit);
-static void clampIntervalometerSettings(IntervalometerSettings &settings);
+static bool requestFactoryResetAndReboot(const char *origin);
+static void initializeSerialFactoryResetChallenge();
+static void serviceSerialConsole();
 static bool isValidRuntimeTxPowerValue(int value);
 static wifi_power_t validatedTxPowerValue(int configuredValue, wifi_power_t fallback, const char *label);
 static void setWifiModemSleep(bool enabled, const char *reason = nullptr);
-static bool applyWifiEnabledRuntimeState(bool enabled, bool showLedFeedback);
-static bool persistWifiEnabledAndApply(bool enabled, const char *reason);
 static void setFlashOutput(bool enabled);
-static void startMotionCaptureFlashIfNeeded();
-static void stopMotionCaptureFlashIfOwned();
 static void registerCameraRoutes();
 static void startAuxHttpServers();
 
@@ -843,69 +605,6 @@ static void powerDownCameraHardware() {
   }
 
   setFlashOutput(false);
-  motionCaptureFlashOwned = false;
-}
-
-static bool initSDCard() {
-  if (gSdCardMounted) {
-    return true;
-  }
-
-  // 1-bit mode stops SDMMC from actively using DAT1/DAT2/DAT3, but the socket
-  // and the card still keep GPIO12/GPIO13 electrically tied to DAT2/DAT3.
-  // Retry several times: SD cards can be slow to respond on cold boot.
-  bool sawCardPresence = false;
-  for (int attempt = 1; attempt <= 5; ++attempt) {
-    SD_MMC.end();
-    bool mounted = SD_MMC.begin("/sdcard", true);
-    restoreInputPinsAfterSDInit();
-
-    sdcard_type_t cardType = SD_MMC.cardType();
-    if (cardType != CARD_NONE) {
-      sawCardPresence = true;
-    }
-
-    if (mounted) {
-      if (cardType == CARD_NONE) {
-        SD_MMC.end();
-        gSdCardMounted = false;
-        restoreInputPinsAfterSDInit();
-        Logger.Log("[SD] No card detected on attempt %d\n", attempt);
-      } else {
-        // Extra sanity check: card responded and mount succeeded, ensure root FS is readable.
-        File root = SD_MMC.open("/");
-        if (!root || !root.isDirectory()) {
-          if (root) {
-            root.close();
-          }
-          SD_MMC.end();
-          gSdCardMounted = false;
-          restoreInputPinsAfterSDInit();
-          Logger.Log("[SD] Card detected but filesystem invalid/unreadable on attempt %d\n", attempt);
-        } else {
-          root.close();
-          gSdCardMounted = true;
-          Logger.Log("[SD] Mounted in 1-bit mode (attempt %d)\n", attempt);
-          return true;
-        }
-      }
-    } else {
-      if (cardType == CARD_NONE) {
-        Logger.Log("[SD] No card/electrical response on attempt %d\n", attempt);
-      } else {
-        Logger.Log("[SD] Card detected but mount failed on attempt %d\n", attempt);
-      }
-    }
-    delay(500);
-  }
-
-  if (sawCardPresence) {
-    Logger.LogLine("[SD] Card was detected, but filesystem mount failed (possible corrupted or unsupported filesystem)");
-  } else {
-    Logger.LogLine("[SD] No SD card detected (or SD bus did not respond)");
-  }
-  Logger.LogLine("[SD] Failed to mount after 5 attempts");
-  return false;
 }
 
 static camera_fb_t *lockAndCaptureFrame(TickType_t timeoutTicks) {
@@ -1095,7 +794,7 @@ static bool ensureCameraReady(TickType_t timeoutTicks) {
 }
 
 static void serviceCameraIdleTimeout() {
-  if (!cameraInitialized || streamClientConnected || recordingActive || cameraIdleTimeoutMs == 0UL) {
+  if (!cameraInitialized || streamClientConnected || cameraIdleTimeoutMs == 0UL) {
     return;
   }
 
@@ -1109,7 +808,7 @@ static void serviceCameraIdleTimeout() {
     return;
   }
 
-  if (cameraInitialized && !streamClientConnected && !recordingActive) {
+  if (cameraInitialized && !streamClientConnected) {
     esp_err_t err = esp_camera_deinit();
     if (err != ESP_OK) {
       Logger.Log("[CAM] Deinit failed: 0x%x\n", err);
@@ -1119,105 +818,6 @@ static void serviceCameraIdleTimeout() {
       Logger.Log("[CAM] Camera powered down after %lu ms idle\n", cameraIdleTimeoutMs);
     }
   }
-}
-
-static bool isRecordingFrameDue(unsigned long now) {
-  if (!recordingMutex) {
-    return false;
-  }
-
-  bool due = false;
-  SemaphoreLock recordingLock(recordingMutex, pdMS_TO_TICKS(RECORDING_SHORT_LOCK_TIMEOUT_MS));
-  if (recordingLock.locked()) {
-    due = recordingActive
-       && (recordingLastFrameAt == 0
-        || (now - recordingLastFrameAt) >= RECORDING_FRAME_INTERVAL_MS);
-  }
-
-  return due;
-}
-
-static bool saveCaptureSequence(uint32_t value) {
-  File file = SD_MMC.open(CAPTURE_COUNTER_FILE_PATH, FILE_WRITE);
-  if (!file) {
-    Logger.LogLine("[SEQ] Failed to open capture counter file for write");
-    return false;
-  }
-
-  if (file.print(value) == 0) {
-    file.close();
-    Logger.LogLine("[SEQ] Failed to write capture counter value");
-    return false;
-  }
-
-  file.close();
-  return true;
-}
-
-static bool loadCaptureSequence() {
-  if (captureSequenceLoaded) {
-    return true;
-  }
-
-  if (!initSDCard()) {
-    return false;
-  }
-
-  captureSequence = 0;
-
-  if (SD_MMC.exists(CAPTURE_COUNTER_FILE_PATH)) {
-    File file = SD_MMC.open(CAPTURE_COUNTER_FILE_PATH, FILE_READ);
-    if (!file) {
-      Logger.LogLine("[SEQ] Failed to open capture counter file for read");
-      return false;
-    }
-
-    String raw = file.readString();
-    file.close();
-    raw.trim();
-
-    if (!raw.isEmpty()) {
-      uint64_t parsed = 0;
-      bool valid = true;
-      for (size_t i = 0; i < raw.length(); ++i) {
-        char c = raw[i];
-        if (c < '0' || c > '9') {
-          valid = false;
-          break;
-        }
-        parsed = (parsed * 10ULL) + (uint64_t)(c - '0');
-        if (parsed > 0xFFFFFFFFULL) {
-          valid = false;
-          break;
-        }
-      }
-
-      if (valid) {
-        captureSequence = (uint32_t)parsed;
-      } else {
-        Logger.LogLine("[SEQ] Invalid capture counter content, resetting to 0");
-      }
-    }
-  }
-
-  captureSequenceLoaded = true;
-  Logger.Log("[SEQ] Current capture sequence: %lu\n", (unsigned long)captureSequence);
-  return true;
-}
-
-static bool nextCaptureSequence(uint32_t &nextValue) {
-  if (!loadCaptureSequence()) {
-    return false;
-  }
-
-  uint32_t candidate = captureSequence + 1;
-  if (!saveCaptureSequence(candidate)) {
-    return false;
-  }
-
-  captureSequence = candidate;
-  nextValue = candidate;
-  return true;
 }
 
 static bool isClockSane() {
@@ -1272,17 +872,6 @@ static String buildTimestampFilenameToken() {
     }
   }
   return String(stamp);
-}
-
-static String buildCapturePath(uint32_t sequence, const char *extension) {
-  char path[80];
-  String stamp = buildTimestampFilenameToken();
-  snprintf(path, sizeof(path), "%s/%lu-%s.%s",
-           CAPTURE_DIRECTORY,
-           (unsigned long)sequence,
-           stamp.c_str(),
-           extension);
-  return String(path);
 }
 
 static void serviceNtpSync() {
@@ -1501,10 +1090,6 @@ static bool connectToSavedStaNetworks(bool showLedFeedback, bool initializeCamer
 }
 
 static void serviceStaReconnect() {
-  if (!runtimeConfig.wifiEnabled) {
-    return;
-  }
-
   if (!staConnectedAtBoot) {
     return;
   }
@@ -1595,297 +1180,6 @@ static String bytesToHex(const uint8_t *data, size_t len) {
     out += hex[data[i] & 0x0F];
   }
   return out;
-}
-
-static void releaseRecordingWriteBuffer() {
-  if (recordingWriteBuffer) {
-    heap_caps_free(recordingWriteBuffer);
-    recordingWriteBuffer = nullptr;
-  }
-  recordingWriteBufferCapacity = 0;
-  recordingWriteBufferLen = 0;
-  recordingLastFileSyncAt = 0;
-}
-
-static void initRecordingWriteBuffer() {
-  releaseRecordingWriteBuffer();
-
-  if (RECORDING_WRITE_BUFFER_BYTES == 0U) {
-    return;
-  }
-
-  if (psramFound()) {
-    recordingWriteBuffer = (uint8_t *)heap_caps_malloc(RECORDING_WRITE_BUFFER_BYTES,
-                                                       MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  }
-
-  if (recordingWriteBuffer) {
-    recordingWriteBufferCapacity = RECORDING_WRITE_BUFFER_BYTES;
-    Logger.Log("[REC] SD write buffer allocated: %u bytes\n", (unsigned int)recordingWriteBufferCapacity);
-  } else {
-    Logger.LogLine("[REC] SD write buffer unavailable; using direct writes");
-  }
-}
-
-static bool flushRecordingWriteBuffer() {
-  if (!recordingFile || recordingWriteBufferLen == 0U) {
-    return true;
-  }
-
-  size_t len = recordingWriteBufferLen;
-  size_t written = recordingFile.write(recordingWriteBuffer, len);
-  if (written != len) {
-    recordingWriteBufferLen = 0;
-    return false;
-  }
-
-  recordingWriteBufferLen = 0;
-  return true;
-}
-
-static bool writeRecordingBytes(const uint8_t *data, size_t len) {
-  if (len == 0U) {
-    return true;
-  }
-  if (!data || !recordingFile) {
-    return false;
-  }
-
-  if (!recordingWriteBuffer || recordingWriteBufferCapacity == 0U) {
-    size_t written = recordingFile.write(data, len);
-    return written == len;
-  }
-
-  while (len > 0U) {
-    if (recordingWriteBufferLen == 0U && len >= recordingWriteBufferCapacity) {
-      size_t written = recordingFile.write(data, len);
-      return written == len;
-    }
-
-    size_t space = recordingWriteBufferCapacity - recordingWriteBufferLen;
-    if (space == 0U) {
-      if (!flushRecordingWriteBuffer()) {
-        return false;
-      }
-      continue;
-    }
-
-    size_t chunkLen = len < space ? len : space;
-    memcpy(recordingWriteBuffer + recordingWriteBufferLen, data, chunkLen);
-    recordingWriteBufferLen += chunkLen;
-    data += chunkLen;
-    len -= chunkLen;
-
-    if (recordingWriteBufferLen == recordingWriteBufferCapacity && !flushRecordingWriteBuffer()) {
-      return false;
-    }
-  }
-
-  return true;
-}
-
-static bool syncRecordingFileIfDue(unsigned long now) {
-  if (!recordingFile) {
-    return false;
-  }
-
-  if (recordingLastFileSyncAt == 0UL) {
-    recordingLastFileSyncAt = now;
-    return true;
-  }
-
-  if ((now - recordingLastFileSyncAt) < RECORDING_FILE_SYNC_INTERVAL_MS) {
-    return true;
-  }
-
-  if (!flushRecordingWriteBuffer()) {
-    return false;
-  }
-  recordingFile.flush();
-  recordingLastFileSyncAt = now;
-  return true;
-}
-
-static bool writeRecordingFourCC(const char *fourcc) {
-  return writeRecordingBytes((const uint8_t *)fourcc, 4);
-}
-
-static bool writeRecordingU32LE(uint32_t value) {
-  uint8_t bytes[4] = {
-    (uint8_t)(value & 0xFF),
-    (uint8_t)((value >> 8) & 0xFF),
-    (uint8_t)((value >> 16) & 0xFF),
-    (uint8_t)((value >> 24) & 0xFF)
-  };
-  return writeRecordingBytes(bytes, sizeof(bytes));
-}
-
-static bool writeRecordingAviChunkHeader(const char *chunkId, uint32_t chunkSize) {
-  return writeRecordingFourCC(chunkId) && writeRecordingU32LE(chunkSize);
-}
-
-static bool writeRecordingMjpegFramePayload(const uint8_t *data, size_t len) {
-  if (!data || len == 0U) {
-    return false;
-  }
-
-  bool patchApp0 = len >= 10U
-    && data[0] == 0xFF && data[1] == 0xD8
-    && data[2] == 0xFF && data[3] == 0xE0
-    && data[6] == 'J' && data[7] == 'F' && data[8] == 'I' && data[9] == 'F';
-  if (!patchApp0) {
-    return writeRecordingBytes(data, len);
-  }
-
-  static const uint8_t avi1[4] = {'A', 'V', 'I', '1'};
-  return writeRecordingBytes(data, 6)
-      && writeRecordingBytes(avi1, sizeof(avi1))
-      && writeRecordingBytes(data + 10, len - 10U);
-}
-
-static bool writeFourCC(File &file, const char *fourcc) {
-  return file.write((const uint8_t *)fourcc, 4) == 4;
-}
-
-static bool writeU16LE(File &file, uint16_t value) {
-  uint8_t bytes[2] = {
-    (uint8_t)(value & 0xFF),
-    (uint8_t)((value >> 8) & 0xFF)
-  };
-  return file.write(bytes, sizeof(bytes)) == sizeof(bytes);
-}
-
-static bool writeU32LE(File &file, uint32_t value) {
-  uint8_t bytes[4] = {
-    (uint8_t)(value & 0xFF),
-    (uint8_t)((value >> 8) & 0xFF),
-    (uint8_t)((value >> 16) & 0xFF),
-    (uint8_t)((value >> 24) & 0xFF)
-  };
-  return file.write(bytes, sizeof(bytes)) == sizeof(bytes);
-}
-
-static bool writeAviChunkHeader(File &file, const char *chunkId, uint32_t chunkSize) {
-  return writeFourCC(file, chunkId) && writeU32LE(file, chunkSize);
-}
-
-static bool writeMjpegFramePayload(File &file, const uint8_t *data, size_t len) {
-  if (!data || len == 0U) {
-    return false;
-  }
-
-  // Some players are more reliable when MJPEG-in-AVI frames advertise AVI1
-  // in the APP0 marker instead of the camera's default JFIF signature.
-  bool patchApp0 = len >= 10U
-    && data[0] == 0xFF && data[1] == 0xD8
-    && data[2] == 0xFF && data[3] == 0xE0
-    && data[6] == 'J' && data[7] == 'F' && data[8] == 'I' && data[9] == 'F';
-  if (!patchApp0) {
-    return file.write(data, len) == len;
-  }
-
-  static const uint8_t avi1[4] = {'A', 'V', 'I', '1'};
-  if (file.write(data, 6) != 6) {
-    return false;
-  }
-  if (file.write(avi1, sizeof(avi1)) != sizeof(avi1)) {
-    return false;
-  }
-  return file.write(data + 10, len - 10U) == (len - 10U);
-}
-
-static uint32_t gcdU32(uint32_t a, uint32_t b) {
-  while (b != 0U) {
-    uint32_t rem = a % b;
-    a = b;
-    b = rem;
-  }
-  return a == 0U ? 1U : a;
-}
-
-static void resetRecordingState() {
-  recordingActive = false;
-  recordingStartTime = 0;
-  recordingDurationMs = 0;
-  recordingLastFrameAt = 0;
-  recordingFrameCount = 0;
-  recordingMaxFrameSize = 0;
-  recordingWidth = 0;
-  recordingHeight = 0;
-  recordingMoviListSize = AVI_MOVI_LIST_HEADER_SIZE;
-  recordingIndexEnabled = true;
-  recordingPath = "";
-  std::vector<AviIndexEntry>().swap(recordingIndex);
-  releaseRecordingWriteBuffer();
-}
-
-static void disableRecordingIndex(const char *reason) {
-  if (!recordingIndexEnabled) {
-    return;
-  }
-
-  recordingIndexEnabled = false;
-  std::vector<AviIndexEntry>().swap(recordingIndex);
-  if (reason && reason[0] != '\0') {
-    Logger.Log("[REC] AVI seek index disabled for this recording (%s)\n", reason);
-  } else {
-    Logger.LogLine("[REC] AVI seek index disabled for this recording");
-  }
-}
-
-static bool canStoreRecordingIndexEntry() {
-  if (!recordingIndexEnabled) {
-    return false;
-  }
-
-  size_t nextIndexBytes = (recordingIndex.size() + 1U) * sizeof(AviIndexEntry);
-  if (nextIndexBytes > AVI_INDEX_MEMORY_BUDGET_BYTES) {
-    disableRecordingIndex("index memory budget reached");
-    return false;
-  }
-
-  if (ESP.getFreeHeap() < AVI_INDEX_LOW_HEAP_GUARD_BYTES) {
-    disableRecordingIndex("low heap");
-    return false;
-  }
-
-  return true;
-}
-
-static bool ensureCaptureDirectory() {
-  if (SD_MMC.exists(CAPTURE_DIRECTORY)) {
-    return true;
-  }
-  return SD_MMC.mkdir(CAPTURE_DIRECTORY);
-}
-
-static bool beginRecordingFile(const String &path) {
-  if (recordingFile) {
-    recordingFile.close();
-  }
-
-  resetRecordingState();
-  resetStreamPreviewFrame();
-
-  recordingFile = SD_MMC.open(path, FILE_WRITE);
-  if (!recordingFile) {
-    return false;
-  }
-
-  uint8_t aviHeader[AVI_HEADER_SIZE] = {0};
-  if (recordingFile.write(aviHeader, sizeof(aviHeader)) != sizeof(aviHeader)) {
-    recordingFile.close();
-    SD_MMC.remove(path);
-    return false;
-  }
-
-  initRecordingWriteBuffer();
-  recordingPath = path;
-  recordingActive = true;
-  recordingStartTime = millis();
-  recordingMoviListSize = AVI_MOVI_LIST_HEADER_SIZE;
-  recordingIndex.clear();
-  return true;
 }
 
 static bool hexToBytes(const String &hex, std::vector<uint8_t> &out) {
@@ -1994,29 +1288,6 @@ static bool isValidIntervalometerUnitValue(uint8_t unit) {
   return unit <= 3;
 }
 
-static void clampMotionSettings(MotionSettings &settings) {
-  settings.enabled = false;
-  settings.captureImage = false;
-  settings.captureVideo = false;
-  settings.flashOnCapture = false;
-  settings.notifyEnabled = false;
-  settings.standbyAfterInactivity = false;
-  settings.notifyUrl = "";
-  settings.detectionIntervalSec = 0;
-  if (settings.imageCount < 1) settings.imageCount = 1;
-  if (settings.imageDelayDs < 1) settings.imageDelayDs = 1;
-  if (settings.videoDurationSec < 1) settings.videoDurationSec = 1;
-}
-
-static void clampIntervalometerSettings(IntervalometerSettings &settings) {
-  if (settings.intervalValue < 1U) settings.intervalValue = 1U;
-  if (settings.intervalValue > 100000U) settings.intervalValue = 100000U;
-  if (!isValidIntervalometerUnitValue(settings.intervalUnit)) settings.intervalUnit = 0;
-  if (settings.burstCount < 1U) settings.burstCount = 1U;
-  if (settings.burstCount > 10U) settings.burstCount = 10U;
-  if (settings.burstDelaySec < 1U) settings.burstDelaySec = 1U;
-  if (settings.burstDelaySec > 100U) settings.burstDelaySec = 100U;
-}
 
 static void appendI16(std::vector<uint8_t> &buf, int16_t value) {
   uint16_t raw = (uint16_t)value;
@@ -2384,9 +1655,6 @@ static void sendHtmlWithToken(const char *html) {
 
 enum class AppPage {
   Camera,
-  Motion,
-  Intervalometer,
-  Sd,
   Admin
 };
 
@@ -2470,9 +1738,6 @@ static String buildAppFooter() {
 static const char *buildAppPageLabel(AppPage activePage) {
   switch (activePage) {
     case AppPage::Camera: return "Camera";
-    case AppPage::Motion: return "Motion";
-    case AppPage::Intervalometer: return "Timelapse";
-    case AppPage::Sd: return "SD Browser";
     case AppPage::Admin: return "Admin";
   }
 
@@ -2577,7 +1842,7 @@ static bool decryptPayload(const String &ivHex, const String &cipherHex, std::ve
 
 static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipherHex) {
   std::vector<uint8_t> plain;
-  plain.reserve(cfg.adminPass.length() + cfg.deviceName.length() + cfg.wifiList.size() * 96 + cfg.motionSettings.notifyUrl.length() + 160);
+  plain.reserve(cfg.adminPass.length() + cfg.deviceName.length() + cfg.wifiList.size() * 96 + 160);
 
   uint16_t wifiCount = (uint16_t)cfg.wifiList.size();
   plain.push_back((uint8_t)(wifiCount & 0xFF));
@@ -2600,27 +1865,8 @@ static bool encryptConfig(const StoredConfig &cfg, String &ivHex, String &cipher
     appendCameraSettings(plain, cfg.cameraSettings);
   }
   appendU8(plain, cfg.ledAccessBlink ? 1 : 0);
-  appendU8(plain, cfg.logFileEnabled ? 1 : 0);
   appendU8(plain, (uint8_t)cfg.txPowerSta);
   appendU8(plain, (uint8_t)cfg.txPowerAp);
-
-  appendU8(plain, cfg.motionSettings.enabled ? 1 : 0);
-  appendU8(plain, cfg.motionSettings.captureImage ? 1 : 0);
-  appendU8(plain, cfg.motionSettings.imageCount);
-  appendU8(plain, cfg.motionSettings.imageDelayDs);
-  appendU8(plain, cfg.motionSettings.captureVideo ? 1 : 0);
-  appendU8(plain, cfg.motionSettings.flashOnCapture ? 1 : 0);
-  appendU8(plain, cfg.motionSettings.videoDurationSec);
-  appendU16(plain, cfg.motionSettings.detectionIntervalSec);
-  appendField(plain, cfg.motionSettings.notifyUrl);
-  appendU8(plain, cfg.motionSettings.standbyAfterInactivity ? 1 : 0);
-  appendU8(plain, cfg.motionSettings.notifyEnabled ? 1 : 0);
-  appendU8(plain, cfg.wifiEnabled ? 1 : 0);
-  appendU32(plain, cfg.intervalometerSettings.intervalValue);
-  appendU8(plain, cfg.intervalometerSettings.intervalUnit);
-  appendU8(plain, cfg.intervalometerSettings.burstCount);
-  appendU8(plain, cfg.intervalometerSettings.burstDelaySec);
-  appendU8(plain, cfg.intervalometerSettings.continueAfterPowerLoss ? 1 : 0);
 
   return encryptPayload(plain, ivHex, cipherHex);
 }
@@ -2675,10 +1921,6 @@ static bool decryptConfig(const String &ivHex, const String &cipherHex, StoredCo
   if (!readU8(plain, offset, ledAccessBlink)) return false;
   cfg.ledAccessBlink = (ledAccessBlink != 0);
 
-  uint8_t logFileEnabled = 1;
-  if (!readU8(plain, offset, logFileEnabled)) return false;
-  cfg.logFileEnabled = (logFileEnabled != 0);
-
   uint8_t txPowerSta = (uint8_t)DEFAULT_TX_POWER_STA;
   if (!readU8(plain, offset, txPowerSta)) return false;
   cfg.txPowerSta = (int8_t)txPowerSta;
@@ -2687,52 +1929,16 @@ static bool decryptConfig(const String &ivHex, const String &cipherHex, StoredCo
   if (!readU8(plain, offset, txPowerAp)) return false;
   cfg.txPowerAp = (int8_t)txPowerAp;
 
-  uint8_t motionEnabled = 0;
-  uint8_t motionCaptureImage = 0;
-  uint8_t motionCaptureVideo = 0;
-  if (!readU8(plain, offset, motionEnabled)) return false;
-  if (!readU8(plain, offset, motionCaptureImage)) return false;
-  if (!readU8(plain, offset, cfg.motionSettings.imageCount)) return false;
-  if (!readU8(plain, offset, cfg.motionSettings.imageDelayDs)) return false;
-  if (!readU8(plain, offset, motionCaptureVideo)) return false;
-  uint8_t motionFlashOnCapture = 0;
-  if (!readU8(plain, offset, motionFlashOnCapture)) return false;
-  if (!readU8(plain, offset, cfg.motionSettings.videoDurationSec)) return false;
-  if (!readU16(plain, offset, cfg.motionSettings.detectionIntervalSec)) return false;
-  if (!readField(plain, offset, cfg.motionSettings.notifyUrl)) return false;
-
-  uint8_t standbyAfterInactivity = 0;
+  // Consume legacy trailing bytes from older config formats.
+  uint8_t legacy = 0;
   if (offset < plain.size()) {
-    if (!readU8(plain, offset, standbyAfterInactivity)) return false;
+    if (!readU8(plain, offset, legacy)) return false;
   }
-  cfg.motionSettings.standbyAfterInactivity = (standbyAfterInactivity != 0);
 
-  uint8_t notifyEnabled = 0;
-  if (!readU8(plain, offset, notifyEnabled)) return false;
-  cfg.motionSettings.notifyEnabled = (notifyEnabled != 0);
-
-  uint8_t wifiEnabled = 1;
   if (offset < plain.size()) {
-    if (!readU8(plain, offset, wifiEnabled)) return false;
+    if (!readU8(plain, offset, legacy)) return false;
   }
-  cfg.wifiEnabled = (wifiEnabled != 0);
 
-  cfg.intervalometerSettings = IntervalometerSettings();
-  if (!readU32(plain, offset, cfg.intervalometerSettings.intervalValue)) return false;
-  if (!readU8(plain, offset, cfg.intervalometerSettings.intervalUnit)) return false;
-  if (!readU8(plain, offset, cfg.intervalometerSettings.burstCount)) return false;
-  if (!readU8(plain, offset, cfg.intervalometerSettings.burstDelaySec)) return false;
-  uint8_t continueAfterPowerLoss = 0;
-  if (!readU8(plain, offset, continueAfterPowerLoss)) return false;
-  cfg.intervalometerSettings.continueAfterPowerLoss = (continueAfterPowerLoss != 0);
-
-  cfg.motionSettings.enabled = (motionEnabled != 0);
-  cfg.motionSettings.captureImage = (motionCaptureImage != 0);
-  cfg.motionSettings.captureVideo = (motionCaptureVideo != 0);
-  cfg.motionSettings.flashOnCapture = (motionFlashOnCapture != 0);
-
-  clampMotionSettings(cfg.motionSettings);
-  clampIntervalometerSettings(cfg.intervalometerSettings);
   return offset == plain.size() && !cfg.adminPass.isEmpty();
 }
 
@@ -2795,15 +2001,12 @@ static bool loadConfigFromSD(StoredConfig &cfg) {
     return false;
   }
 
-  clampMotionSettings(cfg.motionSettings);
   return !cfg.adminPass.isEmpty();
 }
 
 static bool persistRuntimeConfig(const StoredConfig &cfg) {
   StoredConfig updated = cfg;
   syncCameraSettingsFromSensor(updated);
-  clampMotionSettings(updated.motionSettings);
-  clampIntervalometerSettings(updated.intervalometerSettings);
 
   if (!saveConfigToSD(updated)) {
     return false;
@@ -2870,7 +2073,6 @@ static void applySensorDefaults() {
 
 static void resetFlashOutput() {
   setFlashOutput(false);
-  motionCaptureFlashOwned = false;
 }
 
 static void setFlashOutput(bool enabled) {
@@ -2879,25 +2081,6 @@ static void setFlashOutput(bool enabled) {
   flashEnabled = enabled;
 }
 
-static void startMotionCaptureFlashIfNeeded() {
-  if (!runtimeConfig.motionSettings.flashOnCapture || motionCaptureFlashOwned) {
-    return;
-  }
-
-  if (!flashEnabled) {
-    setFlashOutput(true);
-    motionCaptureFlashOwned = true;
-  }
-}
-
-static void stopMotionCaptureFlashIfOwned() {
-  if (!motionCaptureFlashOwned) {
-    return;
-  }
-
-  setFlashOutput(false);
-  motionCaptureFlashOwned = false;
-}
 
 static bool initCamera(uint32_t xclkFreqHz) {
   powerUpCameraHardware();
@@ -3056,10 +2239,6 @@ static bool hasSharedAccessToken(WebServer &srv) {
   return srv.arg("t") == routeAccessToken;
 }
 
-static void noteAuthenticatedWebActivity() {
-  motionLastActivityAt = millis();
-}
-
 static bool checkAuth(WebServer &srv, bool allowSharedToken) {
   // LED feedback for URL access blink (if enabled)
   if (ledAccessBlinkEnabled) {
@@ -3075,7 +2254,6 @@ static bool checkAuth(WebServer &srv, bool allowSharedToken) {
   }
 
   if (allowSharedToken && hasSharedAccessToken(srv)) {
-    noteAuthenticatedWebActivity();
     return true;
   }
 
@@ -3084,7 +2262,6 @@ static bool checkAuth(WebServer &srv, bool allowSharedToken) {
     return false;
   }
 
-  noteAuthenticatedWebActivity();
   return true;
 }
 
@@ -3199,18 +2376,8 @@ static void handleStreamRequest(bool allowSharedToken) {
             }
         }
 
-        bool ok = true;
-        if (recordingActive) {
-            if (!copyLatestStreamPreviewFrame(frame, lastPreviewSequence)) {
-                delay(5);
-                continue;
-            }
-            now = millis();
-            ok = writeMjpegStreamFrame(client, frame.data, frame.len);
-        } else {
-            now = millis();
-            ok = streamCameraFramebufferDirect(client);
-        }
+        now = millis();
+        bool ok = streamCameraFramebufferDirect(client);
 
         lastFrameAt = now;
 
@@ -3221,11 +2388,8 @@ static void handleStreamRequest(bool allowSharedToken) {
     streamClientAbortRequested = false;
     streamClientConnected = false;
     lastCameraActivityAt = millis();
-    noteAuthenticatedWebActivity();
     client.stop();
-    if (!recordingActive) {
-      setWifiModemSleep(true, "idle");
-    }
+    setWifiModemSleep(true, "idle");
     Logger.LogLine("[STREAM] Client disconnected");
 }
 
@@ -3307,86 +2471,25 @@ static void handleOtaRecoveryRoot() {
     ".status{margin-top:12px;min-height:1.2em;color:#93c5fd;font-size:.92rem}"
     "</style></head><body><div class=\"card\">"
     "<h1>OTA Recovery Mode</h1>"
-    "<p>microSD was not detected during boot. This access point exposes only firmware update so you can recover the device.</p>"
+    "<p>This access point exposes only firmware update so you can recover the device.</p>"
     "<p><strong>Firmware:</strong> " + String(FIRMWARE_VERSION_TEXT) + "</p>"
     "<form id=\"fw\" method=\"POST\" enctype=\"multipart/form-data\">"
     "<label for=\"firmware\">Firmware Binary (.bin)</label>"
     "<input id=\"firmware\" type=\"file\" name=\"firmware\" accept=\".bin,application/octet-stream\" required>"
     "<button type=\"submit\">Upload Firmware</button>"
     "</form>"
-    "<button class=\"danger\" id=\"format_sd\" type=\"button\">Format SD Card (Erase All Data)</button>"
     "<div class=\"status\" id=\"status\"></div>"
     "<script>"
     "(function(){"
     "var form=document.getElementById('fw');"
-    "var formatBtn=document.getElementById('format_sd');"
     "var status=document.getElementById('status');"
     "var token='" + routeAccessToken + "';"
     "form.action='http://'+window.location.hostname+':" + String(HTTP_TRANSFER_PORT) + "/admin/update?t='+encodeURIComponent(token);"
     "form.addEventListener('submit',function(){status.textContent='Uploading firmware... do not power off.';});"
-    "formatBtn.addEventListener('click',function(){"
-    "if(!confirm('Format SD card now? This will erase all files and folders on the card.')) return;"
-    "formatBtn.disabled=true;"
-    "status.textContent='Formatting SD card...';"
-    "fetch('/ota/format-sd',{method:'POST'})"
-    ".then(function(r){return r.text().then(function(t){if(!r.ok) throw new Error(t||('HTTP '+r.status)); return t;});})"
-    ".then(function(t){status.textContent=t||'SD format complete.';})"
-    ".catch(function(e){status.textContent='Format failed: '+(e&&e.message?e.message:'unknown error');})"
-    ".finally(function(){formatBtn.disabled=false;});"
-    "});"
     "})();"
     "</script></div></body></html>";
 
   server.send(HTTP_OK, "text/html", page);
-}
-
-static void handleOtaFormatSd() {
-  if (!otaRecoveryModeActive) {
-    server.send(HTTP_FORBIDDEN, "text/plain", "SD format is only available in OTA recovery mode");
-    return;
-  }
-
-  ScopedSdLock sdLock(pdMS_TO_TICKS(SD_LONG_LOCK_TIMEOUT_MS));
-  if (!sdLock.locked()) {
-    server.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", ERR_SD_CARD_BUSY);
-    return;
-  }
-
-  SD_MMC.end();
-  gSdCardMounted = false;
-  gLogSdReady = false;
-  restoreInputPinsAfterSDInit();
-
-  // formatOnFail=true lets the SD stack create a fresh FAT filesystem when mount fails.
-  bool mounted = SD_MMC.begin("/sdcard", true, true);
-  restoreInputPinsAfterSDInit();
-
-  if (!mounted || SD_MMC.cardType() == CARD_NONE) {
-    SD_MMC.end();
-    gSdCardMounted = false;
-    gLogSdReady = false;
-    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Unable to format SD card (no card or SD bus error)");
-    return;
-  }
-
-  File root = SD_MMC.open("/");
-  if (!root || !root.isDirectory()) {
-    if (root) {
-      root.close();
-    }
-    SD_MMC.end();
-    gSdCardMounted = false;
-    gLogSdReady = false;
-    server.send(HTTP_INTERNAL_ERROR, "text/plain", "SD card responded, but filesystem is still unreadable");
-    return;
-  }
-  root.close();
-
-  gSdCardMounted = true;
-  gLogSdReady = true;
-  sdCardAvailableAtBoot = true;
-  Logger.LogLine("[SD] Format completed from OTA recovery page");
-  server.send(HTTP_OK, "text/plain", "SD format complete. Reboot recommended.");
 }
 
 static void handleSave() {
@@ -3433,7 +2536,7 @@ static void handleSave() {
     }
 
     if (!persistRuntimeConfig(cfg)) {
-      server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to save configuration to SD card");
+      server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to save configuration");
       return;
     }
 
@@ -3809,7 +2912,6 @@ static void handleControl() {
 
     // Handle non-sensor controls separately.
     if (varName == "flash") {
-        motionCaptureFlashOwned = false;
         setFlashOutput(val != 0);
         Logger.LogLine(val ? "[FLASH] Enabled" : "[FLASH] Disabled");
         server.send(HTTP_OK, "text/plain", "OK");
@@ -3847,10 +2949,7 @@ static void handleControl() {
     int statusCode = 200;
     const char *message = "OK";
     if (varName == "framesize") {
-        if (recordingActive) {
-            statusCode = 409;
-            message = "Stop recording before changing resolution";
-        } else if (!isValidFrameSizeValue(s, val)) {
+      if (!isValidFrameSizeValue(s, val)) {
             statusCode = 400;
             message = "Unsupported resolution";
         } else {
@@ -3952,9 +3051,7 @@ static void handleStatus() {
         "\"dcw\":%u,"
         "\"colorbar\":%u,"
         "\"stream_visible\":%u,"
-        "\"view_rotate_90\":%u,"
-        "\"recording_active\":%u,"
-        "\"recording_motion\":%u"
+        "\"view_rotate_90\":%u"
         "}",
         s->status.framesize,   s->status.quality,
         s->status.brightness,  s->status.contrast,
@@ -3970,9 +3067,7 @@ static void handleStatus() {
         s->status.vflip,       s->status.dcw,
         s->status.colorbar,
         runtimeConfig.cameraSettings.streamVisible ? 1U : 0U,
-        runtimeConfig.cameraSettings.viewRotate90 ? 1U : 0U,
-        recordingActive ? 1U : 0U,
-        motionVideoManagedRecording ? 1U : 0U
+        runtimeConfig.cameraSettings.viewRotate90 ? 1U : 0U
     );
 
     server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -4189,107 +3284,6 @@ static void startSTAMode() {
   startCameraAPMode();
 }
 
-static bool applyWifiEnabledRuntimeState(bool enabled, bool showLedFeedback) {
-  if (!enabled) {
-    setWifiModemSleep(false, "wifi-disabled");
-    WiFi.setSleep(false);
-    WiFi.disconnect(true, false);
-    WiFi.softAPdisconnect(true);
-    WiFi.mode(WIFI_OFF);
-    staLinkUp = false;
-    staConnectedAtBoot = false;
-    lastStaReconnectAttemptAt = 0;
-    Logger.LogLine("[WIFI] Disabled by RX double-click");
-    return true;
-  }
-
-  if (otaRecoveryModeActive) {
-    bool ok = startSoftAPWithRetries(AP_OTA_RECOVERY_SSID, nullptr);
-    if (!ok) {
-      Logger.LogLine("[WIFI] Failed to enable OTA recovery AP");
-      return false;
-    }
-    WiFi.setSleep(false);
-    wifiModemSleepEnabled = false;
-    Logger.Log("[WIFI] OTA recovery AP re-enabled — SSID: %s  IP: %s\n",
-      AP_OTA_RECOVERY_SSID,
-      WiFi.softAPIP().toString().c_str());
-    return true;
-  }
-
-  if (!isConfigured) {
-    bool ok = startSoftAPWithRetries(AP_SETUP_SSID, AP_SETUP_PASS);
-    if (!ok) {
-      Logger.LogLine("[WIFI] Failed to enable setup AP");
-      return false;
-    }
-    wifiModemSleepEnabled = false;
-    if (showLedFeedback) {
-      ledSetupAPSequence();
-    }
-    Logger.Log("[WIFI] Setup AP re-enabled — SSID: %s  IP: %s\n",
-      AP_SETUP_SSID,
-      WiFi.softAPIP().toString().c_str());
-    return true;
-  }
-
-  if (connectToSavedStaNetworks(showLedFeedback, false)) {
-    staConnectedAtBoot = true;
-    lastStaReconnectAttemptAt = millis();
-    Logger.LogLine("[WIFI] Enabled by RX double-click (STA)");
-    return true;
-  }
-
-  staConnectedAtBoot = false;
-  String apHostname = buildNetworkHostname(cfgDeviceName);
-  String apSsid = buildFallbackApSsid();
-  bool apStarted = startSoftAPWithRetries(apSsid.c_str(), cfgAccessPass.c_str(), apHostname.c_str());
-  if (!apStarted) {
-    Logger.LogLine("[WIFI] Failed to enable fallback AP");
-    return false;
-  }
-
-  wifi_power_t apTxPower = validatedTxPowerValue((int)runtimeConfig.txPowerAp, DEFAULT_TX_POWER_AP, "AP");
-  WiFi.setTxPower(apTxPower);
-  if (AP_FALLBACK_MODEM_SLEEP_ENABLED) {
-    WiFi.setSleep(true);
-    wifiModemSleepEnabled = true;
-  } else {
-    WiFi.setSleep(false);
-    wifiModemSleepEnabled = false;
-  }
-
-  if (showLedFeedback) {
-    ledFallbackAPSequence();
-  }
-
-  Logger.Log("[WIFI] Fallback AP re-enabled — SSID: %s  IP: %s\n",
-    apSsid.c_str(), WiFi.softAPIP().toString().c_str());
-  return true;
-}
-
-static bool persistWifiEnabledAndApply(bool enabled, const char *reason) {
-  if (runtimeConfig.wifiEnabled != enabled) {
-    StoredConfig updated = runtimeConfig;
-    updated.wifiEnabled = enabled;
-    if (!persistRuntimeConfig(updated)) {
-      Logger.LogLine("[WIFI] Failed to persist WiFi enabled state");
-      return false;
-    }
-  }
-
-  if (!applyWifiEnabledRuntimeState(enabled, true)) {
-    Logger.Log("[WIFI] Runtime apply failed after %s; state will apply on reboot\n",
-      reason ? reason : "toggle");
-    return false;
-  }
-
-  Logger.Log("[WIFI] WiFi %s (%s)\n",
-    enabled ? "enabled" : "disabled",
-    reason ? reason : "toggle");
-  return true;
-}
-
 static void servicePendingFirmwareRestart() {
   if (!firmwareUploadSuccess || firmwareRestartAt == 0) {
     return;
@@ -4322,6 +3316,129 @@ static void servicePendingAdminRestart() {
   ESP.restart();
 }
 
+static bool requestFactoryResetAndReboot(const char *origin) {
+  Preferences prefs;
+  if (!prefs.begin(CONFIG_NVS_NAMESPACE, false)) {
+    Logger.LogLine("[CFG] Failed to open NVS for factory reset");
+    return false;
+  }
+
+  prefs.clear();
+  prefs.end();
+
+  adminRestartPending = true;
+  adminRestartAt = millis() + FIRMWARE_RESTART_DELAY_MS;
+  Logger.Log("[CFG] Factory reset requested via %s. Rebooting shortly.\n",
+             origin ? origin : "unknown");
+  return true;
+}
+
+static void processSerialConsoleCommand(const String &rawCommand) {
+  String command = rawCommand;
+  command.trim();
+  if (command.isEmpty()) {
+    return;
+  }
+
+  String upper = command;
+  upper.toUpperCase();
+
+  if (upper == "HELP") {
+    Logger.LogLine("[SERIAL] Commands:");
+    Logger.LogLine("[SERIAL]   REBOOT");
+    Logger.LogLine("[SERIAL]   FACTORY_RESET <boot_code>");
+    Logger.LogLine("[SERIAL]   RESET <boot_code>");
+    return;
+  }
+
+  if (upper == "REBOOT") {
+    adminRestartPending = true;
+    adminRestartAt = millis() + FIRMWARE_RESTART_DELAY_MS;
+    Logger.LogLine("[SERIAL] Reboot command accepted. Rebooting...");
+    return;
+  }
+
+  String providedCode;
+  const String prefixFull = "FACTORY_RESET ";
+  const String prefixShort = "RESET ";
+  if (upper.startsWith(prefixFull)) {
+    providedCode = upper.substring(prefixFull.length());
+  } else if (upper.startsWith(prefixShort)) {
+    providedCode = upper.substring(prefixShort.length());
+  } else {
+    Logger.LogLine("[SERIAL] Unknown command. Use HELP.");
+    return;
+  }
+
+  providedCode.trim();
+  if (providedCode.isEmpty()) {
+    Logger.LogLine("[SERIAL] Missing reset code. Use: FACTORY_RESET <boot_code>");
+    return;
+  }
+
+  if (!serialFactoryResetArmed) {
+    Logger.LogLine("[SERIAL] Factory reset code is no longer valid. Reboot for a new code.");
+    return;
+  }
+
+  if (providedCode != serialFactoryResetCode) {
+    Logger.LogLine("[SERIAL] Invalid factory reset code.");
+    return;
+  }
+
+  serialFactoryResetArmed = false;
+  if (!requestFactoryResetAndReboot("serial")) {
+    serialFactoryResetArmed = true;
+    Logger.LogLine("[SERIAL] Factory reset failed.");
+    return;
+  }
+
+  Logger.LogLine("[SERIAL] Factory reset accepted. Rebooting...");
+}
+
+static void serviceSerialConsole() {
+  while (Serial.available() > 0) {
+    char c = (char)Serial.read();
+    serialLastInputAt = millis();
+    if (c == '\r' || c == '\n') {
+      if (!serialCommandBuffer.isEmpty()) {
+        processSerialConsoleCommand(serialCommandBuffer);
+        serialCommandBuffer = "";
+      }
+      continue;
+    }
+
+    if (c < 32 || c > 126) {
+      continue;
+    }
+
+    if (serialCommandBuffer.length() < SERIAL_COMMAND_MAX_LEN) {
+      serialCommandBuffer += c;
+    }
+  }
+
+  if (!serialCommandBuffer.isEmpty()) {
+    unsigned long now = millis();
+    if ((now - serialLastInputAt) >= SERIAL_COMMAND_IDLE_FLUSH_MS) {
+      processSerialConsoleCommand(serialCommandBuffer);
+      serialCommandBuffer = "";
+    }
+  }
+}
+
+static void initializeSerialFactoryResetChallenge() {
+  char codeBuffer[9];
+  snprintf(codeBuffer, sizeof(codeBuffer), "%08lX", (unsigned long)esp_random());
+  serialFactoryResetCode = String(codeBuffer);
+  serialCommandBuffer = "";
+  serialLastInputAt = millis();
+  serialFactoryResetArmed = true;
+
+  Logger.Log("[SERIAL] Factory reset code for this boot: %s\n", serialFactoryResetCode.c_str());
+  Logger.LogLine("[SERIAL] To factory reset send: FACTORY_RESET <boot_code>");
+  Logger.LogLine("[SERIAL] Serial console ready. Type HELP for commands.");
+}
+
 [[noreturn]] static void haltBoot(const char *message) {
   Logger.LogLine(message);
   for (;;) {
@@ -4331,22 +3448,13 @@ static void servicePendingAdminRestart() {
 
 static bool initializeRuntimeMutexes() {
   cameraMutex = xSemaphoreCreateMutex();
-  recordingMutex = xSemaphoreCreateMutex();
-  sdMutex = xSemaphoreCreateMutex();
   streamPreviewMutex = xSemaphoreCreateMutex();
-  return cameraMutex && recordingMutex && sdMutex && streamPreviewMutex;
+  return cameraMutex && streamPreviewMutex;
 }
 
 static void initializeWakeupIndicator() {
   initLED();
-  esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
-  wokeFromPirDeepSleep = (wakeCause == ESP_SLEEP_WAKEUP_EXT1);
-  if (wokeFromPirDeepSleep) {
-    ledQuickBlink();
-    Logger.Log("[BOOT] Wake cause: EXT1 (GPIO%d PIR)\n", PIR_GPIO);
-  } else {
-    ledBootSequence();
-  }
+  ledBootSequence(); // Always run boot sequence
 }
 
 static void initializeBootPins() {
@@ -4355,35 +3463,12 @@ static void initializeBootPins() {
   powerDownCameraHardware();
 }
 
-static void logInputPinConfiguration() {
-  Logger.Log("[GPIO] PIR DATA: GPIO%d\n", PIR_GPIO);
-  Logger.LogLine("[GPIO] PIR power: VCC -> 3.3V (or compatible rail), GND -> GND");
-  Logger.LogLine("[GPIO] PIR DATA is now on GPIO13");
-  Logger.Log("[GPIO] Motion toggle button: GPIO%d (RX), active HIGH\n", MOTION_TOGGLE_BUTTON_GPIO);
-}
-
-static void resetMotionRuntimeState() {
-  motionLastActivityAt = millis();
-  motionLastDetectedAt = 0;
-  motionPendingImages = 0;
-  motionRecordingStopAt = 0;
-  motionVideoManagedRecording = false;
-  motionActionWindowActive = false;
-  motionNotifyPending = false;
-  motionNotifyLastAttemptAt = 0;
-  motionToggleButtonConsumeUntilRelease = false;
-  motionIgnoreUntilAt = 0;
-  motionEnableActivationAt = 0;
-  deferredNetworkStartupPending = false;
-}
 
 static void applyLoadedStartupConfig(const StoredConfig &cfg) {
   runtimeConfig = cfg;
-  runtimeConfig.logFileEnabled = false;
   cfgAccessPass = cfg.adminPass;
   cfgDeviceName = cfg.deviceName;
   ledAccessBlinkEnabled = cfg.ledAccessBlink;
-  gLogFileEnabled = false;
   if (cfgDeviceName.isEmpty()) {
     cfgDeviceName = "ESP32-CAM";
   }
@@ -4392,10 +3477,8 @@ static void applyLoadedStartupConfig(const StoredConfig &cfg) {
 
 static void applyDefaultStartupConfig() {
   runtimeConfig = StoredConfig();
-  runtimeConfig.logFileEnabled = false;
   cfgDeviceName = "ESP32-CAM";
   ledAccessBlinkEnabled = false;
-  gLogFileEnabled = false;
   isConfigured = false;
 }
 
@@ -4408,45 +3491,6 @@ static void loadStartupConfig() {
   }
 }
 
-static void finalizeMotionStartupConfig() {
-  clampMotionSettings(runtimeConfig.motionSettings);
-  motionRawHigh = false;
-  motionLatched = false;
-  motionEdgePending = false;
-  motionEdgeCount = 0;
-  motionPendingImages = 0;
-  motionVideoManagedRecording = false;
-  motionActionWindowActive = false;
-  motionNotifyPending = false;
-  motionNotifyLastAttemptAt = 0;
-  motionIgnoreUntilAt = 0;
-  motionEnableActivationAt = 0;
-  motionToggleButtonConsumeUntilRelease = false;
-  motionToggleButtonClickCount = 0;
-  motionToggleButtonClickDeadlineAt = 0;
-  gLogFileEnabled = false;
-}
-
-static void applyMotionToggleButtonInputMode() {
-  // Button is wired between RX pin and 3.3V; keep a pulldown so idle state is LOW.
-  pinMode(MOTION_TOGGLE_BUTTON_GPIO, INPUT_PULLDOWN);
-  bool initialHigh = (digitalRead(MOTION_TOGGLE_BUTTON_GPIO) == HIGH);
-  motionToggleButtonStableHigh = initialHigh;
-  motionToggleButtonLastReadingHigh = initialHigh;
-  motionToggleButtonLongPressHandled = false;
-  motionToggleButtonPressedAt = initialHigh ? millis() : 0;
-  motionToggleButtonLastChangeAt = millis();
-  motionToggleButtonClickCount = 0;
-  motionToggleButtonClickDeadlineAt = 0;
-  if (motionToggleButtonConsumeUntilRelease && !initialHigh) {
-    motionToggleButtonConsumeUntilRelease = false;
-  }
-}
-
-static void serviceMotionToggleButton() {
-  // Motion/button behavior is disabled in this simplified firmware variant.
-  return;
-}
 
 static void initializeRouteAccessToken() {
   routeAccessToken = String((uint32_t)esp_random(), HEX) + String((uint32_t)esp_random(), HEX);
@@ -4456,12 +3500,6 @@ static void initializeRouteAccessToken() {
 static void startInitialNetworkServices() {
   Logger.Log("[CFG] Configured: %s\n", isConfigured ? "yes" : "no");
   Logger.Log("[CAM] Lazy init enabled with idle timeout %lu ms\n", cameraIdleTimeoutMs);
-
-  if (!runtimeConfig.wifiEnabled) {
-    Logger.LogLine("[WIFI] Startup skipped: WiFi is disabled in persisted config");
-    applyWifiEnabledRuntimeState(false, false);
-    return;
-  }
 
   if (deferredNetworkStartupPending) {
     Logger.LogLine("[BOOT] Network startup deferred");
@@ -4479,6 +3517,7 @@ static void startInitialNetworkServices() {
 void setup() {
   Logger.begin(115200);
   Logger.LogLine("[BOOT] *** ESP32-CAM starting ***");
+  initializeSerialFactoryResetChallenge();
   WiFi.onEvent(onWifiEvent);
 
   initializeWakeupIndicator();
@@ -4487,24 +3526,19 @@ void setup() {
   }
 
   initializeBootPins();
-  logInputPinConfiguration();
-  resetMotionRuntimeState();
-  sdCardAvailableAtBoot = false;
 
   loadStartupConfig();
-  finalizeMotionStartupConfig();
   initializeRouteAccessToken();
   startInitialNetworkServices();
-  serviceLogFileFlush();
 }
 
 void loop() {
+  serviceSerialConsole();
   server.handleClient();
   serviceNtpSync();
   serviceStaReconnect();
   serviceCameraIdleTimeout();
   servicePendingFirmwareRestart();
   servicePendingAdminRestart();
-  serviceLogFileFlush();
   delay(2);
 }

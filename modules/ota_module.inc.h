@@ -17,7 +17,6 @@ static void handleFirmwareUploadDataWorker() {
       firmwareUploadFailed = true;
       return;
     }
-    noteAuthenticatedWebActivity();
   }
 
   HTTPUpload &upload = transferServer.upload();

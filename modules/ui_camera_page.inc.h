@@ -241,7 +241,6 @@ function applyStatus(s){
     setViewRotation(!!s.view_rotate_90);
   }
   setStreamVisibility(s.stream_visible!==undefined?!!s.stream_visible:true);
-  if(s.recording_active!==undefined){setStatus(s.recording_active?(s.recording_motion?'Motion recording...':'Recording...'):'');}
 }
 function loadStatus(){
   return fetch('/status').then(function(r){return r.json();}).then(function(s){
