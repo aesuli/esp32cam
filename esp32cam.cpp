@@ -9,11 +9,11 @@
  * First Boot (unconfigured or missing config file):
  *   Broadcasts protected WiFi AP "ESP32-CAM-Setup"
  *   with password "ESP32-CAM".
- *   Visit http://192.168.4.1 to enter WiFi credentials and an
+ *   Visit https://192.168.4.1 to enter WiFi credentials and an
  *   access password. Credentials are encrypted and stored on SD.
  *
  * Normal Operation:
- *   Port 80 — web UI with live MJPEG stream (/stream) and camera controls.
+ *   Port 443 — self-signed HTTPS web UI with live MJPEG stream and camera controls.
  *   Protected by HTTP Basic Auth (username: admin).
  *
  * WiFi Failure Fallback:
@@ -39,6 +39,12 @@
 #include <esp_wifi.h>
 #include <driver/gpio.h>
 #include <mbedtls/aes.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/net_sockets.h>
+#include <mbedtls/pk.h>
+#include <mbedtls/ssl.h>
+#include <mbedtls/x509_crt.h>
 #include <time.h>
 #include <sys/time.h>
 #include <vector>
@@ -131,8 +137,62 @@ static constexpr const char *ERR_UNAUTHORIZED = "Unauthorized";
 static constexpr uint16_t HTTP_MAIN_PORT = 80;
 static constexpr uint16_t HTTP_STREAM_PORT = 81;
 static constexpr uint16_t HTTP_TRANSFER_PORT = 82;
+static constexpr uint16_t HTTPS_MAIN_PORT = 443;
+static constexpr uint16_t HTTPS_STREAM_PORT = 444;
+static constexpr uint16_t HTTPS_TRANSFER_PORT = 445;
 static constexpr uint32_t HTTP_STREAM_TASK_STACK = 8192;
 static constexpr uint32_t HTTP_TRANSFER_TASK_STACK = 8192;
+static constexpr uint32_t HTTPS_PROXY_TASK_STACK = 16384;
+static constexpr int HTTPS_PROXY_BUFFER_BYTES = 1024;
+static constexpr uint32_t HTTPS_PROXY_READ_TIMEOUT_MS = 20;
+
+static const char TLS_SERVER_CERT[] PROGMEM = R"pem(-----BEGIN CERTIFICATE-----
+MIICwTCCAamgAwIBAgIJAPOF7QzWSNgaMA0GCSqGSIb3DQEBCwUAMCAxHjAcBgNV
+BAMTFUVTUDMyLUNBTSBTZWxmIFNpZ25lZDAeFw0yNjA3MTIxMDQ3MDNaFw00NjA3
+MTMxMDQ3MDNaMCAxHjAcBgNVBAMTFUVTUDMyLUNBTSBTZWxmIFNpZ25lZDCCASIw
+DQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAK8eNqEzWv5mifxCCpY+wUpXoAcy
+iuU8lE+Wleto0aX5jfhpcB2Y83MiqhsLSJTnEbxbtrps+L7IXz8bLDCrG5mkRkHC
+kYDnPN7coGvhmtP+dHo4Y3gRxrvm3h3fJEDPykvHPxf6V6ZWhl89T8fo1CnveKzL
+oBTg10oEX7GPYTTxSXBWSe5yBoYiUltc+sPw856zJHYw9aVcqVxK7hOBgxN3QT9v
+eurmFD6QhoJ0eLzAdBdtjqGlOl1CAa79iD+1X+bi08JVCh2mqX+Iz0UOr6YvzV4v
+xTvaztcAK1prCyw55IhzI58CXLkkZLf1uYl/qOLB33eVu5YR/2PtRxPyPckCAwEA
+ATANBgkqhkiG9w0BAQsFAAOCAQEAIw32Njo62emDqmG2O5z0fGnsrvZ7PyxKC7vi
+PVN9Vwu0gZjSiNfDGPujYcstIPJyEGEeWTYZYXayMwlCphVi8hjK33BsIvctyt2+
+DiWHdWlGoKHyt4sqbN08YIbcnLFTUMrRK+eX7UmfQvPgJXgK8Tn1r3pdDa7K+4OW
+SaOFXeC9kXJJJvlQTAwOou7RBIftnL9u/7Ic8tka5kuCw6XfCHMIOvLxo0yh7q5q
+LIBAPWuvG+2uYpORdBfO5ViSdmGEIb88HkflPAPTe1IWQ+Sc2OGAtXDcsPUDLr/A
+ZYTlxli1NX3OUvSJLr5J2UjDTTvGwPm34MGw0qx/sXkGdvbtrg==
+-----END CERTIFICATE-----
+)pem";
+
+static const char TLS_SERVER_KEY[] PROGMEM = R"pem(-----BEGIN RSA PRIVATE KEY-----
+MIIEowIBAAKCAQEArx42oTNa/maJ/EIKlj7BSlegBzKK5TyUT5aV62jRpfmN+Glw
+HZjzcyKqGwtIlOcRvFu2umz4vshfPxssMKsbmaRGQcKRgOc83tyga+Ga0/50ejhj
+eBHGu+beHd8kQM/KS8c/F/pXplaGXz1Px+jUKe94rMugFODXSgRfsY9hNPFJcFZJ
+7nIGhiJSW1z6w/DznrMkdjD1pVypXEruE4GDE3dBP2966uYUPpCGgnR4vMB0F22O
+oaU6XUIBrv2IP7Vf5uLTwlUKHaapf4jPRQ6vpi/NXi/FO9rO1wArWmsLLDnkiHMj
+nwJcuSRkt/W5iX+o4sHfd5W7lhH/Y+1HE/I9yQIDAQABAoIBACOjGWj6w4TMJz6P
+zgm/YaSYanesgHmgN2pu8bmDjk6hl5O7GVbcnoaKwmVYiX/L+l8Dpw8PSBvDOSbl
+h7urxqUgui99whCifk+4RGlP8ys7OEb7HLr9mxz4IbGgjIcoAjojpSJjDt1J9HSD
+TK4ZIrwaAMvhcIVvMEDe3P6MeDLGpUKuuW6GbN39PTBb/w3msvgfKMhLlISRC4EL
+YG4yE3LTzQSdypXmsfeQb46Dw8JFGFCiqX+nMQFocCNz9ixuK0u62IKS/4W3PPHd
+4zHdyF5sw9TRFn1kcR+IjrYW5ygqQoxMDWy6J+9/E26t/CxT3QctYgPLaaCc3Uzl
+9BFb43UCgYEAw7h2zoWV4L271vunmQJuynYpUpxMBGwA43WzClavH483ArsFOGE6
+a0+srRu7puHaetAfwY9RrQr6bDQbXPCa8CjVd6ywtbmBIs4jbz7b8U4jd9nVhdOO
+ViWiopw53IvGZYFEtmmzYoKG6vyoEml9ieHT6Ijm/QvQD7V524LpEj8CgYEA5Q1Y
+7MTTGW7CSW/ZBL2AYM6qjG8vE20dqFbTv7K3N0FkFW66jCy0gt10GGFNiQKsL7hN
+vave815Ej1IS1cAnUkfKcTqju5ZnKM8/O+eLcBVEZZw2jw5pQO7Bl28Fc6s7B+UZ
+ZP9Do8lDOSpRTXrMciKbv/l2OhiTtRqM+BDfnfcCgYBVz8TXW56RAN8grQmYfoaQ
+4inP/JMfxTLGh85OFB+IGMSnv9PUGl0Au9gbtfMagh/GhQXHWc0Xr56IXng40Y09
+Cso9REveAU1rMzI6DjdknzvRyoJhwJXBk5Kw9Qoxdl8wFfNIfyOVZ2E8Gjaei/3s
+vESqyYttGwbIPGsHIWiLBQKBgDvvky5ZjpegGOzYfKQ15iruyUf4LAxcSB9toPkP
+jcvCq6rED8JwTEfWJPPgOka40U+nXYhdOfja2Pvb0RvnrSJlsL6SRpfmklXmbTiC
+rUUF+6DPEKO8dKROFZBHt9h9nPPC6jM4bH2mQ5Xo0d+BW5AeKD1CzMIE/lmseejL
+mYgfAoGBALIKuYgLYOOMwruR6uTgxMAKQ+mTCY4y8x61lu9ZUwnt1uUi8FdphiTx
+WEV6iSGNr4Bu1b6MmMuFXKU/Wzsuhio/Xhf+PD6QI5L3q+8xHAkU08mKa75ISCsD
+J/2ihhjiucYwmEZcuJ1KnV7R5Vrpj2XkGPOdgpfU3/X8i3I4HPK3
+-----END RSA PRIVATE KEY-----
+)pem";
 
 static WebServer server(HTTP_MAIN_PORT);
 static WebServer streamServer(HTTP_STREAM_PORT);
@@ -229,6 +289,9 @@ static SemaphoreHandle_t sdMutex = nullptr;
 static SemaphoreHandle_t streamPreviewMutex = nullptr;
 static TaskHandle_t streamServerTaskHandle = nullptr;
 static TaskHandle_t transferServerTaskHandle = nullptr;
+static TaskHandle_t httpsMainTaskHandle = nullptr;
+static TaskHandle_t httpsStreamTaskHandle = nullptr;
+static TaskHandle_t httpsTransferTaskHandle = nullptr;
 static constexpr unsigned long SD_SHORT_LOCK_TIMEOUT_MS = 100;
 static constexpr unsigned long SD_LONG_LOCK_TIMEOUT_MS = 1500;
 static constexpr unsigned long RECORDING_SHORT_LOCK_TIMEOUT_MS = 100;
@@ -653,6 +716,7 @@ static void startMotionCaptureFlashIfNeeded();
 static void stopMotionCaptureFlashIfOwned();
 static void registerCameraRoutes();
 static void startAuxHttpServers();
+static void startHttpsProxyServers(bool includeAux);
 
 static void onWifiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   switch (event) {
@@ -1465,7 +1529,10 @@ static bool connectToSavedStaNetworks(bool showLedFeedback, bool initializeCamer
         registerCameraRoutes();
         server.begin();
         startAuxHttpServers();
-        Logger.LogLine("[HTTP] Camera server ready on port 80");
+        startHttpsProxyServers(true);
+        Logger.Log("[HTTP] Camera server ready on port %u; HTTPS on port %u\n",
+          (unsigned int)HTTP_MAIN_PORT,
+          (unsigned int)HTTPS_MAIN_PORT);
       }
 
       setWifiModemSleep(true, "idle");
@@ -3003,6 +3070,7 @@ static void handleFirmwareUploadDataWorker();
 static void streamServerTask(void *arg);
 static void transferServerTask(void *arg);
 static void startAuxHttpServers();
+static void startHttpsProxyServers(bool includeAux);
 static void registerAdminRoutes();
 static void registerOtaRoutes();
 static void registerOtaTransferRoutes();
@@ -3080,7 +3148,7 @@ static bool checkAuth(WebServer &srv, bool allowSharedToken) {
 }
 
 static String buildLocalUrl(uint16_t port, const String &path, bool withToken) {
-  String url = "http://";
+  String url = "https://";
 
   if (WiFi.getMode() == WIFI_AP || WiFi.getMode() == WIFI_AP_STA) {
     url += WiFi.softAPIP().toString();
@@ -3091,7 +3159,15 @@ static String buildLocalUrl(uint16_t port, const String &path, bool withToken) {
   }
 
   url += ":";
-  url += String(port);
+  uint16_t exposedPort = port;
+  if (port == HTTP_MAIN_PORT) {
+    exposedPort = HTTPS_MAIN_PORT;
+  } else if (port == HTTP_STREAM_PORT) {
+    exposedPort = HTTPS_STREAM_PORT;
+  } else if (port == HTTP_TRANSFER_PORT) {
+    exposedPort = HTTPS_TRANSFER_PORT;
+  }
+  url += String(exposedPort);
   url += path;
 
   if (withToken && !routeAccessToken.isEmpty()) {
@@ -3309,7 +3385,7 @@ static void handleOtaRecoveryRoot() {
     "var formatBtn=document.getElementById('format_sd');"
     "var status=document.getElementById('status');"
     "var token='" + routeAccessToken + "';"
-    "form.action='http://'+window.location.hostname+':" + String(HTTP_TRANSFER_PORT) + "/admin/update?t='+encodeURIComponent(token);"
+    "form.action='https://'+window.location.hostname+':" + String(HTTPS_TRANSFER_PORT) + "/admin/update?t='+encodeURIComponent(token);"
     "form.addEventListener('submit',function(){status.textContent='Uploading firmware... do not power off.';});"
     "formatBtn.addEventListener('click',function(){"
     "if(!confirm('Format SD card now? This will erase all files and folders on the card.')) return;"
@@ -3974,6 +4050,282 @@ static void handleNotFound() {
 
 #include "modules/ota_module.inc.h"
 
+struct HttpsProxyConfig {
+  uint16_t listenPort;
+  uint16_t upstreamPort;
+  const char *name;
+  TaskHandle_t *taskHandle;
+};
+
+static HttpsProxyConfig httpsMainProxy = {
+  HTTPS_MAIN_PORT,
+  HTTP_MAIN_PORT,
+  "main",
+  &httpsMainTaskHandle
+};
+
+static HttpsProxyConfig httpsStreamProxy = {
+  HTTPS_STREAM_PORT,
+  HTTP_STREAM_PORT,
+  "stream",
+  &httpsStreamTaskHandle
+};
+
+static HttpsProxyConfig httpsTransferProxy = {
+  HTTPS_TRANSFER_PORT,
+  HTTP_TRANSFER_PORT,
+  "transfer",
+  &httpsTransferTaskHandle
+};
+
+static bool tlsWriteAll(mbedtls_ssl_context &ssl, const uint8_t *data, size_t len) {
+  size_t offset = 0;
+  while (offset < len) {
+    int ret = mbedtls_ssl_write(&ssl, data + offset, len - offset);
+    if (ret > 0) {
+      offset += (size_t)ret;
+      continue;
+    }
+    if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+      delay(1);
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+static bool connectHttpsProxyUpstream(WiFiClient &upstream, uint16_t upstreamPort) {
+  IPAddress loopback(127, 0, 0, 1);
+  if (upstream.connect(loopback, upstreamPort)) {
+    upstream.setNoDelay(true);
+    upstream.setTimeout(1000);
+    return true;
+  }
+
+  IPAddress local = WiFi.localIP();
+  if (local != INADDR_NONE && upstream.connect(local, upstreamPort)) {
+    upstream.setNoDelay(true);
+    upstream.setTimeout(1000);
+    return true;
+  }
+
+  IPAddress ap = WiFi.softAPIP();
+  if (ap != INADDR_NONE && upstream.connect(ap, upstreamPort)) {
+    upstream.setNoDelay(true);
+    upstream.setTimeout(1000);
+    return true;
+  }
+
+  return false;
+}
+
+static void handleHttpsProxyClient(HttpsProxyConfig *cfg,
+                                   mbedtls_ssl_config &sslConf,
+                                   mbedtls_net_context &clientFd) {
+  mbedtls_ssl_context ssl;
+  mbedtls_ssl_init(&ssl);
+
+  if (mbedtls_ssl_setup(&ssl, &sslConf) != 0) {
+    mbedtls_ssl_free(&ssl);
+    return;
+  }
+
+  mbedtls_ssl_set_bio(&ssl, &clientFd, mbedtls_net_send, nullptr, mbedtls_net_recv_timeout);
+
+  int ret = 0;
+  while ((ret = mbedtls_ssl_handshake(&ssl)) != 0) {
+    if (ret != MBEDTLS_ERR_SSL_WANT_READ &&
+        ret != MBEDTLS_ERR_SSL_WANT_WRITE &&
+        ret != MBEDTLS_ERR_SSL_TIMEOUT) {
+      mbedtls_ssl_free(&ssl);
+      return;
+    }
+    delay(1);
+  }
+
+  WiFiClient upstream;
+  if (!connectHttpsProxyUpstream(upstream, cfg->upstreamPort)) {
+    static const char unavailable[] =
+      "HTTP/1.1 503 Service Unavailable\r\n"
+      "Connection: close\r\n"
+      "Content-Type: text/plain\r\n"
+      "Content-Length: 29\r\n"
+      "\r\n"
+      "Local HTTP server unavailable";
+    tlsWriteAll(ssl, (const uint8_t *)unavailable, strlen(unavailable));
+    mbedtls_ssl_close_notify(&ssl);
+    mbedtls_ssl_free(&ssl);
+    return;
+  }
+
+  uint8_t buffer[HTTPS_PROXY_BUFFER_BYTES];
+  bool tlsOpen = true;
+  unsigned long idleSince = millis();
+
+  while (tlsOpen || upstream.available()) {
+    bool movedData = false;
+
+    if (tlsOpen) {
+      ret = mbedtls_ssl_read(&ssl, buffer, sizeof(buffer));
+      if (ret > 0) {
+        upstream.write(buffer, (size_t)ret);
+        movedData = true;
+      } else if (ret == 0 ||
+                 ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY ||
+                 ret == MBEDTLS_ERR_NET_CONN_RESET) {
+        tlsOpen = false;
+      } else if (ret != MBEDTLS_ERR_SSL_TIMEOUT &&
+                 ret != MBEDTLS_ERR_SSL_WANT_READ &&
+                 ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+        break;
+      }
+    }
+
+    int available = upstream.available();
+    if (available > 0) {
+      int chunk = available > HTTPS_PROXY_BUFFER_BYTES ? HTTPS_PROXY_BUFFER_BYTES : available;
+      int readLen = upstream.read(buffer, chunk);
+      if (readLen > 0) {
+        if (!tlsWriteAll(ssl, buffer, (size_t)readLen)) {
+          break;
+        }
+        movedData = true;
+      }
+    }
+
+    if (!upstream.connected() && upstream.available() <= 0) {
+      break;
+    }
+
+    if (movedData) {
+      idleSince = millis();
+    } else {
+      delay(1);
+      if (!tlsOpen && (millis() - idleSince) > 1000) {
+        break;
+      }
+    }
+  }
+
+  upstream.stop();
+  mbedtls_ssl_close_notify(&ssl);
+  mbedtls_ssl_free(&ssl);
+}
+
+static void httpsProxyTask(void *arg) {
+  HttpsProxyConfig *cfg = static_cast<HttpsProxyConfig *>(arg);
+
+  mbedtls_net_context listenFd;
+  mbedtls_x509_crt cert;
+  mbedtls_pk_context key;
+  mbedtls_ssl_config sslConf;
+  mbedtls_ctr_drbg_context ctrDrbg;
+  mbedtls_entropy_context entropy;
+
+  mbedtls_net_init(&listenFd);
+  mbedtls_x509_crt_init(&cert);
+  mbedtls_pk_init(&key);
+  mbedtls_ssl_config_init(&sslConf);
+  mbedtls_ctr_drbg_init(&ctrDrbg);
+  mbedtls_entropy_init(&entropy);
+
+  const char *personalization = "esp32cam-https";
+  int ret = mbedtls_ctr_drbg_seed(&ctrDrbg, mbedtls_entropy_func, &entropy,
+                                  (const unsigned char *)personalization,
+                                  strlen(personalization));
+  if (ret != 0) {
+    Logger.Log("[HTTPS] %s RNG seed failed: -0x%04x\n", cfg->name, (unsigned int)-ret);
+    vTaskDelete(nullptr);
+  }
+
+  ret = mbedtls_x509_crt_parse(&cert, (const unsigned char *)TLS_SERVER_CERT,
+                               strlen(TLS_SERVER_CERT) + 1);
+  if (ret != 0) {
+    Logger.Log("[HTTPS] %s certificate parse failed: -0x%04x\n", cfg->name, (unsigned int)-ret);
+    vTaskDelete(nullptr);
+  }
+
+  ret = mbedtls_pk_parse_key(&key, (const unsigned char *)TLS_SERVER_KEY,
+                             strlen(TLS_SERVER_KEY) + 1, nullptr, 0);
+  if (ret != 0) {
+    Logger.Log("[HTTPS] %s private key parse failed: -0x%04x\n", cfg->name, (unsigned int)-ret);
+    vTaskDelete(nullptr);
+  }
+
+  ret = mbedtls_ssl_config_defaults(&sslConf,
+                                    MBEDTLS_SSL_IS_SERVER,
+                                    MBEDTLS_SSL_TRANSPORT_STREAM,
+                                    MBEDTLS_SSL_PRESET_DEFAULT);
+  if (ret != 0) {
+    Logger.Log("[HTTPS] %s TLS config failed: -0x%04x\n", cfg->name, (unsigned int)-ret);
+    vTaskDelete(nullptr);
+  }
+
+  mbedtls_ssl_conf_rng(&sslConf, mbedtls_ctr_drbg_random, &ctrDrbg);
+  mbedtls_ssl_conf_read_timeout(&sslConf, HTTPS_PROXY_READ_TIMEOUT_MS);
+  mbedtls_ssl_conf_authmode(&sslConf, MBEDTLS_SSL_VERIFY_NONE);
+
+  ret = mbedtls_ssl_conf_own_cert(&sslConf, &cert, &key);
+  if (ret != 0) {
+    Logger.Log("[HTTPS] %s own cert failed: -0x%04x\n", cfg->name, (unsigned int)-ret);
+    vTaskDelete(nullptr);
+  }
+
+  String portText = String(cfg->listenPort);
+  ret = mbedtls_net_bind(&listenFd, nullptr, portText.c_str(), MBEDTLS_NET_PROTO_TCP);
+  if (ret != 0) {
+    Logger.Log("[HTTPS] %s bind on port %u failed: -0x%04x\n",
+               cfg->name, (unsigned int)cfg->listenPort, (unsigned int)-ret);
+    vTaskDelete(nullptr);
+  }
+
+  Logger.Log("[HTTPS] %s proxy ready on port %u -> HTTP %u\n",
+             cfg->name, (unsigned int)cfg->listenPort, (unsigned int)cfg->upstreamPort);
+
+  for (;;) {
+    mbedtls_net_context clientFd;
+    mbedtls_net_init(&clientFd);
+    ret = mbedtls_net_accept(&listenFd, &clientFd, nullptr, 0, nullptr);
+    if (ret == 0) {
+      handleHttpsProxyClient(cfg, sslConf, clientFd);
+    } else {
+      Logger.Log("[HTTPS] %s accept failed: -0x%04x\n", cfg->name, (unsigned int)-ret);
+      delay(100);
+    }
+    mbedtls_net_free(&clientFd);
+  }
+}
+
+static void startHttpsProxy(HttpsProxyConfig &cfg) {
+  if (*cfg.taskHandle) {
+    return;
+  }
+
+  BaseType_t created = xTaskCreatePinnedToCore(
+    httpsProxyTask,
+    cfg.name,
+    HTTPS_PROXY_TASK_STACK,
+    &cfg,
+    1,
+    cfg.taskHandle,
+    ARDUINO_RUNNING_CORE
+  );
+
+  if (created != pdPASS) {
+    *cfg.taskHandle = nullptr;
+    Logger.Log("[HTTPS] Failed to start %s proxy task\n", cfg.name);
+  }
+}
+
+static void startHttpsProxyServers(bool includeAux) {
+  startHttpsProxy(httpsMainProxy);
+  if (includeAux) {
+    startHttpsProxy(httpsStreamProxy);
+    startHttpsProxy(httpsTransferProxy);
+  }
+}
+
 static void streamServerTask(void *arg) {
   WebServer *srv = static_cast<WebServer *>(arg);
   for (;;) {
@@ -4070,7 +4422,10 @@ static void startSetupAPMode() {
     server.on("/save", HTTP_POST, handleSave);
     server.onNotFound(handleNotFound);
     server.begin();
-    Logger.LogLine("[HTTP] Setup server ready on port 80");
+    startHttpsProxyServers(false);
+    Logger.Log("[HTTP] Setup server ready on port %u; HTTPS on port %u\n",
+      (unsigned int)HTTP_MAIN_PORT,
+      (unsigned int)HTTPS_MAIN_PORT);
 }
 
 static void startCameraAPMode() {
@@ -4128,7 +4483,10 @@ static void startCameraAPMode() {
   registerCameraRoutes();
   server.begin();
   startAuxHttpServers();
-  Logger.LogLine("[HTTP] Camera server ready on port 80 (AP mode)");
+  startHttpsProxyServers(true);
+  Logger.Log("[HTTP] Camera server ready on port %u; HTTPS on port %u (AP mode)\n",
+    (unsigned int)HTTP_MAIN_PORT,
+    (unsigned int)HTTPS_MAIN_PORT);
 }
 
 static bool syncClockWithNtp() {

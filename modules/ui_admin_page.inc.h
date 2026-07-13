@@ -218,7 +218,7 @@ __APP_NAV__
 __APP_FOOTER__
 <script>
 function id(n){return document.getElementById(n);}
-var transferBase='http://'+window.location.hostname+':82';
+var transferBase='https://'+window.location.hostname+':445';
 var transferToken=encodeURIComponent('__ROUTE_TOKEN__');
 var wifiCache=[];
 function setWiFiStatus(msg,err){var e=id('wifi_status');e.textContent=msg;e.className=err?'status error':'status';}

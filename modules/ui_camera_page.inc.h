@@ -129,7 +129,7 @@ var recordingMode=false;
 var motionRecordingMode=false;
 var streamVisible=true;
 var viewRotate90=false;
-var streamUrl='http://'+window.location.hostname+':81/stream?t='+encodeURIComponent('__ROUTE_TOKEN__');
+var streamUrl='https://'+window.location.hostname+':444/stream?t='+encodeURIComponent('__ROUTE_TOKEN__');
 function id(n){return document.getElementById(n);}
 function chk(el){return el.checked?1:0;}
 function ctrl(v,val,persist){
