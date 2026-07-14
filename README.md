@@ -32,7 +32,7 @@ After setup, the device boots into normal operation.
 
 - It tries saved WiFi networks in priority order until one connects.
 - Main web interface: port 80 (HTTP Basic Auth, user: `admin`, password: configured admin password).
-- Live MJPEG stream endpoint: `/stream` on HTTP port 81. This accepts HTTP Basic Auth and also the internal shared route token used by the camera page.
+- Live MJPEG stream endpoint: `/stream` on port 80. The firmware dispatches each viewer to one of two MJPEG worker ports, 81 and 83, so two clients can stream at the same time.
 - Direct JPEG snapshot URLs: `/snapshot` or `/snapshot.jpg` on HTTP port 80. These require HTTP Basic Auth.
 - Firmware upload endpoint: HTTP port 82.
 - If no saved WiFi connects, it starts fallback AP:

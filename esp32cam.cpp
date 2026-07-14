@@ -131,12 +131,22 @@ static constexpr const char *ERR_UNAUTHORIZED = "Unauthorized";
 
 static constexpr uint16_t HTTP_MAIN_PORT = 80;
 static constexpr uint16_t HTTP_STREAM_PORT = 81;
+static constexpr uint16_t HTTP_STREAM_PORT_ALT = 83;
 static constexpr uint16_t HTTP_TRANSFER_PORT = 82;
 static constexpr uint32_t HTTP_STREAM_TASK_STACK = 8192;
 static constexpr uint32_t HTTP_TRANSFER_TASK_STACK = 8192;
+static constexpr uint8_t STREAM_SLOT_COUNT = 2;
+static constexpr unsigned long STREAM_SLOT_RESERVATION_TIMEOUT_MS = 5000;
+
+enum class StreamSlotState : uint8_t {
+  Free = 0,
+  Reserved = 1,
+  Active = 2,
+};
 
 static WebServer server(HTTP_MAIN_PORT);
 static WebServer streamServer(HTTP_STREAM_PORT);
+static WebServer streamServerAlt(HTTP_STREAM_PORT_ALT);
 static WebServer transferServer(HTTP_TRANSFER_PORT);
 
 static String cfgAccessPass;
@@ -144,8 +154,6 @@ static String cfgDeviceName;
 static String routeAccessToken;
 static bool   isConfigured = false;
 static bool   otaRecoveryModeActive = false;
-static volatile bool streamClientConnected = false;
-static volatile bool streamClientAbortRequested = false;
 static bool   flashEnabled = false;
 static bool   cameraInitialized = false;
 static bool   ledAccessBlinkEnabled = false;
@@ -171,7 +179,9 @@ static bool serialFactoryResetArmed = false;
 static unsigned long serialLastInputAt = 0;
 static SemaphoreHandle_t cameraMutex = nullptr;
 static SemaphoreHandle_t streamPreviewMutex = nullptr;
+static SemaphoreHandle_t streamSlotMutex = nullptr;
 static TaskHandle_t streamServerTaskHandle = nullptr;
+static TaskHandle_t streamServerAltTaskHandle = nullptr;
 static TaskHandle_t transferServerTaskHandle = nullptr;
 static constexpr unsigned long STREAM_FRAME_INTERVAL_MS = 33;
 static constexpr unsigned long STREAM_CLOSE_WAIT_MS = 600;
@@ -181,6 +191,11 @@ static constexpr unsigned long SERIAL_COMMAND_IDLE_FLUSH_MS = 1200;
 static constexpr const char *SERIAL_LOG_FILE_PATH = "/log.txt";
 static constexpr const char *FIRMWARE_VERSION_TEXT = FIRMWARE_VERSION;
 static constexpr const char *FIRMWARE_BUILD_TEXT = __DATE__ " " __TIME__;
+static StreamSlotState streamSlotStates[STREAM_SLOT_COUNT] = {
+  StreamSlotState::Free,
+  StreamSlotState::Free,
+};
+static unsigned long streamSlotReservedAt[STREAM_SLOT_COUNT] = {0, 0};
 
 class SemaphoreLock {
  public:
@@ -407,6 +422,11 @@ static void unlockCameraFrame(camera_fb_t *fb);
 static bool copyCameraFrame(camera_fb_t *fb, OwnedJpegFrame &frame);
 static bool publishStreamPreviewFrame(const OwnedJpegFrame &frame);
 static void resetStreamPreviewFrame();
+static bool hasActiveStreamClients();
+static int reserveStreamSlot();
+static bool activateStreamSlot(uint8_t slotIndex);
+static void releaseStreamSlot(uint8_t slotIndex);
+static void cleanupExpiredStreamReservations(unsigned long now);
 static bool ensureCameraReady(TickType_t timeoutTicks = pdMS_TO_TICKS(5000));
 static void serviceCameraIdleTimeout();
 static bool isDeviceBusy();
@@ -699,7 +719,7 @@ static bool copyCameraFrame(camera_fb_t *fb, OwnedJpegFrame &frame) {
 }
 
 static bool publishStreamPreviewFrame(const OwnedJpegFrame &frame) {
-  if (!streamClientConnected || !streamPreviewMutex || !frame.data || frame.len == 0U) {
+  if (!hasActiveStreamClients() || !streamPreviewMutex || !frame.data || frame.len == 0U) {
     return false;
   }
 
@@ -800,7 +820,7 @@ static bool ensureCameraReady(TickType_t timeoutTicks) {
 }
 
 static void serviceCameraIdleTimeout() {
-  if (!cameraInitialized || streamClientConnected || cameraIdleTimeoutMs == 0UL) {
+  if (!cameraInitialized || hasActiveStreamClients() || cameraIdleTimeoutMs == 0UL) {
     return;
   }
 
@@ -814,7 +834,7 @@ static void serviceCameraIdleTimeout() {
     return;
   }
 
-  if (cameraInitialized && !streamClientConnected) {
+  if (cameraInitialized && !hasActiveStreamClients()) {
     esp_err_t err = esp_camera_deinit();
     if (err != ESP_OK) {
       Logger.Log("[CAM] Deinit failed: 0x%x\n", err);
@@ -2320,6 +2340,10 @@ static bool checkAuth(WebServer &srv, bool allowSharedToken) {
   return true;
 }
 
+static bool checkAuth() {
+  return checkAuth(server);
+}
+
 static String buildLocalUrl(uint16_t port, const String &path, bool withToken) {
   String url = "http://";
 
@@ -2376,80 +2400,179 @@ static bool streamCameraFramebufferDirect(WiFiClient &client) {
   return ok;
 }
 
-static void requestStreamClientCloseAndWait() {
-    if (!streamClientConnected) {
-      return;
-    }
-
-    streamClientAbortRequested = true;
-    unsigned long startedAt = millis();
-    while (streamClientConnected && (millis() - startedAt) < STREAM_CLOSE_WAIT_MS) {
-      delay(10);
-    }
+static uint16_t streamPortForSlot(uint8_t slotIndex) {
+  return slotIndex == 0 ? HTTP_STREAM_PORT : HTTP_STREAM_PORT_ALT;
 }
 
-static void handleStreamRequest(bool allowSharedToken) {
-    if (!checkAuth(streamServer, allowSharedToken)) return;
+static bool hasActiveStreamClients() {
+  if (!streamSlotMutex) {
+    return false;
+  }
 
-    if (!ensureCameraReady()) {
-      streamServer.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", "Camera unavailable");
-      return;
+  SemaphoreLock lock(streamSlotMutex, pdMS_TO_TICKS(20));
+  if (!lock.locked()) {
+    return false;
+  }
+
+  for (uint8_t i = 0; i < STREAM_SLOT_COUNT; ++i) {
+    if (streamSlotStates[i] == StreamSlotState::Active) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static void cleanupExpiredStreamReservationsLocked(unsigned long now) {
+  for (uint8_t i = 0; i < STREAM_SLOT_COUNT; ++i) {
+    if (streamSlotStates[i] == StreamSlotState::Reserved &&
+        (now - streamSlotReservedAt[i]) >= STREAM_SLOT_RESERVATION_TIMEOUT_MS) {
+      streamSlotStates[i] = StreamSlotState::Free;
+      streamSlotReservedAt[i] = 0;
+    }
+  }
+}
+
+static void cleanupExpiredStreamReservations(unsigned long now) {
+  if (!streamSlotMutex) {
+    return;
+  }
+
+  SemaphoreLock lock(streamSlotMutex, pdMS_TO_TICKS(20));
+  if (!lock.locked()) {
+    return;
+  }
+
+  cleanupExpiredStreamReservationsLocked(now);
+}
+
+static int reserveStreamSlot() {
+  if (!streamSlotMutex) {
+    return -1;
+  }
+
+  SemaphoreLock lock(streamSlotMutex, pdMS_TO_TICKS(20));
+  if (!lock.locked()) {
+    return -1;
+  }
+
+  unsigned long now = millis();
+  cleanupExpiredStreamReservationsLocked(now);
+
+  for (uint8_t i = 0; i < STREAM_SLOT_COUNT; ++i) {
+    if (streamSlotStates[i] == StreamSlotState::Free) {
+      streamSlotStates[i] = StreamSlotState::Reserved;
+      streamSlotReservedAt[i] = now;
+      return (int)i;
+    }
+  }
+
+  return -1;
+}
+
+static bool activateStreamSlot(uint8_t slotIndex) {
+  if (!streamSlotMutex || slotIndex >= STREAM_SLOT_COUNT) {
+    return false;
+  }
+
+  SemaphoreLock lock(streamSlotMutex, pdMS_TO_TICKS(20));
+  if (!lock.locked()) {
+    return false;
+  }
+
+  if (streamSlotStates[slotIndex] == StreamSlotState::Active) {
+    return false;
+  }
+
+  streamSlotStates[slotIndex] = StreamSlotState::Active;
+  streamSlotReservedAt[slotIndex] = 0;
+  return true;
+}
+
+static void releaseStreamSlot(uint8_t slotIndex) {
+  if (!streamSlotMutex || slotIndex >= STREAM_SLOT_COUNT) {
+    return;
+  }
+
+  SemaphoreLock lock(streamSlotMutex, pdMS_TO_TICKS(20));
+  if (!lock.locked()) {
+    return;
+  }
+
+  streamSlotStates[slotIndex] = StreamSlotState::Free;
+  streamSlotReservedAt[slotIndex] = 0;
+}
+
+static void handleStreamRequest(uint8_t slotIndex, bool allowSharedToken) {
+  WebServer &srv = (slotIndex == 0 ? streamServer : streamServerAlt);
+  if (!checkAuth(srv, allowSharedToken)) {
+    return;
+  }
+
+  if (!ensureCameraReady()) {
+    srv.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", "Camera unavailable");
+    return;
+  }
+
+  if (!activateStreamSlot(slotIndex)) {
+    srv.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", "Stream busy");
+    return;
+  }
+
+  setWifiModemSleep(false, "active stream");
+
+  WiFiClient client = srv.client();
+  client.setNoDelay(true);
+  client.setTimeout(1000);
+  Logger.LogLine("[STREAM] Client connected");
+  unsigned long lastFrameAt = 0;
+
+  client.print(
+      "HTTP/1.1 200 OK\r\n"
+      "Content-Type: multipart/x-mixed-replace; boundary=jpgbound\r\n"
+      "Cache-Control: no-cache, no-store, must-revalidate\r\n"
+      "Pragma: no-cache\r\n"
+      "Connection: close\r\n"
+      "\r\n"
+  );
+
+  while (client.connected()) {
+    unsigned long now = millis();
+    if (lastFrameAt != 0) {
+      unsigned long elapsed = now - lastFrameAt;
+      if (elapsed < STREAM_FRAME_INTERVAL_MS) {
+        delay(STREAM_FRAME_INTERVAL_MS - elapsed);
+        continue;
+      }
     }
 
-    setWifiModemSleep(false, "active stream");
+    now = millis();
+    bool ok = streamCameraFramebufferDirect(client);
 
-    WiFiClient client = streamServer.client();
-    client.setNoDelay(true);
-    client.setTimeout(1000);
-    Logger.LogLine("[STREAM] Client connected");
-    streamClientAbortRequested = false;
-    streamClientConnected = true;
-    unsigned long lastFrameAt = 0;
-    OwnedJpegFrame frame;
-    uint32_t lastPreviewSequence = 0;
+    lastFrameAt = now;
 
-    client.print(
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: multipart/x-mixed-replace; boundary=jpgbound\r\n"
-        "Cache-Control: no-cache, no-store, must-revalidate\r\n"
-        "Pragma: no-cache\r\n"
-        "Connection: close\r\n"
-        "\r\n"
-    );
-
-    while (client.connected()) {
-        if (streamClientAbortRequested) {
-            break;
-        }
-
-        unsigned long now = millis();
-        if (lastFrameAt != 0) {
-            unsigned long elapsed = now - lastFrameAt;
-            if (elapsed < STREAM_FRAME_INTERVAL_MS) {
-                delay(STREAM_FRAME_INTERVAL_MS - elapsed);
-                continue;
-            }
-        }
-
-        now = millis();
-        bool ok = streamCameraFramebufferDirect(client);
-
-        lastFrameAt = now;
-
-        if (!ok) break;
-        lastCameraActivityAt = millis();
+    if (!ok) {
+      break;
     }
 
-    streamClientAbortRequested = false;
-    streamClientConnected = false;
     lastCameraActivityAt = millis();
-    client.stop();
+  }
+
+  lastCameraActivityAt = millis();
+  client.stop();
+  releaseStreamSlot(slotIndex);
+  if (!hasActiveStreamClients()) {
     setWifiModemSleep(true, "idle");
-    Logger.LogLine("[STREAM] Client disconnected");
+  }
+  Logger.LogLine("[STREAM] Client disconnected");
 }
 
 static void handleStreamWorker() {
-  handleStreamRequest(true);
+  handleStreamRequest(0, true);
+}
+
+static void handleStreamWorkerAlt() {
+  handleStreamRequest(1, true);
 }
 
 static void handleStreamMain() {
@@ -2457,14 +2580,15 @@ static void handleStreamMain() {
     return;
   }
 
-  if (streamClientConnected) {
-    Logger.LogLine("[STREAM] Replacing active stream client");
-    requestStreamClientCloseAndWait();
+  int slotIndex = reserveStreamSlot();
+  if (slotIndex < 0) {
+    server.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", "All stream slots are busy");
+    return;
   }
 
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   server.sendHeader("Pragma", "no-cache");
-  server.sendHeader("Location", buildLocalUrl(HTTP_STREAM_PORT, "/stream", true));
+  server.sendHeader("Location", buildLocalUrl(streamPortForSlot((uint8_t)slotIndex), "/stream", true));
   server.send(HTTP_FOUND, "text/plain", "Redirecting to stream server");
 }
 
@@ -2473,17 +2597,7 @@ static void handleStreamClose() {
     return;
   }
 
-  if (streamClientConnected) {
-    requestStreamClientCloseAndWait();
-    Logger.LogLine("[STREAM] Close requested by UI");
-  }
-
-  server.send(HTTP_NO_CONTENT, "text/plain", "");
-}
-
-// ─── Authentication helper ────────────────────────────────────────────────────
-static bool checkAuth() {
-    return checkAuth(server);
+  server.send(HTTP_OK, "text/plain", "OK");
 }
 
 // ─── Route handlers: AP (setup) mode ─────────────────────────────────────────
@@ -3192,6 +3306,29 @@ static void startAuxHttpServers() {
     }
   }
 
+  if (!streamServerAltTaskHandle) {
+    streamServerAlt.on("/stream", HTTP_GET, handleStreamWorkerAlt);
+    streamServerAlt.onNotFound([]() {
+      streamServerAlt.send(HTTP_NOT_FOUND, "text/plain", "Not found");
+    });
+    streamServerAlt.begin();
+    BaseType_t created = xTaskCreatePinnedToCore(
+      streamServerTask,
+      "http-stream-2",
+      HTTP_STREAM_TASK_STACK,
+      &streamServerAlt,
+      1,
+      &streamServerAltTaskHandle,
+      ARDUINO_RUNNING_CORE
+    );
+    if (created == pdPASS) {
+      Logger.Log("[HTTP] Stream server ready on port %u\n", (unsigned int)HTTP_STREAM_PORT_ALT);
+    } else {
+      streamServerAltTaskHandle = nullptr;
+      Logger.LogLine("[HTTP] Failed to start secondary stream server task");
+    }
+  }
+
   if (!transferServerTaskHandle) {
     registerOtaTransferRoutes();
     transferServer.onNotFound([]() {
@@ -3520,7 +3657,8 @@ static void initializeSerialFactoryResetChallenge() {
 static bool initializeRuntimeMutexes() {
   cameraMutex = xSemaphoreCreateMutex();
   streamPreviewMutex = xSemaphoreCreateMutex();
-  return cameraMutex && streamPreviewMutex;
+  streamSlotMutex = xSemaphoreCreateMutex();
+  return cameraMutex && streamPreviewMutex && streamSlotMutex;
 }
 
 static void initializeWakeupIndicator() {
@@ -3605,6 +3743,7 @@ void setup() {
 
 void loop() {
   serviceSerialConsole();
+  cleanupExpiredStreamReservations(millis());
   server.handleClient();
   serviceNtpSync();
   serviceStaReconnect();
