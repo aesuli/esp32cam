@@ -65,6 +65,9 @@ static constexpr int LED_GPIO = GPIO_NUM_33;
 static constexpr int AP_CHANNEL = 1;
 static constexpr bool AP_HIDDEN = false;
 static constexpr int AP_MAX_CONNECTIONS = 4;
+static constexpr size_t AP_SSID_MAX_LEN = 32;
+static constexpr size_t AP_PASS_MIN_LEN = 8;
+static constexpr size_t AP_PASS_MAX_LEN = 63;
 static constexpr wifi_power_t DEFAULT_TX_POWER_STA = WIFI_POWER_19_5dBm;
 static constexpr wifi_power_t DEFAULT_TX_POWER_AP = WIFI_POWER_8_5dBm;
 static constexpr uint16_t AP_FALLBACK_BEACON_INTERVAL_TU = 10000;
@@ -415,6 +418,9 @@ static void servicePendingAdminRestart();
 static bool requestFactoryResetAndReboot(const char *origin);
 static void initializeSerialFactoryResetChallenge();
 static void serviceSerialConsole();
+static bool isPrintableAscii(const String &value);
+static bool isValidApSsid(const String &value);
+static bool isValidApPassword(const String &value);
 static bool isValidRuntimeTxPowerValue(int value);
 static wifi_power_t validatedTxPowerValue(int configuredValue, wifi_power_t fallback, const char *label);
 static void setWifiModemSleep(bool enabled, const char *reason = nullptr);
@@ -950,10 +956,43 @@ static String buildNetworkHostname(const String &deviceName) {
 static String buildFallbackApSsid() {
   String ssid = cfgDeviceName;
   ssid.trim();
-  if (ssid.isEmpty()) {
+
+  if (!isPrintableAscii(ssid)) {
+    Logger.LogLine("[WIFI] Device name has non-ASCII characters; using default fallback AP SSID");
+    return AP_FALLBACK_SSID;
+  }
+
+  if (ssid.length() > AP_SSID_MAX_LEN) {
+    ssid.remove(AP_SSID_MAX_LEN);
+    ssid.trim();
+    Logger.Log("[WIFI] Truncated fallback AP SSID to %u characters\n", (unsigned int)AP_SSID_MAX_LEN);
+  }
+
+  if (!isValidApSsid(ssid)) {
     ssid = AP_FALLBACK_SSID;
   }
   return ssid;
+}
+
+static String buildFallbackApPassword() {
+  String password = cfgAccessPass;
+
+  if (!isPrintableAscii(password)) {
+    Logger.LogLine("[WIFI] Admin password has non-ASCII characters; using setup AP password for fallback AP");
+    return AP_SETUP_PASS;
+  }
+
+  if (password.length() > AP_PASS_MAX_LEN) {
+    password.remove(AP_PASS_MAX_LEN);
+    Logger.Log("[WIFI] Truncated fallback AP password to %u characters\n", (unsigned int)AP_PASS_MAX_LEN);
+  }
+
+  if (!isValidApPassword(password)) {
+    Logger.LogLine("[WIFI] Invalid fallback AP password length; using setup AP password");
+    return AP_SETUP_PASS;
+  }
+
+  return password;
 }
 
 static bool connectToSavedStaNetworks(bool showLedFeedback, bool initializeCameraHttpServices) {
@@ -1442,6 +1481,22 @@ static bool isPrintableAscii(const String &value) {
     }
   }
   return true;
+}
+
+static bool isValidApSsid(const String &value) {
+  return !value.isEmpty()
+      && value.length() <= AP_SSID_MAX_LEN
+      && isPrintableAscii(value);
+}
+
+static bool isValidApPassword(const String &value) {
+  if (value.isEmpty()) {
+    return true;
+  }
+
+  return value.length() >= AP_PASS_MIN_LEN
+      && value.length() <= AP_PASS_MAX_LEN
+      && isPrintableAscii(value);
 }
 
 static bool parseIpv4String(const String &raw, IPAddress &out) {
@@ -2512,8 +2567,22 @@ static void handleSave() {
     server.send(HTTP_BAD_REQUEST, "text/plain", "Access password must be at least 8 characters");
         return;
     }
+    if (newAPass.length() > AP_PASS_MAX_LEN) {
+      server.send(HTTP_BAD_REQUEST, "text/plain", "Access password must be at most 63 characters");
+          return;
+      }
 
-    if (!isPrintableAscii(newSSID) || !isPrintableAscii(newWPass) || !isPrintableAscii(newAPass)) {
+    String newDeviceName = server.hasArg("dname") ? server.arg("dname") : "ESP32-CAM";
+    newDeviceName.trim();
+    if (newDeviceName.isEmpty()) {
+      newDeviceName = "ESP32-CAM";
+    }
+    if (newDeviceName.length() > AP_SSID_MAX_LEN) {
+      server.send(HTTP_BAD_REQUEST, "text/plain", "Device name must be between 1 and 32 characters");
+      return;
+    }
+
+      if (!isPrintableAscii(newSSID) || !isPrintableAscii(newWPass) || !isPrintableAscii(newAPass) || !isPrintableAscii(newDeviceName)) {
     server.send(HTTP_BAD_REQUEST, "text/plain", "Invalid characters in input");
         return;
     }
@@ -2530,10 +2599,7 @@ static void handleSave() {
     }
     cfg.wifiList.push_back(wifi);
     cfg.adminPass = newAPass;
-    cfg.deviceName = server.hasArg("dname") ? server.arg("dname") : "ESP32-CAM";
-    if (cfg.deviceName.isEmpty()) {
-      cfg.deviceName = "ESP32-CAM";
-    }
+    cfg.deviceName = newDeviceName;
 
     if (!persistRuntimeConfig(cfg)) {
       server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to save configuration");
@@ -2837,6 +2903,10 @@ static void handleAdminPasswordChange() {
   }
   if (nextPass.length() < 8) {
     server.send(HTTP_BAD_REQUEST, "text/plain", "New password must be at least 8 characters");
+    return;
+  }
+  if (nextPass.length() > AP_PASS_MAX_LEN) {
+    server.send(HTTP_BAD_REQUEST, "text/plain", "New password must be at most 63 characters");
     return;
   }
   if (nextPass != confirmPass) {
@@ -3189,7 +3259,8 @@ static void startCameraAPMode() {
   wifiModemSleepEnabled = false;
   String apHostname = buildNetworkHostname(cfgDeviceName);
   String apSsid = buildFallbackApSsid();
-  bool ok = startSoftAPWithRetries(apSsid.c_str(), cfgAccessPass.c_str(), apHostname.c_str());
+  String apPassword = buildFallbackApPassword();
+  bool ok = startSoftAPWithRetries(apSsid.c_str(), apPassword.c_str(), apHostname.c_str());
   if (!ok) {
     Logger.LogLine("[WIFI] Fallback AP start failed (check password length >= 8)");
     return;
