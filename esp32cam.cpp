@@ -31,7 +31,6 @@
 #include <Update.h>
 #include <esp_err.h>
 #include <esp_heap_caps.h>
-#include <esp_sleep.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
 #include <driver/gpio.h>

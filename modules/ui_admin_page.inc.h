@@ -495,7 +495,6 @@ refreshDeviceName();
 refreshTimeStatus();
 refreshLedStatus();
 refreshLoggingStatus();
-refreshStandbySettings();
 refreshTxPower();
 </script>
 </body>
