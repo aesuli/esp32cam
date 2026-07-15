@@ -192,6 +192,12 @@ function setViewRotation(isRotated){
   img.classList.toggle('rot90',viewRotate90);
   updateStreamLayout();
 }
+function setFlashButton(isFlashOn){
+  var btn=id('flash_btn');
+  if(!btn)return;
+  btn.classList.toggle('flash-on',!!isFlashOn);
+  btn.textContent=isFlashOn?'💡 Flash On':'💡 Flash Off';
+}
 function bindFrameSizeControl(){
   var el=id('framesize');
   if(!el)return;
@@ -240,6 +246,7 @@ function applyStatus(s){
     if(rotateCb)rotateCb.checked=!!s.view_rotate_90;
     setViewRotation(!!s.view_rotate_90);
   }
+  if(s.flashlight!==undefined){setFlashButton(!!s.flashlight);}
   setStreamVisibility(s.stream_visible!==undefined?!!s.stream_visible:true);
 }
 function loadStatus(){
@@ -266,15 +273,9 @@ id('snapshot_open_btn').addEventListener('click',function(){
 });
 id('flash_btn').addEventListener('click',function(){
   var isFlashOn=id('flash_btn').classList.contains('flash-on');
-  fetch('/control?var=flash&val='+(isFlashOn?0:1)).then(function(r){
+  fetch('/flashlight?enabled='+(isFlashOn?0:1),{method:'POST'}).then(function(r){
     if(r.ok){
-      if(isFlashOn){
-        id('flash_btn').classList.remove('flash-on');
-        id('flash_btn').textContent='💡 Flash Off';
-      }else{
-        id('flash_btn').classList.add('flash-on');
-        id('flash_btn').textContent='💡 Flash On';
-      }
+      return r.json().then(function(s){setFlashButton(!!s.enabled);});
     }
   });
 });

@@ -129,6 +129,7 @@ static String routeAccessToken;
 static bool   isConfigured = false;
 static bool   cameraInitialized = false;
 static bool   ledAccessBlinkEnabled = false;
+static bool   flashEnabled = false;
 static bool   wifiModemSleepEnabled = false;
 static bool   staConnectedAtBoot = false;
 static volatile bool staLinkUp = false;
@@ -1956,6 +1957,7 @@ static void resetFlashOutput() {
 static void setFlashOutput(bool enabled) {
   pinMode(LED_FLASH_GPIO_NUM, OUTPUT);
   digitalWrite(LED_FLASH_GPIO_NUM, enabled ? HIGH : LOW);
+  flashEnabled = enabled;
 }
 
 
@@ -2955,6 +2957,42 @@ static void handleControl() {
     server.send(HTTP_OK, "text/plain", res == 0 ? "OK" : "ERROR");
 }
 
+static void sendFlashlightStatus() {
+  String json = "{\"enabled\":";
+  json += flashEnabled ? "true" : "false";
+  json += "}";
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(HTTP_OK, "application/json", json);
+}
+
+static bool readFlashlightRequestedState(bool &enabled) {
+  if (server.hasArg("enabled") && parseBoolString(server.arg("enabled"), enabled)) {
+    return true;
+  }
+  if (server.hasArg("state") && parseBoolString(server.arg("state"), enabled)) {
+    return true;
+  }
+  if (server.hasArg("val") && parseBoolString(server.arg("val"), enabled)) {
+    return true;
+  }
+  if (server.hasArg("plain") && parseBoolString(server.arg("plain"), enabled)) {
+    return true;
+  }
+  return false;
+}
+
+static void handleFlashlight() {
+  if (!checkAuth()) return;
+
+  bool enabled = false;
+  if (readFlashlightRequestedState(enabled)) {
+    setFlashOutput(enabled);
+    Logger.LogLine(enabled ? "[FLASH] Enabled" : "[FLASH] Disabled");
+  }
+
+  sendFlashlightStatus();
+}
+
 static void handleStatus() {
     if (!checkAuth()) return;
 
@@ -2997,6 +3035,7 @@ static void handleStatus() {
         "\"vflip\":%u,"
         "\"dcw\":%u,"
         "\"colorbar\":%u,"
+        "\"flashlight\":%u,"
         "\"stream_visible\":%u,"
         "\"view_rotate_90\":%u"
         "}",
@@ -3013,6 +3052,7 @@ static void handleStatus() {
         s->status.lenc,        s->status.hmirror,
         s->status.vflip,       s->status.dcw,
         s->status.colorbar,
+        flashEnabled ? 1U : 0U,
         runtimeConfig.cameraSettings.streamVisible ? 1U : 0U,
         runtimeConfig.cameraSettings.viewRotate90 ? 1U : 0U
     );
@@ -3123,6 +3163,8 @@ static void registerCameraRoutes() {
   server.on("/stream/close",  HTTP_POST, handleStreamClose);
   server.on("/snapshot",      HTTP_GET,  handleCapture);
   server.on("/snapshot.jpg",  HTTP_GET,  handleCapture);
+  server.on("/flashlight",    HTTP_GET,  handleFlashlight);
+  server.on("/flashlight",    HTTP_POST, handleFlashlight);
   server.on("/control",       HTTP_GET,  handleControl);
   server.on("/status",        HTTP_GET,  handleStatus);
   server.on("/wifi/scan",     HTTP_GET,  handleWifiScan);

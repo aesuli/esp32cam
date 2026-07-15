@@ -34,6 +34,7 @@ After setup, the device boots into normal operation.
 - Main web interface: port 80 (HTTP Basic Auth, user: `admin`, password: configured admin password).
 - Live MJPEG stream endpoint: `/stream` on port 80. The firmware dispatches each viewer to one of two MJPEG worker ports, 81 and 83, so two clients can stream at the same time.
 - Direct JPEG snapshot URLs: `/snapshot` or `/snapshot.jpg` on HTTP port 80. These require HTTP Basic Auth.
+- Flash LED control URL: `/flashlight` on HTTP port 80. `GET` returns JSON state, and `POST`/`GET` with `enabled=1` or `enabled=0` changes it. This requires HTTP Basic Auth.
 - Firmware upload endpoint: HTTP port 82.
 - If no saved WiFi connects, it starts fallback AP:
   - SSID: ESP32-CAM
@@ -61,7 +62,7 @@ Use this page for live view and manual capture.
 - Use `/stream` for clients that need a direct authenticated stream URL.
 - Show/hide stream without leaving the page.
 - Use `/snapshot` or `/snapshot.jpg` for a one-shot authenticated JPEG.
-- Flash LED on/off.
+- Flash LED on/off via `/flashlight`.
 - Camera tuning controls, including:
   - resolution
   - brightness, contrast, saturation
