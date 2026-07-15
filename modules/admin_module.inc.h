@@ -47,89 +47,6 @@ static void handleDeviceNameGet() {
   server.send(HTTP_OK, "application/json", json);
 }
 
-static void handleAdminTimeStatus() {
-  if (!checkAuth()) return;
-
-  time_t now = time(nullptr);
-  String json = "{";
-  json += "\"epoch\":" + String((unsigned long)now) + ",";
-  json += "\"sane\":" + String(isClockSane() ? "true" : "false") + ",";
-  json += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false") + ",";
-  json += "\"local\":\"" + jsonEscape(formatLocalTimeString()) + "\"";
-  json += "}";
-
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send(HTTP_OK, "application/json", json);
-}
-
-static bool parseEpochArg(const String &raw, time_t &epochOut) {
-  if (raw.isEmpty()) {
-    return false;
-  }
-
-  uint64_t parsed = 0;
-  for (size_t i = 0; i < raw.length(); ++i) {
-    char c = raw[i];
-    if (c < '0' || c > '9') {
-      return false;
-    }
-    parsed = (parsed * 10ULL) + (uint64_t)(c - '0');
-    if (parsed > 0x7FFFFFFFULL) {
-      return false;
-    }
-  }
-
-  if (parsed < 946684800ULL) {  // 2000-01-01
-    return false;
-  }
-
-  epochOut = (time_t)parsed;
-  return true;
-}
-
-static void handleAdminTimeSet() {
-  if (!checkAuth()) return;
-  if (!server.hasArg("epoch")) {
-    server.send(HTTP_BAD_REQUEST, "text/plain", "epoch is required");
-    return;
-  }
-
-  time_t epoch = 0;
-  if (!parseEpochArg(server.arg("epoch"), epoch)) {
-    server.send(HTTP_BAD_REQUEST, "text/plain", "Invalid epoch value");
-    return;
-  }
-
-  applyLocalTimeZone();
-
-  struct timeval tv;
-  tv.tv_sec = epoch;
-  tv.tv_usec = 0;
-  if (settimeofday(&tv, nullptr) != 0) {
-    server.send(HTTP_INTERNAL_ERROR, "text/plain", "Failed to set system time");
-    return;
-  }
-
-  server.send(HTTP_OK, "text/plain", "Time set to: " + formatLocalTimeString());
-}
-
-static void handleAdminTimeSync() {
-  if (!checkAuth()) return;
-
-  if (WiFi.status() != WL_CONNECTED) {
-    server.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", "WiFi is not connected");
-    return;
-  }
-
-  bool ok = syncClockWithNtp();
-  if (!ok) {
-    server.send(HTTP_INTERNAL_ERROR, "text/plain", "NTP sync failed");
-    return;
-  }
-
-  server.send(HTTP_OK, "text/plain", "NTP synced: " + formatLocalTimeString());
-}
-
 static void handleAdminLedGet() {
   if (!checkAuth()) return;
 
@@ -263,9 +180,6 @@ static void registerAdminRoutes() {
   server.on("/admin/password", HTTP_POST, handleAdminPasswordChange);
   server.on("/admin/rename", HTTP_POST, handleDeviceNameRename);
   server.on("/admin/name", HTTP_GET, handleDeviceNameGet);
-  server.on("/admin/time", HTTP_GET, handleAdminTimeStatus);
-  server.on("/admin/time/set", HTTP_POST, handleAdminTimeSet);
-  server.on("/admin/time/sync", HTTP_POST, handleAdminTimeSync);
   server.on("/admin/led", HTTP_GET, handleAdminLedGet);
   server.on("/admin/led", HTTP_POST, handleAdminLedSet);
   server.on("/admin/txpower", HTTP_GET, handleAdminTxPowerGet);
@@ -274,6 +188,7 @@ static void registerAdminRoutes() {
   server.on("/admin/factory-reset", HTTP_POST, handleAdminFactoryReset);
   server.on("/wifi/list", HTTP_GET, handleWifiList);
   server.on("/wifi/add", HTTP_POST, handleWifiAdd);
+  server.on("/wifi/enabled", HTTP_POST, handleWifiSetEnabled);
   server.on("/wifi/delete", HTTP_POST, handleWifiDelete);
   server.on("/wifi/move", HTTP_POST, handleWifiMove);
 }

@@ -125,19 +125,6 @@ __APP_NAV__
     <div id="name_status" class="status"></div>
   </div>
   <div class="panel">
-    <h3>Time</h3>
-    <div class="status" id="time_now"></div>
-    <form class="form" id="time_form">
-      <div>
-        <label>Manual Local Time</label>
-        <input id="manual_time" type="datetime-local" step="1" required>
-      </div>
-      <button type="submit">Set Time</button>
-      <button type="button" id="ntp_sync_btn">Sync NTP</button>
-    </form>
-    <div id="time_status" class="status"></div>
-  </div>
-  <div class="panel">
     <h3>LED Control</h3>
     <form class="form" id="led_form">
       <div style="display:flex;align-items:center;gap:10px">
@@ -224,40 +211,12 @@ var wifiCache=[];
 function setWiFiStatus(msg,err){var e=id('wifi_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setAdminStatus(msg,err){var e=id('admin_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setNameStatus(msg,err){var e=id('name_status');e.textContent=msg;e.className=err?'status error':'status';}
-function setTimeStatus(msg,err){var e=id('time_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setLedStatus(msg,err){var e=id('led_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setTxPowerStatus(msg,err){var e=id('txpower_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setFirmwareStatus(msg,err){var e=id('firmware_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setResetStatus(msg,err){var e=id('reset_status');e.textContent=msg;e.className=err?'status error':'status';}
 function setFactoryResetStatus(msg,err){var e=id('factory_reset_status');e.textContent=msg;e.className=err?'status error':'status';}
 function formData(obj){return Object.keys(obj).map(function(k){return encodeURIComponent(k)+'='+encodeURIComponent(obj[k]);}).join('&');}
-function toDateTimeLocalValue(epoch){
-  var d=new Date((Number(epoch)||0)*1000);
-  if(isNaN(d.getTime())) return '';
-  var pad=function(n){return n<10?'0'+n:String(n);};
-  return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())+'T'+pad(d.getHours())+':'+pad(d.getMinutes())+':'+pad(d.getSeconds());
-}
-function refreshTimeStatus(){
-  fetch('/admin/time').then(function(r){
-    if(!r.ok){throw new Error('Failed to load time status');}
-    return r.json();
-  }).then(function(d){
-    id('time_now').textContent='Current: '+(d.local||'unknown')+' • '+(d.sane?'Clock synced':'Clock not synced')+' • '+(d.wifiConnected?'WiFi connected':'WiFi offline');
-    if(d.epoch){id('manual_time').value=toDateTimeLocalValue(d.epoch);}
-  }).catch(function(e){
-    id('time_now').textContent='Current: unavailable';
-    setTimeStatus(e.message,true);
-  });
-}
-function syncNtpTime(){
-  setTimeStatus('Syncing NTP...',false);
-  fetch('/admin/time/sync',{method:'POST'}).then(function(r){
-    return r.text().then(function(msg){
-      setTimeStatus(msg||'NTP sync request finished',!r.ok);
-      refreshTimeStatus();
-    });
-  }).catch(function(e){setTimeStatus(e.message,true);});
-}
 function refreshDeviceName(){
   var input=id('device_name');
   fetch('/admin/name').then(function(r){
@@ -400,21 +359,6 @@ id('wifi_form').addEventListener('submit',function(e){
 });
 id('admin_form').addEventListener('submit',function(e){e.preventDefault();fetch('/admin/password',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({current:id('admin_current').value,next:id('admin_new').value,confirm:id('admin_confirm').value})}).then(function(r){r.text().then(function(msg){setAdminStatus(msg,!r.ok);if(r.ok)id('admin_form').reset();});});});
 id('name_form').addEventListener('submit',function(e){e.preventDefault();fetch('/admin/rename',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({name:id('device_name').value})}).then(function(r){r.text().then(function(msg){setNameStatus(msg,!r.ok);if(r.ok)refreshDeviceName();});});});
-id('time_form').addEventListener('submit',function(e){
-  e.preventDefault();
-  var raw=id('manual_time').value;
-  if(!raw){setTimeStatus('Choose a date and time first',true);return;}
-  var dt=new Date(raw);
-  if(isNaN(dt.getTime())){setTimeStatus('Invalid date/time value',true);return;}
-  var epoch=Math.floor(dt.getTime()/1000);
-  fetch('/admin/time/set',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:formData({epoch:epoch})}).then(function(r){
-    return r.text().then(function(msg){
-      setTimeStatus(msg||'Time updated',!r.ok);
-      refreshTimeStatus();
-    });
-  }).catch(function(err){setTimeStatus(err.message,true);});
-});
-id('ntp_sync_btn').addEventListener('click',syncNtpTime);
 id('wifi_scan_list').addEventListener('change',function(){if(this.value)id('wifi_ssid').value=this.value;});
 id('wifi_netmode').addEventListener('change',updateWiFiStaticFieldVisibility);
 function refreshLedStatus(){
@@ -492,7 +436,6 @@ id('factory_reset_form').addEventListener('submit',function(e){
 refreshWiFiList();
 resetWiFiForm();
 refreshDeviceName();
-refreshTimeStatus();
 refreshLedStatus();
 refreshLoggingStatus();
 refreshTxPower();

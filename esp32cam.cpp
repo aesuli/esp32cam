@@ -24,9 +24,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 #include <WiFi.h>
-#include <HTTPClient.h>
 #include <WebServer.h>
-#include <FS.h>
 #include <Preferences.h>
 #include <Update.h>
 #include <esp_err.h>
@@ -35,16 +33,8 @@
 #include <esp_wifi.h>
 #include <driver/gpio.h>
 #include <mbedtls/aes.h>
-#include <mbedtls/ctr_drbg.h>
-#include <mbedtls/entropy.h>
-#include <mbedtls/net_sockets.h>
-#include <mbedtls/pk.h>
-#include <mbedtls/ssl.h>
-#include <mbedtls/x509_crt.h>
 #include <time.h>
-#include <sys/time.h>
 #include <vector>
-#include <algorithm>
 #include <cstring>
 #include <cstdarg>
 #include "camera_pins.h"
@@ -60,31 +50,26 @@ static constexpr int LED_GPIO = GPIO_NUM_33;
 #define AP_SETUP_SSID "ESP32-CAM-Setup"
 #define AP_SETUP_PASS "ESP32-CAM"
 #define AP_FALLBACK_SSID "ESP32-CAM"
-#define AP_OTA_RECOVERY_SSID "ESP32-CAM-OTA"
 static constexpr int AP_CHANNEL = 1;
 static constexpr bool AP_HIDDEN = false;
 static constexpr int AP_MAX_CONNECTIONS = 4;
 static constexpr size_t AP_SSID_MAX_LEN = 32;
 static constexpr size_t AP_PASS_MIN_LEN = 8;
 static constexpr size_t AP_PASS_MAX_LEN = 63;
-static constexpr wifi_power_t DEFAULT_TX_POWER_STA = WIFI_POWER_19_5dBm;
+static constexpr wifi_power_t DEFAULT_TX_POWER_STA = WIFI_POWER_11dBm;
 static constexpr wifi_power_t DEFAULT_TX_POWER_AP = WIFI_POWER_8_5dBm;
 static constexpr uint16_t AP_FALLBACK_BEACON_INTERVAL_TU = 10000;
 static constexpr bool AP_FALLBACK_MODEM_SLEEP_ENABLED = false;
 static constexpr bool AP_FALLBACK_EXTENDED_BEACON_ENABLED = false;
-static constexpr const char *NTP_SERVER = "pool.ntp.org";
-static constexpr const char *TIME_ZONE = "BRT3";
 static constexpr int CONFIG_LOAD_RETRIES = 5;
 static constexpr unsigned long CONFIG_LOAD_RETRY_DELAY_MS = 1000;
 static constexpr int CAMERA_INIT_RETRIES = 8;
 static constexpr unsigned long CAMERA_INIT_RETRY_DELAY_MS = 500;
-static constexpr unsigned long BOOT_RECOVERY_RESTART_DELAY_MS = 5000;
 static constexpr int AP_START_RETRIES = 3;
 static constexpr unsigned long AP_START_RETRY_DELAY_MS = 1000;
 static constexpr uint32_t CAMERA_XCLK_FREQS_HZ[] = {20000000UL, 10000000UL, 8000000UL, 4000000UL};
 
 // Config persistence metadata
-#define CONFIG_FILE_PATH "/config.enc"
 #define CONFIG_FILE_MAGIC "ESP32CAMCFG14"
 static constexpr const char *CONFIG_NVS_NAMESPACE = "esp32camcfg";
 static constexpr const char *CONFIG_NVS_MAGIC_KEY = "cfg_magic";
@@ -93,22 +78,18 @@ static constexpr const char *CONFIG_NVS_CIPHER_KEY = "cfg_cipher";
 
 // HTTP status and shared parameters
 static constexpr int HTTP_OK = 200;
-static constexpr int HTTP_NO_CONTENT = 204;
 static constexpr int HTTP_FOUND = 302;
 static constexpr int HTTP_TEMPORARY_REDIRECT = 307;
 static constexpr int HTTP_BAD_REQUEST = 400;
 static constexpr int HTTP_UNAUTHORIZED = 401;
 static constexpr int HTTP_FORBIDDEN = 403;
 static constexpr int HTTP_NOT_FOUND = 404;
-static constexpr int HTTP_CONFLICT = 409;
-static constexpr int HTTP_UNSUPPORTED_MEDIA_TYPE = 415;
 static constexpr int HTTP_INTERNAL_ERROR = 500;
 static constexpr int HTTP_SERVICE_UNAVAILABLE = 503;
 
 static constexpr const char *PARAM_SSID = "ssid";
 static constexpr const char *PARAM_WPASS = "wpass";
 static constexpr const char *PARAM_APASS = "apass";
-static constexpr const char *PARAM_FILE = "file";
 static constexpr const char *PARAM_INDEX = "index";
 static constexpr const char *PARAM_CURRENT = "current";
 static constexpr const char *PARAM_NEXT = "next";
@@ -120,12 +101,6 @@ static constexpr const char *PARAM_SUBNET = "mask";
 static constexpr const char *PARAM_DNS1 = "dns1";
 static constexpr const char *PARAM_DNS2 = "dns2";
 
-static constexpr const char *ERR_FILE_REQUIRED = "file parameter required";
-static constexpr const char *ERR_INVALID_PATH = "Invalid file path";
-static constexpr const char *ERR_ACCESS_DENIED = "Access denied";
-static constexpr const char *ERR_SD_CARD_NOT_AVAILABLE = "SD card not available";
-static constexpr const char *ERR_SD_CARD_BUSY = "SD card busy";
-static constexpr const char *ERR_FILE_NOT_FOUND = "File not found";
 static constexpr const char *ERR_UNAUTHORIZED = "Unauthorized";
 
 static constexpr uint16_t HTTP_MAIN_PORT = 80;
@@ -152,13 +127,10 @@ static String cfgAccessPass;
 static String cfgDeviceName;
 static String routeAccessToken;
 static bool   isConfigured = false;
-static bool   otaRecoveryModeActive = false;
-static bool   flashEnabled = false;
 static bool   cameraInitialized = false;
 static bool   ledAccessBlinkEnabled = false;
 static bool   wifiModemSleepEnabled = false;
 static bool   staConnectedAtBoot = false;
-static bool   deferredNetworkStartupPending = false;
 static volatile bool staLinkUp = false;
 static unsigned long lastUrlAccessBlink = 0;
 static unsigned long lastCameraActivityAt = 0;
@@ -177,17 +149,14 @@ static String serialCommandBuffer;
 static bool serialFactoryResetArmed = false;
 static unsigned long serialLastInputAt = 0;
 static SemaphoreHandle_t cameraMutex = nullptr;
-static SemaphoreHandle_t streamPreviewMutex = nullptr;
 static SemaphoreHandle_t streamSlotMutex = nullptr;
 static TaskHandle_t streamServerTaskHandle = nullptr;
 static TaskHandle_t streamServerAltTaskHandle = nullptr;
 static TaskHandle_t transferServerTaskHandle = nullptr;
 static constexpr unsigned long STREAM_FRAME_INTERVAL_MS = 33;
-static constexpr unsigned long STREAM_CLOSE_WAIT_MS = 600;
 static constexpr unsigned long FIRMWARE_RESTART_DELAY_MS = 1500;
 static constexpr size_t SERIAL_COMMAND_MAX_LEN = 96;
 static constexpr unsigned long SERIAL_COMMAND_IDLE_FLUSH_MS = 1200;
-static constexpr const char *SERIAL_LOG_FILE_PATH = "/log.txt";
 static constexpr const char *FIRMWARE_VERSION_TEXT = FIRMWARE_VERSION;
 static constexpr const char *FIRMWARE_BUILD_TEXT = __DATE__ " " __TIME__;
 static StreamSlotState streamSlotStates[STREAM_SLOT_COUNT] = {
@@ -308,13 +277,6 @@ class AppLogger {
 
 static AppLogger Logger;
 
-struct AviIndexEntry {
-  uint32_t offset;
-  uint32_t size;
-};
-
-static std::vector<AviIndexEntry> recordingIndex;
-
 struct OwnedJpegFrame {
   uint8_t *data = nullptr;
   size_t capacity = 0;
@@ -341,10 +303,6 @@ struct OwnedJpegFrame {
     height = 0;
   }
 };
-
-static OwnedJpegFrame streamPreviewFrame;
-static uint32_t streamPreviewSequence = 0;
-static bool streamPreviewPending = false;
 
 struct WifiCredential {
   String ssid;
@@ -415,12 +373,9 @@ static constexpr FrameSizeOption FRAME_SIZE_OPTIONS[] = {
 static constexpr framesize_t DEFAULT_SENSOR_MAX_FRAMESIZE = FRAMESIZE_QXGA;
 
 static StoredConfig runtimeConfig;
-static bool syncClockWithNtp();
 static camera_fb_t *lockAndCaptureFrame(TickType_t timeoutTicks = pdMS_TO_TICKS(1000));
 static void unlockCameraFrame(camera_fb_t *fb);
 static bool copyCameraFrame(camera_fb_t *fb, OwnedJpegFrame &frame);
-static bool publishStreamPreviewFrame(const OwnedJpegFrame &frame);
-static void resetStreamPreviewFrame();
 static bool hasActiveStreamClients();
 static int reserveStreamSlot();
 static bool activateStreamSlot(uint8_t slotIndex);
@@ -428,7 +383,6 @@ static void releaseStreamSlot(uint8_t slotIndex);
 static void cleanupExpiredStreamReservations(unsigned long now);
 static bool ensureCameraReady(TickType_t timeoutTicks = pdMS_TO_TICKS(5000));
 static void serviceCameraIdleTimeout();
-static bool isDeviceBusy();
 static bool loadRuntimeConfigWithRetries(StoredConfig &cfg);
 static bool initCameraWithRetries();
 static bool applyWifiClientConfig(const WifiCredential &wifi);
@@ -717,78 +671,6 @@ static bool copyCameraFrame(camera_fb_t *fb, OwnedJpegFrame &frame) {
   return copyJpegBufferToFrame(fb->buf, fb->len, fb->width, fb->height, frame);
 }
 
-static bool publishStreamPreviewFrame(const OwnedJpegFrame &frame) {
-  if (!hasActiveStreamClients() || !streamPreviewMutex || !frame.data || frame.len == 0U) {
-    return false;
-  }
-
-  SemaphoreLock previewLock(streamPreviewMutex, 0);
-  if (!previewLock.locked()) {
-    return false;
-  }
-
-  if (streamPreviewPending) {
-    return false;
-  }
-
-  if (!copyJpegBufferToFrame(frame.data, frame.len, frame.width, frame.height, streamPreviewFrame)) {
-    return false;
-  }
-
-  ++streamPreviewSequence;
-  streamPreviewPending = true;
-  return true;
-}
-
-static bool copyLatestStreamPreviewFrame(OwnedJpegFrame &frame, uint32_t &lastSeenSequence) {
-  if (!streamPreviewMutex) {
-    return false;
-  }
-
-  SemaphoreLock previewLock(streamPreviewMutex, 0);
-  if (!previewLock.locked()) {
-    return false;
-  }
-
-  if (streamPreviewFrame.len == 0U || streamPreviewSequence == lastSeenSequence) {
-    return false;
-  }
-
-  if (!copyJpegBufferToFrame(streamPreviewFrame.data,
-                             streamPreviewFrame.len,
-                             streamPreviewFrame.width,
-                             streamPreviewFrame.height,
-                             frame)) {
-    return false;
-  }
-
-  lastSeenSequence = streamPreviewSequence;
-  streamPreviewPending = false;
-  return true;
-}
-
-static void resetStreamPreviewFrame() {
-  if (!streamPreviewMutex) {
-    streamPreviewFrame.len = 0;
-    streamPreviewFrame.width = 0;
-    streamPreviewFrame.height = 0;
-    ++streamPreviewSequence;
-    streamPreviewPending = false;
-    return;
-  }
-
-  SemaphoreLock previewLock(streamPreviewMutex, pdMS_TO_TICKS(50));
-  if (!previewLock.locked()) {
-    return;
-  }
-
-  streamPreviewFrame.len = 0;
-  streamPreviewFrame.width = 0;
-  streamPreviewFrame.height = 0;
-  ++streamPreviewSequence;
-  streamPreviewPending = false;
-}
-
 static bool ensureCameraReady(TickType_t timeoutTicks) {
   if (!cameraMutex) {
     return false;
@@ -843,75 +725,6 @@ static void serviceCameraIdleTimeout() {
       Logger.Log("[CAM] Camera powered down after %lu ms idle\n", cameraIdleTimeoutMs);
     }
   }
-}
-
-static bool isClockSane() {
-  time_t now = time(nullptr);
-  if (now < 1704067200) {  // 2024-01-01 00:00:00 UTC
-    return false;
-  }
-
-  struct tm timeinfo;
-  if (!localtime_r(&now, &timeinfo)) {
-    return false;
-  }
-
-  return (timeinfo.tm_year + 1900) >= 2024;
-}
-
-static void applyLocalTimeZone() {
-  setenv("TZ", TIME_ZONE, 1);
-  tzset();
-}
-
-static void ensureClockBeforeTimestamp() {
-  if (isClockSane()) {
-    return;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    syncClockWithNtp();
-  } else {
-    Logger.LogLine("[NTP] Clock not synced and WiFi is not connected");
-  }
-}
-
-static String formatLocalTimeString() {
-  time_t now = time(nullptr);
-  struct tm timeinfo;
-  char buf[32] = "1970-01-01 00:00:00";
-  if (localtime_r(&now, &timeinfo)) {
-    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
-  }
-  return String(buf);
-}
-
-static String buildTimestampFilenameToken() {
-  time_t now = time(nullptr);
-  struct tm timeinfo;
-  char stamp[24] = "19700101_000000";
-  if (localtime_r(&now, &timeinfo)) {
-    if (strftime(stamp, sizeof(stamp), "%Y%m%d_%H%M%S", &timeinfo) == 0) {
-      strncpy(stamp, "19700101_000000", sizeof(stamp));
-      stamp[sizeof(stamp) - 1] = '\0';
-    }
-  }
-  return String(stamp);
-}
-
-static void serviceNtpSync() {
-  static unsigned long lastAttemptAt = 0;
-  unsigned long nowMs = millis();
-  if ((nowMs - lastAttemptAt) < 60000UL) {
-    return;
-  }
-
-  if (WiFi.status() != WL_CONNECTED || isClockSane()) {
-    return;
-  }
-
-  lastAttemptAt = nowMs;
-  syncClockWithNtp();
 }
 
 static bool isHostnameLabelChar(char c) {
@@ -1112,7 +925,6 @@ static bool connectToSavedStaNetworks(bool showLedFeedback, bool initializeCamer
       WiFi.setTxPower(staTxPower);
       Logger.Log("[WIFI] STA TX power set to %d (raw)\n", (int)staTxPower);
       Logger.Log("[WIFI] Connected to %s — IP: %s\n", wifi.ssid.c_str(), WiFi.localIP().toString().c_str());
-      syncClockWithNtp();
 
       if (initializeCameraHttpServices) {
         registerCameraRoutes();
@@ -1193,7 +1005,8 @@ static void setWifiModemSleep(bool enabled, const char *reason) {
     return;
   }
 
-  if (!WiFi.setSleep(enabled)) {
+  wifi_ps_type_t sleepType = enabled ? WIFI_PS_MAX_MODEM : WIFI_PS_NONE;
+  if (!WiFi.setSleep(sleepType)) {
     if (reason && reason[0] != '\0') {
       Logger.Log("[WIFI] Failed to %s modem sleep (%s)\n",
         enabled ? "enable" : "disable",
@@ -1306,46 +1119,6 @@ static bool readU8(const std::vector<uint8_t> &buf, size_t &offset, uint8_t &out
   out = buf[offset++];
   return true;
 }
-
-static void appendU16(std::vector<uint8_t> &buf, uint16_t value) {
-  buf.push_back((uint8_t)(value & 0xFF));
-  buf.push_back((uint8_t)((value >> 8) & 0xFF));
-}
-
-static void appendU32(std::vector<uint8_t> &buf, uint32_t value) {
-  buf.push_back((uint8_t)(value & 0xFF));
-  buf.push_back((uint8_t)((value >> 8) & 0xFF));
-  buf.push_back((uint8_t)((value >> 16) & 0xFF));
-  buf.push_back((uint8_t)((value >> 24) & 0xFF));
-}
-
-static bool readU16(const std::vector<uint8_t> &buf, size_t &offset, uint16_t &out) {
-  if (offset + 2 > buf.size()) {
-    return false;
-  }
-
-  out = (uint16_t)buf[offset] | ((uint16_t)buf[offset + 1] << 8);
-  offset += 2;
-  return true;
-}
-
-static bool readU32(const std::vector<uint8_t> &buf, size_t &offset, uint32_t &out) {
-  if (offset + 4 > buf.size()) {
-    return false;
-  }
-
-  out = (uint32_t)buf[offset]
-      | ((uint32_t)buf[offset + 1] << 8)
-      | ((uint32_t)buf[offset + 2] << 16)
-      | ((uint32_t)buf[offset + 3] << 24);
-  offset += 4;
-  return true;
-}
-
-static bool isValidIntervalometerUnitValue(uint8_t unit) {
-  return unit <= 3;
-}
-
 
 static void appendI16(std::vector<uint8_t> &buf, int16_t value) {
   uint16_t raw = (uint16_t)value;
@@ -1691,29 +1464,6 @@ static String jsonEscape(const String &value) {
         break;
     }
   }
-  return escaped;
-}
-
-static String urlEncode(const String &value) {
-  static const char hex[] = "0123456789ABCDEF";
-  String escaped;
-  escaped.reserve(value.length() * 3);
-
-  for (unsigned int i = 0; i < value.length(); ++i) {
-    uint8_t c = (uint8_t)value[i];
-    bool safe = (c >= 'A' && c <= 'Z')
-             || (c >= 'a' && c <= 'z')
-             || (c >= '0' && c <= '9')
-             || c == '-' || c == '_' || c == '.' || c == '~';
-    if (safe) {
-      escaped += (char)c;
-    } else {
-      escaped += '%';
-      escaped += hex[(c >> 4) & 0x0F];
-      escaped += hex[c & 0x0F];
-    }
-  }
-
   return escaped;
 }
 
@@ -2152,7 +1902,6 @@ static void resetFlashOutput() {
 static void setFlashOutput(bool enabled) {
   pinMode(LED_FLASH_GPIO_NUM, OUTPUT);
   digitalWrite(LED_FLASH_GPIO_NUM, enabled ? HIGH : LOW);
-  flashEnabled = enabled;
 }
 
 
@@ -2259,7 +2008,6 @@ static bool checkAuth();
 static bool checkAuth(WebServer &srv, bool allowSharedToken = false);
 static bool hasSharedAccessToken(WebServer &srv);
 static String buildLocalUrl(uint16_t port, const String &path, bool withToken = false);
-static void sendTransferError(WebServer &srv, int statusCode, const char *message);
 static void handleStreamMain();
 static void handleStreamClose();
 static void handleStreamWorker();
@@ -2615,48 +2363,6 @@ static void handleSetupRoot() {
     handleUrlAccess();
   String page(SETUP_HTML);
   page.replace("__PAGE_TITLE__", buildDevicePageTitle("Setup"));
-  server.send(HTTP_OK, "text/html", page);
-}
-
-static void handleOtaRecoveryRoot() {
-  String page =
-    "<!DOCTYPE html><html lang=\"en\"><head>"
-    "<meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-    "<title>ESP32-CAM OTA Recovery</title>"
-    "<style>"
-    "*{box-sizing:border-box}"
-    "body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;"
-    "font-family:Arial,sans-serif;background:#10131a;color:#e6edf3;padding:20px}"
-    ".card{width:min(520px,100%);background:#1a2230;border:1px solid #2e3b52;border-radius:12px;padding:20px}"
-    "h1{margin:0 0 10px;font-size:1.35rem;color:#7dd3fc}"
-    "p{margin:0 0 12px;line-height:1.45;color:#cbd5e1}"
-    "label{display:block;margin:0 0 8px;color:#cbd5e1;font-size:.92rem}"
-    "input[type=file]{display:block;width:100%;padding:10px;background:#0f1722;border:1px solid #334155;border-radius:8px;color:#e6edf3;margin-bottom:12px}"
-    "button{width:100%;padding:11px 14px;background:#16a34a;color:#fff;border:0;border-radius:8px;cursor:pointer;font-weight:600}"
-    "button:hover{background:#15803d}"
-    ".danger{margin-top:10px;background:#b91c1c}"
-    ".danger:hover{background:#991b1b}"
-    ".status{margin-top:12px;min-height:1.2em;color:#93c5fd;font-size:.92rem}"
-    "</style></head><body><div class=\"card\">"
-    "<h1>OTA Recovery Mode</h1>"
-    "<p>This access point exposes only firmware update so you can recover the device.</p>"
-    "<p><strong>Firmware:</strong> " + String(FIRMWARE_VERSION_TEXT) + "</p>"
-    "<form id=\"fw\" method=\"POST\" enctype=\"multipart/form-data\">"
-    "<label for=\"firmware\">Firmware Binary (.bin)</label>"
-    "<input id=\"firmware\" type=\"file\" name=\"firmware\" accept=\".bin,application/octet-stream\" required>"
-    "<button type=\"submit\">Upload Firmware</button>"
-    "</form>"
-    "<div class=\"status\" id=\"status\"></div>"
-    "<script>"
-    "(function(){"
-    "var form=document.getElementById('fw');"
-    "var status=document.getElementById('status');"
-    "var token='" + routeAccessToken + "';"
-    "form.action='http://'+window.location.hostname+':" + String(HTTP_TRANSFER_PORT) + "/admin/update?t='+encodeURIComponent(token);"
-    "form.addEventListener('submit',function(){status.textContent='Uploading firmware... do not power off.';});"
-    "})();"
-    "</script></div></body></html>";
-
   server.send(HTTP_OK, "text/html", page);
 }
 
@@ -3370,7 +3076,6 @@ static void registerCameraRoutes() {
 }
 
 static void startSetupAPMode() {
-  otaRecoveryModeActive = false;
   wifiModemSleepEnabled = false;
   bool ok = startSoftAPWithRetries(AP_SETUP_SSID, AP_SETUP_PASS);
   if (!ok) {
@@ -3391,7 +3096,6 @@ static void startSetupAPMode() {
 }
 
 static void startCameraAPMode() {
-  otaRecoveryModeActive = false;
   wifiModemSleepEnabled = false;
   String apHostname = buildNetworkHostname(cfgDeviceName);
   String apSsid = buildFallbackApSsid();
@@ -3429,7 +3133,7 @@ static void startCameraAPMode() {
 
   // Keep modem sleep disabled in fallback AP mode for better runtime stability.
   if (AP_FALLBACK_MODEM_SLEEP_ENABLED) {
-    WiFi.setSleep(true);
+    WiFi.setSleep(WIFI_PS_MAX_MODEM);
     wifiModemSleepEnabled = true;
     Logger.Log("[WIFI] Fallback AP power: reduced TX + modem sleep enabled\n");
   } else {
@@ -3452,29 +3156,7 @@ static void startCameraAPMode() {
     (unsigned int)HTTP_TRANSFER_PORT);
 }
 
-static bool syncClockWithNtp() {
-  Logger.Log("[NTP] Syncing clock using %s (TZ=%s)\n", NTP_SERVER, TIME_ZONE);
-  applyLocalTimeZone();
-  configTzTime(TIME_ZONE, NTP_SERVER);
-
-  struct tm timeinfo;
-  for (int attempt = 0; attempt < 20; ++attempt) {
-    if (getLocalTime(&timeinfo, 500)) {
-      char ts[32];
-      strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", &timeinfo);
-      Logger.Log("[NTP] Time synced: %s\n", ts);
-      return true;
-    }
-    delay(500);
-    Logger.LogRaw('.');
-  }
-
-  Logger.LogLine("[NTP] Time sync failed; clock may be incorrect");
-  return false;
-}
-
 static void startSTAMode() {
-  otaRecoveryModeActive = false;
   if (runtimeConfig.wifiList.empty()) {
     Logger.LogLine("[WIFI] No saved STA networks — switching to fallback AP");
     startCameraAPMode();
@@ -3655,9 +3337,8 @@ static void initializeSerialFactoryResetChallenge() {
 
 static bool initializeRuntimeMutexes() {
   cameraMutex = xSemaphoreCreateMutex();
-  streamPreviewMutex = xSemaphoreCreateMutex();
   streamSlotMutex = xSemaphoreCreateMutex();
-  return cameraMutex && streamPreviewMutex && streamSlotMutex;
+  return cameraMutex && streamSlotMutex;
 }
 
 static void initializeWakeupIndicator() {
@@ -3709,11 +3390,6 @@ static void startInitialNetworkServices() {
   Logger.Log("[CFG] Configured: %s\n", isConfigured ? "yes" : "no");
   Logger.Log("[CAM] Lazy init enabled with idle timeout %lu ms\n", cameraIdleTimeoutMs);
 
-  if (deferredNetworkStartupPending) {
-    Logger.LogLine("[BOOT] Network startup deferred");
-    return;
-  }
-
   if (isConfigured) {
     startSTAMode();
   } else {
@@ -3744,7 +3420,6 @@ void loop() {
   serviceSerialConsole();
   cleanupExpiredStreamReservations(millis());
   server.handleClient();
-  serviceNtpSync();
   serviceStaReconnect();
   serviceCameraIdleTimeout();
   servicePendingFirmwareRestart();

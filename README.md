@@ -47,7 +47,6 @@ Use this page for system-level configuration.
 - Switch each profile between DHCP and static addressing (IP, gateway, mask, DNS).
 - Change admin password.
 - Change device name.
-- Set time manually or sync via NTP.
 - Enable or disable LED blink on URL access.
 - Configure WiFi TX power for STA mode and fallback AP mode.
 - Upload new firmware (`.bin`) for OTA update.
