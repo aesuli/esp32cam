@@ -22,6 +22,8 @@ static void handleFirmwareUploadDataWorker() {
   HTTPUpload &upload = transferServer.upload();
 
   if (upload.status == UPLOAD_FILE_START) {
+    setCpuClockActive("OTA update");
+
     firmwareUploadFailed = false;
     firmwareUploadSuccess = false;
     firmwareRestartAt = 0;
@@ -34,6 +36,8 @@ static void handleFirmwareUploadDataWorker() {
   }
 
   if (upload.status == UPLOAD_FILE_WRITE) {
+    setCpuClockActive("OTA update");
+
     if (firmwareUploadFailed) {
       return;
     }
