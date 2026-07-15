@@ -139,8 +139,6 @@ static unsigned long lastStaReconnectAttemptAt = 0;
 static constexpr unsigned long LED_ACCESS_BLINK_INTERVAL_MS = 100;  // Minimum interval between access blinks
 static constexpr unsigned long STA_RECONNECT_INTERVAL_MS = 30000;
 static constexpr unsigned long STA_CONNECT_TIMEOUT_MS = 20000;
-static constexpr uint32_t CPU_ACTIVE_FREQ_MHZ = 240;
-static constexpr uint32_t CPU_IDLE_FREQ_MHZ = 80;
 static unsigned long cameraIdleTimeoutMs = 3000;
 static bool   firmwareUploadFailed = false;
 static bool   firmwareUploadSuccess = false;
@@ -391,8 +389,6 @@ static bool initCameraWithRetries();
 static bool applyWifiClientConfig(const WifiCredential &wifi);
 static void servicePendingFirmwareRestart();
 static void servicePendingAdminRestart();
-static void setCpuClockActive(const char *reason = nullptr);
-static void setCpuClockIdleIfPossible(const char *reason = nullptr);
 static bool requestFactoryResetAndReboot(const char *origin);
 static void initializeSerialFactoryResetChallenge();
 static void serviceSerialConsole();
@@ -677,8 +673,6 @@ static bool copyCameraFrame(camera_fb_t *fb, OwnedJpegFrame &frame) {
 }
 
 static bool ensureCameraReady(TickType_t timeoutTicks) {
-  setCpuClockActive("camera activity");
-
   if (!cameraMutex) {
     return false;
   }
@@ -730,7 +724,6 @@ static void serviceCameraIdleTimeout() {
       cameraInitialized = false;
       powerDownCameraHardware();
       Logger.Log("[CAM] Camera powered down after %lu ms idle\n", cameraIdleTimeoutMs);
-      setCpuClockIdleIfPossible("camera idle");
     }
   }
 }
@@ -836,11 +829,9 @@ static String buildFallbackApPassword() {
 }
 
 static bool connectToSavedStaNetworks(bool showLedFeedback, bool initializeCameraHttpServices) {
-  setCpuClockActive("STA connect");
 
   if (runtimeConfig.wifiList.empty()) {
     Logger.LogLine("[WIFI] No saved STA networks");
-    setCpuClockIdleIfPossible("STA idle");
     return false;
   }
 
@@ -853,7 +844,6 @@ static bool connectToSavedStaNetworks(bool showLedFeedback, bool initializeCamer
 
   if (enabledCount == 0) {
     Logger.LogLine("[WIFI] No enabled STA networks");
-    setCpuClockIdleIfPossible("STA idle");
     return false;
   }
 
@@ -949,7 +939,6 @@ static bool connectToSavedStaNetworks(bool showLedFeedback, bool initializeCamer
       }
 
       setWifiModemSleep(true, "idle");
-      setCpuClockIdleIfPossible("STA idle");
       return true;
     }
 
@@ -969,7 +958,6 @@ static bool connectToSavedStaNetworks(bool showLedFeedback, bool initializeCamer
     WiFi.setSleep(false);
   }
 
-  setCpuClockIdleIfPossible("STA retry idle");
   return false;
 }
 
@@ -1041,47 +1029,6 @@ static void setWifiModemSleep(bool enabled, const char *reason) {
     Logger.Log("[WIFI] Modem sleep %s\n",
       enabled ? "enabled" : "disabled");
   }
-}
-
-static bool setCpuClockMhz(uint32_t targetMhz, const char *mode, const char *reason) {
-  if (getCpuFrequencyMhz() == targetMhz) {
-    return true;
-  }
-
-  if (!setCpuFrequencyMhz(targetMhz)) {
-    if (reason && reason[0] != '\0') {
-      Logger.Log("[CPU] Failed to set %s clock to %lu MHz (%s)\n",
-        mode ? mode : "requested",
-        (unsigned long)targetMhz,
-        reason);
-    } else {
-      Logger.Log("[CPU] Failed to set %s clock to %lu MHz\n",
-        mode ? mode : "requested",
-        (unsigned long)targetMhz);
-    }
-    return false;
-  }
-
-  if (reason && reason[0] != '\0') {
-    Logger.Log("[CPU] Clock set to %lu MHz (%s)\n",
-      (unsigned long)targetMhz,
-      reason);
-  } else {
-    Logger.Log("[CPU] Clock set to %lu MHz\n", (unsigned long)targetMhz);
-  }
-  return true;
-}
-
-static void setCpuClockActive(const char *reason) {
-  setCpuClockMhz(CPU_ACTIVE_FREQ_MHZ, "active", reason);
-}
-
-static void setCpuClockIdleIfPossible(const char *reason) {
-  if (cameraInitialized || hasActiveStreamClients() || firmwareUploadSuccess || adminRestartPending) {
-    return;
-  }
-
-  setCpuClockMhz(CPU_IDLE_FREQ_MHZ, "idle", reason);
 }
 
 static void deriveKey(uint8_t key[16]) {
@@ -2065,7 +2012,6 @@ static bool checkAuth(WebServer &srv, bool allowSharedToken = false);
 static bool hasSharedAccessToken(WebServer &srv);
 static String buildLocalUrl(uint16_t port, const String &path, bool withToken = false);
 static void handleStreamMain();
-static void handleStreamClose();
 static void handleStreamWorker();
 static void handleFirmwareUploadMain();
 static void handleFirmwareUploadWorker();
@@ -2395,14 +2341,6 @@ static void handleStreamMain() {
   server.send(HTTP_FOUND, "text/plain", "Redirecting to stream server");
 }
 
-static void handleStreamClose() {
-  if (!checkAuth(server)) {
-    return;
-  }
-
-  server.send(HTTP_OK, "text/plain", "OK");
-}
-
 // ─── Route handlers: AP (setup) mode ─────────────────────────────────────────
 static void handleUrlAccess() {
   // LED feedback for URL access blink (if enabled)
@@ -2527,8 +2465,6 @@ static void sendWifiScanResponse(bool requireAuth) {
     return;
   }
 
-  setCpuClockActive("WiFi scan");
-
   wifi_mode_t previousMode = WiFi.getMode();
   bool restoreApOnlyMode = (previousMode == WIFI_AP);
   if (restoreApOnlyMode) {
@@ -2542,7 +2478,6 @@ static void sendWifiScanResponse(bool requireAuth) {
       WiFi.mode(WIFI_AP);
     }
     server.send(HTTP_INTERNAL_ERROR, "application/json", "{\"error\":\"WiFi scan failed\"}");
-    setCpuClockIdleIfPossible("WiFi scan complete");
     return;
   }
 
@@ -2582,7 +2517,6 @@ static void sendWifiScanResponse(bool requireAuth) {
   }
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.send(HTTP_OK, "application/json", json);
-  setCpuClockIdleIfPossible("WiFi scan complete");
 }
 
 static void handleSetupWifiScan() {
@@ -3160,7 +3094,6 @@ static void startAuxHttpServers() {
 static void registerCameraRoutes() {
   server.on("/",              HTTP_GET,  handleCameraRoot);
   server.on("/stream",        HTTP_GET,  handleStreamMain);
-  server.on("/stream/close",  HTTP_POST, handleStreamClose);
   server.on("/snapshot",      HTTP_GET,  handleCapture);
   server.on("/snapshot.jpg",  HTTP_GET,  handleCapture);
   server.on("/flashlight",    HTTP_GET,  handleFlashlight);
@@ -3176,8 +3109,6 @@ static void registerCameraRoutes() {
 }
 
 static void startSetupAPMode() {
-  setCpuClockActive("setup AP start");
-
   wifiModemSleepEnabled = false;
   bool ok = startSoftAPWithRetries(AP_SETUP_SSID, AP_SETUP_PASS);
   if (!ok) {
@@ -3195,11 +3126,9 @@ static void startSetupAPMode() {
     server.begin();
     Logger.Log("[HTTP] Setup server ready on port %u\n",
       (unsigned int)HTTP_MAIN_PORT);
-    setCpuClockIdleIfPossible("setup AP idle");
 }
 
 static void startCameraAPMode() {
-  setCpuClockActive("fallback AP start");
 
   wifiModemSleepEnabled = false;
   String apHostname = buildNetworkHostname(cfgDeviceName);
@@ -3259,11 +3188,9 @@ static void startCameraAPMode() {
     (unsigned int)HTTP_MAIN_PORT,
     (unsigned int)HTTP_STREAM_PORT,
     (unsigned int)HTTP_TRANSFER_PORT);
-  setCpuClockIdleIfPossible("fallback AP idle");
 }
 
 static void startSTAMode() {
-  setCpuClockActive("STA start");
 
   if (runtimeConfig.wifiList.empty()) {
     Logger.LogLine("[WIFI] No saved STA networks — switching to fallback AP");
@@ -3509,7 +3436,6 @@ static void startInitialNetworkServices() {
 void setup() {
   Logger.begin(115200);
   Logger.LogLine("[BOOT] *** ESP32-CAM starting ***");
-  setCpuClockActive("boot");
   initializeSerialFactoryResetChallenge();
   WiFi.onEvent(onWifiEvent);
 

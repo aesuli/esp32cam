@@ -437,7 +437,6 @@ refreshWiFiList();
 resetWiFiForm();
 refreshDeviceName();
 refreshLedStatus();
-refreshLoggingStatus();
 refreshTxPower();
 </script>
 </body>
