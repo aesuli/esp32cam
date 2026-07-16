@@ -65,6 +65,7 @@ static constexpr int CONFIG_LOAD_RETRIES = 5;
 static constexpr unsigned long CONFIG_LOAD_RETRY_DELAY_MS = 1000;
 static constexpr int CAMERA_INIT_RETRIES = 8;
 static constexpr unsigned long CAMERA_INIT_RETRY_DELAY_MS = 500;
+static constexpr unsigned long CAMERA_SNAPSHOT_SETTLE_DELAY_MS = 500;
 static constexpr int AP_START_RETRIES = 3;
 static constexpr unsigned long AP_START_RETRY_DELAY_MS = 1000;
 static constexpr uint32_t CAMERA_XCLK_FREQS_HZ[] = {20000000UL, 10000000UL, 8000000UL, 4000000UL};
@@ -382,7 +383,7 @@ static int reserveStreamSlot();
 static bool activateStreamSlot(uint8_t slotIndex);
 static void releaseStreamSlot(uint8_t slotIndex);
 static void cleanupExpiredStreamReservations(unsigned long now);
-static bool ensureCameraReady(TickType_t timeoutTicks = pdMS_TO_TICKS(5000));
+static bool ensureCameraReady(TickType_t timeoutTicks = pdMS_TO_TICKS(5000), bool *justPoweredUp = nullptr);
 static void serviceCameraIdleTimeout();
 static bool loadRuntimeConfigWithRetries(StoredConfig &cfg);
 static bool initCameraWithRetries();
@@ -672,9 +673,16 @@ static bool copyCameraFrame(camera_fb_t *fb, OwnedJpegFrame &frame) {
   return copyJpegBufferToFrame(fb->buf, fb->len, fb->width, fb->height, frame);
 }
 
-static bool ensureCameraReady(TickType_t timeoutTicks) {
+static bool ensureCameraReady(TickType_t timeoutTicks, bool *justPoweredUp) {
   if (!cameraMutex) {
+    if (justPoweredUp) {
+      *justPoweredUp = false;
+    }
     return false;
+  }
+
+  if (justPoweredUp) {
+    *justPoweredUp = false;
   }
 
   SemaphoreLock cameraLock(cameraMutex, timeoutTicks);
@@ -683,11 +691,13 @@ static bool ensureCameraReady(TickType_t timeoutTicks) {
   }
 
   bool ok = true;
+  bool cameraWasPoweredUp = false;
   if (!cameraInitialized) {
     Logger.LogLine("[CAM] Powering up camera on demand");
     ok = initCameraWithRetries();
     if (ok) {
       cameraInitialized = true;
+      cameraWasPoweredUp = true;
       Logger.LogLine("[CAM] Camera ready");
     } else {
       Logger.LogLine("[CAM] Camera init failed");
@@ -696,6 +706,9 @@ static bool ensureCameraReady(TickType_t timeoutTicks) {
 
   if (ok) {
     lastCameraActivityAt = millis();
+    if (justPoweredUp) {
+      *justPoweredUp = cameraWasPoweredUp;
+    }
   }
 
   return ok;
@@ -2748,9 +2761,14 @@ static void handleAdminPasswordChange() {
 static void handleCapture() {
     if (!checkAuth()) return;
 
-  if (!ensureCameraReady()) {
+  bool cameraJustPoweredUp = false;
+  if (!ensureCameraReady(pdMS_TO_TICKS(5000), &cameraJustPoweredUp)) {
     server.send(HTTP_SERVICE_UNAVAILABLE, "text/plain", "Camera unavailable");
     return;
+  }
+
+  if (cameraJustPoweredUp) {
+    delay(CAMERA_SNAPSHOT_SETTLE_DELAY_MS);
   }
 
     camera_fb_t *fb = lockAndCaptureFrame(pdMS_TO_TICKS(1000));
