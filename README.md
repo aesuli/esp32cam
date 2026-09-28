@@ -2,6 +2,10 @@
 
 Firmware for AI-Thinker ESP32-CAM (OV3660) with web streaming, camera controls, motion actions, intervalometer (timelapse), and SD-backed secure configuration.
 
+This is a multipurpose firmware which fits a lot of functions.
+The idea is to have a rich pool of functionalities from which customized solutions can be quickly extracted and adapted.
+For example the [`homeassistant`](https://github.com/aesuli/esp32cam/tree/homeassistant) branch implements a simple wifi camera that works with Home Assistant.
+
 ## Hardware and Assembly
 
 ### Hardware parts
