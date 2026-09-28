@@ -1,0 +1,24 @@
+rest_command:
+  esp32cam_1_flashlight_on:
+    url: "http://esp32-4671c8/flashlight?enabled=1"
+    method: post
+    authentication: basic
+    username: "admin"
+    password: !secret espcam_password
+
+  esp32cam_1_flashlight_off:
+    url: "http://esp32-4671c8/flashlight?enabled=0"
+    method: post
+    authentication: basic
+    username: "admin"
+    password: !secret espcam_password
+
+template:
+  - switch:
+      - name: "ESPCAM 1 Light"
+        unique_id: espcam_1_light
+        icon: mdi:flashlight
+        turn_on:
+          action: rest_command.esp32cam_1_flashlight_on
+        turn_off:
+          action: rest_command.esp32cam_1_flashlight_off

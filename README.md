@@ -1,6 +1,7 @@
-# ESP32 multipurpose CAM
+# ESP32 MJPEG Stream Camera
 
 Firmware for AI-Thinker ESP32-CAM (OV3660) with web streaming and camera controls.
+This has been specially implemented to work with Home Assistant
 
 ## Hardware and Assembly
 
@@ -8,10 +9,6 @@ Firmware for AI-Thinker ESP32-CAM (OV3660) with web streaming and camera control
 
 - AI-Thinker ESP32-CAM board with OV3660 camera.
 - Stable 5V power source suitable for ESP32-CAM current peaks.
-
-### Wiring
-
-None required
 
 ## First setup
 
@@ -82,6 +79,25 @@ Use this page for system-wide settings and maintenance.
 - Set time manually or request NTP sync.
 - Configure LED blink-on-access behavior.
 
+### Setup in Home Assistant
+
+The camera module can be added to HA using the MJPEG IP Camera integration, filling the dialog with the IP/local DNS name and the credentials to access it:
+
+![](ha_camera.png)
+
+An additional configuration is required to be able to monitor and control the flashlight.
+
+Assuming a `./package` dir exists in the HA configuration directory, and the line:
+
+`packages: !include_dir_named packages`
+
+Exists in `configuration.yaml`.
+
+For each hardware camera module create in the `packages` directory a copy of the [`ha_camera.yaml`](ha_camera.yaml) file, adding a password line to the `secrets.yaml` file:
+
+`espcam_password: <your password>`
+
+Once configured, HA automations can be built to stream and capture video or to capture still images from the camera.
 
 ## License
 
